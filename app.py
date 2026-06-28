@@ -356,16 +356,12 @@ def webhook():
         alert_time_str = datetime.now(timezone.utc).strftime('%H:%M UTC')
         
         if scheduler:
+            job_id = f"outcome_{datetime.now(timezone.utc).timestamp()}"
             scheduler.add_job(
-                func=lambda: check_trade_outcome(
-                    data.get('type', 'Unknown'),
-                    entry_price,
-                    predicted_direction,
-                    alert_time_str
-                ),
+                func=lambda a=data.get('type', 'Unknown'), b=entry_price, c=predicted_direction, d=alert_time_str: check_trade_outcome(a, b, c, d),
                 trigger='date',
                 run_date=check_time,
-                id=f"outcome_{bar_index if 'bar_index' in dir() else datetime.now().timestamp()}"
+                id=job_id
             )
 
         # Extract confidence from analysis

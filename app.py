@@ -633,33 +633,29 @@ def update_pnl():
 def auto_update_levels():
     global KEY_LEVELS
     try:
-        # Pull last 30 days of gold data from Yahoo Finance
+    # Pull data
         gold = yf.download('GC=F', period='30d', interval='1d', progress=False)
 
         if gold.empty:
-            send_telegram("⚠️ Auto level update failed — no data returned from Yahoo Finance")
+            send_telegram("⚠️ Auto level update failed — no data returned")
             return jsonify({"status": "error", "message": "no data"})
 
-        # Get this week's candles (last 5 trading days)
-        weekly = gold.tail(5)
-        
-        # Get today's candle
-        today = gold.tail(1)
-
-       # Flatten MultiIndex columns from yfinance
+        # Flatten MultiIndex FIRST before doing anything else
         gold.columns = [col[0] for col in gold.columns]
 
-        # Now extract levels cleanly
+        # NOW create subsets after flattening
+        weekly = gold.tail(5)
+        today = gold.tail(1)
+        recent = gold.tail(10)
+        full_range = gold.tail(20)
+
+        # Extract levels
         weekly_high = round(float(weekly['High'].max()), 2)
         weekly_low = round(float(weekly['Low'].min()), 2)
         daily_high = round(float(today['High'].iloc[-1]), 2)
         daily_low = round(float(today['Low'].iloc[-1]), 2)
-
-        recent = gold.tail(10)
         major_resistance = round(float(recent['High'].max()), 2)
         major_support = round(float(recent['Low'].min()), 2)
-
-        full_range = gold.tail(20)
         dealing_range_high = round(float(full_range['High'].max()), 2)
         dealing_range_low = round(float(full_range['Low'].min()), 2)
         

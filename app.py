@@ -11,6 +11,8 @@ import json
 import csv
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 
 # Load secret keys from .env file
 load_dotenv()
@@ -407,7 +409,118 @@ Keep it punchy and practical. This trader uses SMC — FVGs, sweeps, order block
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+# ============================================================
+# WEEKLY BIAS REPORT — fires every Sunday 8pm
+# ============================================================
+@app.route('/weekly-bias', methods=['GET'])
+def weekly_bias_report():
+    try:
+        levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in KEY_LEVELS.items()])
 
+        prompt = f"""
+You are an expert XAUUSD analyst preparing a weekly trading bias report.
+
+Today is {datetime.utcnow().strftime('%A %d %B %Y')}
+
+Key levels this week:
+{levels_text}
+
+Provide a structured weekly bias report covering:
+
+**WEEKLY BIAS**
+Overall directional bias for the coming week — bullish, bearish or neutral and why.
+
+**KEY LEVELS TO RESPECT**
+The most important levels to watch this week and why they matter.
+
+**SESSIONS TO FOCUS ON**
+Which sessions are likely to produce the best setups this week.
+
+**SETUPS TO LOOK FOR**
+Specific setup types that align with the weekly bias.
+
+**SETUPS TO AVOID**
+What NOT to trade this week.
+
+**RISK EVENTS**
+Key news events or market conditions to be aware of.
+
+**ONE SENTENCE SUMMARY**
+The week in one clear sentence.
+
+Keep it punchy, practical and SMC focused.
+"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        report = message.content[0].text
+        telegram_message = f"📊 *XAUUSD Weekly Bias Report — Week of {datetime.utcnow().strftime('%d %b %Y')}*\n\n{report}"
+        send_telegram(telegram_message)
+
+        return jsonify({"status": "weekly bias report sent"})
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# MONDAY GAP ANALYSIS — fires every Monday 6:55am
+# ============================================================
+@app.route('/monday-gap', methods=['GET'])
+def monday_gap_analysis():
+    try:
+        prompt = f"""
+You are an expert XAUUSD analyst. It is Monday morning before the London open.
+
+Current key levels:
+Weekly High: {KEY_LEVELS['weekly_high']}
+Weekly Low: {KEY_LEVELS['weekly_low']}
+Major Resistance: {KEY_LEVELS['major_resistance']}
+Major Support: {KEY_LEVELS['major_support']}
+
+Provide a Monday morning gap analysis covering:
+
+**GAP ANALYSIS**
+Explain what traders should look for regarding weekend gaps on gold at Monday open.
+What gap sizes are significant and worth trading?
+Do gold gaps typically fill? In what timeframe?
+
+**MONDAY OPEN STRATEGY**
+What is the typical smart money behaviour at Monday open on gold?
+What setups should a trader look for in the first 2 hours?
+
+**ASIAN SESSION BIAS**
+What direction does the Asian session typically set up for London on Mondays?
+
+**FIRST TRADE OF THE WEEK**
+What would make an ideal first trade setup this Monday?
+What confirmation signals to wait for before entering?
+
+**AVOID**
+What traps do smart money typically set at Monday open?
+
+Keep it concise and actionable. SMC focused.
+"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        analysis = message.content[0].text
+        telegram_message = f"🌅 *XAUUSD Monday Gap Analysis — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{analysis}"
+        send_telegram(telegram_message)
+
+        return jsonify({"status": "monday gap analysis sent"})
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
 # ============================================================
 # HEALTH CHECK
 # ============================================================
@@ -486,9 +599,43 @@ def update_levels():
 # START THE SERVER
 # ============================================================
 if __name__ == '__main__':
+    # Start the scheduler
+    scheduler = BackgroundScheduler()
+    
+    # Morning briefing every day at 7am UTC
+    scheduler.add_job(
+        func=lambda: morning_briefing(),
+        trigger='cron',
+        hour=7,
+        minute=0
+    )
+    
+    # Weekly bias report every Sunday at 8pm UTC
+    scheduler.add_job(
+        func=lambda: weekly_bias_report(),
+        trigger='cron',
+        day_of_week='sun',
+        hour=20,
+        minute=0
+    )
+
+    # Monday gap analysis every Monday at 6:55am UTC
+    scheduler.add_job(
+        func=lambda: monday_gap_analysis(),
+        trigger='cron',
+        day_of_week='mon',
+        hour=6,
+        minute=55
+    )
+
+    scheduler.start()
+    atexit.register(lambda: scheduler.shutdown())
+
     print("🚀 Gold Alert System starting...")
     print("📡 Waiting for TradingView alerts...")
     print("🔗 Test at: http://localhost:5000/test")
     print("❤️ Health check: http://localhost:5000/health")
+    print("⏰ Scheduler running — morning briefing at 7am UTC daily")
+    
     port = int(os.environ.get('PORT', 5000))
-app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)

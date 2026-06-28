@@ -69,7 +69,42 @@ KEY_LEVELS = {
     "dealing_range_high": 4100.00,
     "dealing_range_low": 3975.00,
 }
-
+# ============================================================
+# DXY CORRELATION CHECK
+# ============================================================
+def get_dxy_bias():
+    try:
+        dxy = yf.download('DX-Y.NYB', period='5d', interval='1h', progress=False)
+        
+        if dxy.empty:
+            return "UNKNOWN", "DXY data unavailable"
+        
+        # Flatten MultiIndex
+        dxy.columns = [col[0] for col in dxy.columns]
+        
+        # Get last 10 candles
+        recent = dxy.tail(10)
+        current = float(recent['Close'].iloc[-1])
+        previous = float(recent['Close'].iloc[-5])
+        
+        # Calculate direction
+        change = current - previous
+        change_pct = (change / previous) * 100
+        
+        if change_pct > 0.1:
+            bias = "BULLISH"
+            implication = "DXY rising — bearish pressure on gold"
+        elif change_pct < -0.1:
+            bias = "BEARISH"
+            implication = "DXY falling — bullish pressure on gold"
+        else:
+            bias = "NEUTRAL"
+            implication = "DXY flat — no additional confluence"
+            
+        return bias, f"DXY {bias} ({change_pct:+.2f}%) — {implication}"
+        
+    except Exception as e:
+        return "UNKNOWN", f"DXY check failed: {str(e)}"
 # ============================================================
 # SESSION DETECTION
 # ============================================================
@@ -237,10 +272,8 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
 # ============================================================
 # MAIN CLAUDE ANALYSIS
 # ============================================================
-def analyse_with_claude(alert_data, recent_context, session_name, session_desc, is_killzone, zone, zone_pct, zone_advice, news_risk, news_msg, drawdown_active):
 
-    levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in KEY_LEVELS.items()])
-
+def analyse_with_claude(alert_data, recent_context, session_name, session_desc, is_killzone, zone, zone_pct, zone_advice, news_risk, news_msg, drawdown_active, dxy_bias="UNKNOWN", dxy_message="DXY data unavailable"):
     killzone_text = "✅ YES — weight this signal higher" if is_killzone else "❌ NO — standard session, normal weighting"
 
     prompt = f"""
@@ -269,6 +302,10 @@ A live market alert has fired. Analyse it thoroughly and give a clear trading as
 
 ## NEWS RISK
 - {news_msg}
+
+## DXY CORRELATION
+- {dxy_message}
+- Gold/DXY relationship: {"CONFIRMING — DXY bearish supports gold bullish signals" if dxy_bias == "BEARISH" else "CONFIRMING — DXY bullish supports gold bearish signals" if dxy_bias == "BULLISH" else "NEUTRAL — no directional confluence from DXY"}
 
 ## RECENT ALERT HISTORY
 {recent_context if recent_context else "No prior alerts this session"}
@@ -343,6 +380,7 @@ def webhook():
 
         # Get all context
         session_name, session_desc, is_killzone = get_session()
+        dxy_bias, dxy_message = get_dxy_bias()
         zone, zone_pct, zone_advice = get_premium_discount(data.get('price', 0))
         news_risk, news_msg = check_news_risk()
         drawdown_active, drawdown_msg = check_drawdown_protection()
@@ -367,7 +405,8 @@ def webhook():
         analysis = analyse_with_claude(
             data, context, session_name, session_desc,
             is_killzone, zone, zone_pct, zone_advice,
-            news_risk, news_msg, drawdown_active
+            news_risk, news_msg, drawdown_active,
+            dxy_bias, dxy_message
         )
 
         # Extract predicted direction from analysis
@@ -855,15 +894,18 @@ def test():
         }
 
         session_name, session_desc, is_killzone = get_session()
+        dxy_bias, dxy_message = get_dxy_bias()
         zone, zone_pct, zone_advice = get_premium_discount(fake_alert['price'])
         news_risk, news_msg = check_news_risk()
         drawdown_active, drawdown_msg = check_drawdown_protection()
 
+        dxy_bias, dxy_message = get_dxy_bias()
         analysis = analyse_with_claude(
             fake_alert, "No prior alerts — this is a test",
             session_name, session_desc, is_killzone,
             zone, zone_pct, zone_advice,
-            news_risk, news_msg, drawdown_active
+            news_risk, news_msg, drawdown_active,
+            dxy_bias, dxy_message
         )
 
         telegram_message = f"""

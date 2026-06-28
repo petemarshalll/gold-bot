@@ -646,36 +646,22 @@ def auto_update_levels():
         # Get today's candle
         today = gold.tail(1)
 
-        # Flatten columns if yfinance returns MultiIndex
-        if isinstance(gold.columns, pd.MultiIndex):
-            gold.columns = gold.columns.get_level_values(0)
+       # Flatten MultiIndex columns from yfinance
+        gold.columns = [col[0] for col in gold.columns]
 
-        # Extract values safely
-        def safe_val(series):
-            val = series.dropna()
-            if len(val) == 0:
-                return 0.0
-            return round(float(val.iloc[0]), 2)
-
-        def safe_max(df, col):
-            return round(float(df[col].dropna().max()), 2)
-
-        def safe_min(df, col):
-            return round(float(df[col].dropna().min()), 2)
-
-        # Calculate levels automatically
-        weekly_high = safe_max(weekly, 'High')
-        weekly_low = safe_min(weekly, 'Low')
-        daily_high = safe_max(today, 'High')
-        daily_low = safe_min(today, 'Low')
+        # Now extract levels cleanly
+        weekly_high = round(float(weekly['High'].max()), 2)
+        weekly_low = round(float(weekly['Low'].min()), 2)
+        daily_high = round(float(today['High'].iloc[-1]), 2)
+        daily_low = round(float(today['Low'].iloc[-1]), 2)
 
         recent = gold.tail(10)
-        major_resistance = safe_max(recent, 'High')
-        major_support = safe_min(recent, 'Low')
+        major_resistance = round(float(recent['High'].max()), 2)
+        major_support = round(float(recent['Low'].min()), 2)
 
         full_range = gold.tail(20)
-        dealing_range_high = safe_max(full_range, 'High')
-        dealing_range_low = safe_min(full_range, 'Low')
+        dealing_range_high = round(float(full_range['High'].max()), 2)
+        dealing_range_low = round(float(full_range['Low'].min()), 2)
         
         # Update the global KEY_LEVELS automatically
         KEY_LEVELS = {

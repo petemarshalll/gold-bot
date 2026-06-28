@@ -37,6 +37,7 @@ paper_trades = []
 daily_losses = 0
 consecutive_losses = 0
 drawdown_protection = False
+scheduler = None
 
 # ============================================================
 # PROP FIRM RULES — update these when you join a firm
@@ -340,6 +341,32 @@ def webhook():
             is_killzone, zone, zone_pct, zone_advice,
             news_risk, news_msg, drawdown_active
         )
+
+        # Extract predicted direction from analysis
+        predicted_direction = "NEUTRAL"
+        if "LONG" in analysis.upper() and "DIRECTION" in analysis.upper():
+            predicted_direction = "LONG"
+        elif "SHORT" in analysis.upper() and "DIRECTION" in analysis.upper():
+            predicted_direction = "SHORT"
+
+        # Schedule outcome check in 4 hours
+        from datetime import timedelta
+        check_time = datetime.now(timezone.utc) + timedelta(hours=4)
+        entry_price = float(data.get('price', 0))
+        alert_time_str = datetime.now(timezone.utc).strftime('%H:%M UTC')
+        
+        if scheduler:
+            scheduler.add_job(
+                func=lambda: check_trade_outcome(
+                    data.get('type', 'Unknown'),
+                    entry_price,
+                    predicted_direction,
+                    alert_time_str
+                ),
+                trigger='date',
+                run_date=check_time,
+                id=f"outcome_{bar_index if 'bar_index' in dir() else datetime.now().timestamp()}"
+            )
 
         # Extract confidence from analysis
         confidence = "MEDIUM"
@@ -710,6 +737,72 @@ _Claude will use these levels in all analysis until next Sunday_ ✅
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# TRADE OUTCOME TRACKER
+# ============================================================
+def check_trade_outcome(alert_type, entry_price, predicted_direction, alert_time):
+    try:
+        # Pull current gold price
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        
+        if gold.empty:
+            return
+            
+        # Flatten columns
+        gold.columns = [col[0] for col in gold.columns]
+        
+        # Get current price
+        current_price = round(float(gold['Close'].iloc[-1]), 2)
+        
+        # Calculate move
+        price_move = round(current_price - entry_price, 2)
+        points_moved = abs(price_move)
+        
+        # Determine if prediction was correct
+        if predicted_direction == "LONG":
+            correct = price_move > 0
+            direction_emoji = "🟢" if correct else "🔴"
+        elif predicted_direction == "SHORT":
+            correct = price_move < 0
+            direction_emoji = "🟢" if correct else "🔴"
+        else:
+            correct = None
+            direction_emoji = "🟡"
+        
+        result = "WIN ✅" if correct else "LOSS ❌" if correct is not None else "NEUTRAL"
+        
+        # Build outcome message
+        message = f"""
+📊 *Trade Outcome Update*
+_{alert_time} alert — 4 hour check_
+
+Alert: {alert_type}
+Entry Price: {entry_price}
+Current Price: {current_price}
+Move: {'+' if price_move > 0 else ''}{price_move} points
+Predicted: {predicted_direction}
+Result: {direction_emoji} {result}
+
+_Log this result in your journal_
+"""
+        send_telegram(message)
+        
+        # Log to CSV
+        with open('outcomes.csv', 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                alert_time,
+                alert_type,
+                entry_price,
+                current_price,
+                price_move,
+                predicted_direction,
+                result
+            ])
+            
+    except Exception as e:
+        print(f"Outcome tracker error: {e}")
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -788,6 +881,7 @@ def update_levels():
 # ============================================================
 if __name__ == '__main__':
     # Start the scheduler
+    global scheduler
     scheduler = BackgroundScheduler()
     
     # Morning briefing every day at 7am UTC

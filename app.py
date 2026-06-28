@@ -275,6 +275,7 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
 
 def analyse_with_claude(alert_data, recent_context, session_name, session_desc, is_killzone, zone, zone_pct, zone_advice, news_risk, news_msg, drawdown_active, dxy_bias="UNKNOWN", dxy_message="DXY data unavailable"):
     killzone_text = "✅ YES — weight this signal higher" if is_killzone else "❌ NO — standard session, normal weighting"
+    levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in KEY_LEVELS.items()])
 
     prompt = f"""
 You are an expert XAUUSD (Gold) trader with 20 years experience in Smart Money Concepts (SMC).

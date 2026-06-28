@@ -473,7 +473,7 @@ Keep it punchy, practical and SMC focused.
 @app.route('/monday-gap', methods=['GET'])
 def monday_gap_analysis():
     try:
-prompt = f"""
+        prompt = f"""
 You are an expert XAUUSD analyst. Monday morning before London open.
 
 Key levels:
@@ -483,10 +483,10 @@ Major Resistance: {KEY_LEVELS['major_resistance']}
 Major Support: {KEY_LEVELS['major_support']}
 
 Give a concise Monday gap analysis covering:
-**GAP STRATEGY** — what to look for at Monday open
-**FIRST SETUP** — ideal first trade conditions this Monday
-**ASIAN SESSION** — likely direction before London
-**AVOID** — traps smart money typically sets Monday open
+**GAP STRATEGY** - what to look for at Monday open
+**FIRST SETUP** - ideal first trade conditions this Monday
+**ASIAN SESSION** - likely direction before London
+**AVOID** - traps smart money typically sets Monday open
 
 Maximum 3 sentences per section. Be direct and actionable.
 """
@@ -504,8 +504,7 @@ Maximum 3 sentences per section. Be direct and actionable.
         return jsonify({"status": "monday gap analysis sent"})
 
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-    
+        return jsonify({"status": "error", "message": str(e)}), 500    
 # ============================================================
 # HEALTH CHECK
 # ============================================================

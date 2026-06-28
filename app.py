@@ -650,23 +650,32 @@ def auto_update_levels():
         if isinstance(gold.columns, pd.MultiIndex):
             gold.columns = gold.columns.get_level_values(0)
 
+        # Extract values safely
+        def safe_val(series):
+            val = series.dropna()
+            if len(val) == 0:
+                return 0.0
+            return round(float(val.iloc[0]), 2)
+
+        def safe_max(df, col):
+            return round(float(df[col].dropna().max()), 2)
+
+        def safe_min(df, col):
+            return round(float(df[col].dropna().min()), 2)
+
         # Calculate levels automatically
-        weekly_high = round(float(weekly['High'].max().item()), 2)
-        weekly_low = round(float(weekly['Low'].min().item()), 2)
-        daily_high = round(float(today['High'].values[0]), 2)
-        daily_low = round(float(today['Low'].values[0]), 2)
+        weekly_high = safe_max(weekly, 'High')
+        weekly_low = safe_min(weekly, 'Low')
+        daily_high = safe_max(today, 'High')
+        daily_low = safe_min(today, 'Low')
 
-        # Find key resistance — highest high of last 10 days
         recent = gold.tail(10)
-        major_resistance = round(float(recent['High'].max().item()), 2)
-        
-        # Find key support — lowest low of last 10 days
-        major_support = round(float(recent['Low'].min().item()), 2)
+        major_resistance = safe_max(recent, 'High')
+        major_support = safe_min(recent, 'Low')
 
-        # Dealing range based on last 20 days
         full_range = gold.tail(20)
-        dealing_range_high = round(float(full_range['High'].max().item()), 2)
-        dealing_range_low = round(float(full_range['Low'].min().item()), 2)
+        dealing_range_high = safe_max(full_range, 'High')
+        dealing_range_low = safe_min(full_range, 'Low')
         
         # Update the global KEY_LEVELS automatically
         KEY_LEVELS = {

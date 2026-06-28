@@ -151,33 +151,48 @@ def check_drawdown_protection():
 # SEND TELEGRAM MESSAGE
 # ============================================================
 def send_telegram(message):
-    # Telegram max length is 4096 characters
-    # Trim cleanly if too long
-    if len(message) > 4000:
-        # Find the last complete sentence before the limit
-        trimmed = message[:4000]
-        last_period = trimmed.rfind('.')
-        if last_period > 3500:
-            message = trimmed[:last_period + 1] + "\n\n_✅ Analysis complete_"
-        else:
-            message = trimmed + "\n\n_✅ Analysis complete_"
-
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, json=payload)
-        print(f"Telegram sent: {response.status_code}")
-        # If markdown parsing fails try plain text
-        if response.status_code == 400:
-            payload["parse_mode"] = "None"
+    
+    # Split into chunks of 3800 chars at natural break points
+    def split_message(text, limit=3800):
+        if len(text) <= limit:
+            return [text]
+        
+        chunks = []
+        while len(text) > limit:
+            # Find last newline before limit
+            split_point = text[:limit].rfind('\n')
+            if split_point < 2000:
+                # No good newline found, split at limit
+                split_point = limit
+            chunks.append(text[:split_point])
+            text = text[split_point:].strip()
+        if text:
+            chunks.append(text)
+        return chunks
+
+    chunks = split_message(message)
+    
+    for i, chunk in enumerate(chunks):
+        # Add part indicator if multiple chunks
+        if len(chunks) > 1:
+            chunk = f"_{i+1}/{len(chunks)}_\n\n" + chunk
+        
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "Markdown"
+        }
+        try:
             response = requests.post(url, json=payload)
-            print(f"Telegram plain text sent: {response.status_code}")
-    except Exception as e:
-        print(f"Telegram error: {e}")
+            print(f"Telegram sent: {response.status_code}")
+            if response.status_code == 400:
+                # Markdown failed, try plain text
+                payload["parse_mode"] = "None"
+                response = requests.post(url, json=payload)
+                print(f"Telegram plain text: {response.status_code}")
+        except Exception as e:
+            print(f"Telegram error: {e}")
 
 # ============================================================
 # LOG TRADE TO CSV

@@ -150,6 +150,11 @@ def check_drawdown_protection():
 # SEND TELEGRAM MESSAGE
 # ============================================================
 def send_telegram(message):
+    # Telegram max length is 4096 characters
+    # Trim cleanly if too long
+    if len(message) > 3800:
+        message = message[:3800] + "\n\n_...message trimmed for length_"
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -159,6 +164,11 @@ def send_telegram(message):
     try:
         response = requests.post(url, json=payload)
         print(f"Telegram sent: {response.status_code}")
+        # If markdown parsing fails try plain text
+        if response.status_code == 400:
+            payload["parse_mode"] = "None"
+            response = requests.post(url, json=payload)
+            print(f"Telegram plain text sent: {response.status_code}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -658,7 +668,7 @@ def auto_update_levels():
         major_support = round(float(recent['Low'].min()), 2)
         dealing_range_high = round(float(full_range['High'].max()), 2)
         dealing_range_low = round(float(full_range['Low'].min()), 2)
-        
+
         # Update the global KEY_LEVELS automatically
         KEY_LEVELS = {
             "weekly_high": weekly_high,

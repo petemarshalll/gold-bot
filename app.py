@@ -37,6 +37,23 @@ consecutive_losses = 0
 drawdown_protection = False
 
 # ============================================================
+# PROP FIRM RULES — update these when you join a firm
+# ============================================================
+PROP_FIRM_RULES = {
+    "account_size": 10000,
+    "max_daily_loss_pct": 4.0,
+    "max_total_drawdown_pct": 8.0,
+    "min_trading_days": 4,
+    "max_loss_per_trade_pct": 1.0,
+}
+
+# Track current performance
+current_balance = 10000
+daily_pnl = 0
+total_pnl = 0
+trading_days = 0
+
+# ============================================================
 # KEY LEVELS — update these every Sunday
 # ============================================================
 KEY_LEVELS = {
@@ -505,6 +522,108 @@ Maximum 3 sentences per section. Be direct and actionable.
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500    
+
+# ============================================================
+# PROP FIRM MONITOR
+# ============================================================
+@app.route('/prop-status', methods=['GET'])
+def prop_status():
+    try:
+        account = PROP_FIRM_RULES["account_size"]
+        daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
+        total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
+        daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
+        total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
+        daily_remaining = daily_loss_limit - abs(min(daily_pnl, 0))
+        total_remaining = total_drawdown_limit - abs(min(total_pnl, 0))
+
+        if daily_used_pct >= 80:
+            daily_status = "🔴 DANGER"
+        elif daily_used_pct >= 50:
+            daily_status = "🟡 CAUTION"
+        else:
+            daily_status = "🟢 SAFE"
+
+        if total_used_pct >= 80:
+            total_status = "🔴 DANGER"
+        elif total_used_pct >= 50:
+            total_status = "🟡 CAUTION"
+        else:
+            total_status = "🟢 SAFE"
+
+        message = f"""
+📊 *Prop Firm Status Report*
+
+*Account Size:* ${account:,.2f}
+*Current Balance:* ${current_balance:,.2f}
+*Today's P&L:* ${daily_pnl:,.2f}
+*Total P&L:* ${total_pnl:,.2f}
+*Trading Days:* {trading_days}/{PROP_FIRM_RULES['min_trading_days']} minimum
+
+*Daily Loss Limit:* {daily_status}
+Used: {daily_used_pct:.1f}% | Remaining: ${daily_remaining:,.2f}
+Limit: {PROP_FIRM_RULES['max_daily_loss_pct']}% (${daily_loss_limit:,.2f})
+
+*Total Drawdown:* {total_status}
+Used: {total_used_pct:.1f}% | Remaining: ${total_remaining:,.2f}
+Limit: {PROP_FIRM_RULES['max_total_drawdown_pct']}% (${total_drawdown_limit:,.2f})
+
+*Max Risk Per Trade:* {PROP_FIRM_RULES['max_loss_per_trade_pct']}% (${account * PROP_FIRM_RULES['max_loss_per_trade_pct'] / 100:,.2f})
+"""
+        send_telegram(message)
+        return jsonify({
+            "status": "ok",
+            "daily_used_pct": daily_used_pct,
+            "total_used_pct": total_used_pct,
+            "daily_status": daily_status,
+            "total_status": total_status
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# UPDATE P&L — call this after each trade
+# ============================================================
+@app.route('/update-pnl', methods=['POST'])
+def update_pnl():
+    global daily_pnl, total_pnl, current_balance, trading_days
+    try:
+        data = request.json
+        trade_pnl = float(data.get('pnl', 0))
+        daily_pnl += trade_pnl
+        total_pnl += trade_pnl
+        current_balance += trade_pnl
+
+        account = PROP_FIRM_RULES["account_size"]
+        daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
+        total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
+
+        warnings = []
+        if abs(min(daily_pnl, 0)) >= daily_loss_limit * 0.8:
+            warnings.append(f"⚠️ DAILY LOSS WARNING — at {(abs(min(daily_pnl,0))/account)*100:.1f}% of {PROP_FIRM_RULES['max_daily_loss_pct']}% limit")
+        if abs(min(total_pnl, 0)) >= total_drawdown_limit * 0.8:
+            warnings.append(f"⚠️ TOTAL DRAWDOWN WARNING — at {(abs(min(total_pnl,0))/account)*100:.1f}% of {PROP_FIRM_RULES['max_total_drawdown_pct']}% limit")
+        if abs(min(daily_pnl, 0)) >= daily_loss_limit:
+            warnings.append(f"🚨 DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
+        if abs(min(total_pnl, 0)) >= total_drawdown_limit:
+            warnings.append(f"🚨 TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
+
+        if warnings:
+            send_telegram("\n".join(warnings))
+
+        return jsonify({
+            "status": "updated",
+            "daily_pnl": daily_pnl,
+            "total_pnl": total_pnl,
+            "current_balance": current_balance,
+            "warnings": warnings
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================

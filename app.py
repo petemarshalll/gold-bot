@@ -473,42 +473,27 @@ Keep it punchy, practical and SMC focused.
 @app.route('/monday-gap', methods=['GET'])
 def monday_gap_analysis():
     try:
-        prompt = f"""
-You are an expert XAUUSD analyst. It is Monday morning before the London open.
+prompt = f"""
+You are an expert XAUUSD analyst. Monday morning before London open.
 
-Current key levels:
+Key levels:
 Weekly High: {KEY_LEVELS['weekly_high']}
 Weekly Low: {KEY_LEVELS['weekly_low']}
 Major Resistance: {KEY_LEVELS['major_resistance']}
 Major Support: {KEY_LEVELS['major_support']}
 
-Provide a Monday morning gap analysis covering:
+Give a concise Monday gap analysis covering:
+**GAP STRATEGY** — what to look for at Monday open
+**FIRST SETUP** — ideal first trade conditions this Monday
+**ASIAN SESSION** — likely direction before London
+**AVOID** — traps smart money typically sets Monday open
 
-**GAP ANALYSIS**
-Explain what traders should look for regarding weekend gaps on gold at Monday open.
-What gap sizes are significant and worth trading?
-Do gold gaps typically fill? In what timeframe?
-
-**MONDAY OPEN STRATEGY**
-What is the typical smart money behaviour at Monday open on gold?
-What setups should a trader look for in the first 2 hours?
-
-**ASIAN SESSION BIAS**
-What direction does the Asian session typically set up for London on Mondays?
-
-**FIRST TRADE OF THE WEEK**
-What would make an ideal first trade setup this Monday?
-What confirmation signals to wait for before entering?
-
-**AVOID**
-What traps do smart money typically set at Monday open?
-
-Keep it concise and actionable. SMC focused.
+Maximum 3 sentences per section. Be direct and actionable.
 """
 
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=500,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
 

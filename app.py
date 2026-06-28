@@ -82,10 +82,16 @@ def get_dxy_bias():
         # Flatten MultiIndex
         dxy.columns = [col[0] for col in dxy.columns]
         
-        # Get last 10 candles
-        recent = dxy.tail(10)
-        current = float(recent['Close'].iloc[-1])
-        previous = float(recent['Close'].iloc[-5])
+        # Drop any NaN rows
+        dxy = dxy.dropna(subset=['Close'])
+        
+        if len(dxy) < 5:
+            return "UNKNOWN", "DXY insufficient data"
+        
+        # Get values directly as floats
+        closes = dxy['Close'].values
+        current = float(closes[-1])
+        previous = float(closes[-5])
         
         # Calculate direction
         change = current - previous
@@ -93,18 +99,19 @@ def get_dxy_bias():
         
         if change_pct > 0.1:
             bias = "BULLISH"
-            implication = "DXY rising — bearish pressure on gold"
+            implication = "DXY rising — bearish pressure on gold confirmed"
         elif change_pct < -0.1:
             bias = "BEARISH"
-            implication = "DXY falling — bullish pressure on gold"
+            implication = "DXY falling — bullish pressure on gold confirmed"
         else:
             bias = "NEUTRAL"
-            implication = "DXY flat — no additional confluence"
+            implication = "DXY flat — no additional confluence from dollar"
             
-        return bias, f"DXY {bias} ({change_pct:+.2f}%) — {implication}"
+        return bias, f"DXY {bias} | Current: {current:.3f} | Change: {change_pct:+.2f}% | {implication}"
         
     except Exception as e:
         return "UNKNOWN", f"DXY check failed: {str(e)}"
+    
 # ============================================================
 # SESSION DETECTION
 # ============================================================

@@ -731,9 +731,9 @@ def test():
     try:
         fake_alert = {
             "type": "BEARISH_FVG_SWEEP",
-            "price": "2341.50",
-            "high": "2344.20",
-            "low": "2338.10",
+            "price": "4088.50",
+            "high": "4095.20",
+            "low": "4082.10",
             "timeframe": "15m"
         }
 

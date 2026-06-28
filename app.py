@@ -317,13 +317,13 @@ CRITICAL FORMATTING RULES:
 - Stop Loss: one sentence only
 - Target: two sentences maximum  
 - Always end with CONFIDENCE LEVEL and AVOID IF sections
-- Total response must be under 500 words
+- Total response must be under 1000 words
 """
 
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=550,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text

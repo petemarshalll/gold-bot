@@ -2,3 +2,4 @@ flask
 anthropic
 requests
 python-dotenv
+apscheduler

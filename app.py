@@ -877,7 +877,6 @@ def update_levels():
 # ============================================================
 if __name__ == '__main__':
     # Start the scheduler
-    global scheduler
     scheduler = BackgroundScheduler()
     
     # Morning briefing every day at 7am UTC

@@ -161,7 +161,7 @@ def send_telegram(message):
             message = trimmed[:last_period + 1] + "\n\n_✅ Analysis complete_"
         else:
             message = trimmed + "\n\n_✅ Analysis complete_"
-            
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -297,13 +297,18 @@ List any specific reasons to skip this trade entirely.
 
 Be direct and concise. Use the headers exactly as shown.
 
-IMPORTANT: You must complete every section fully. Keep each section to 3 sentences maximum. Never leave a sentence unfinished.
+CRITICAL FORMATTING RULES:
+- Maximum 2 sentences per section
+- Stop Loss: one sentence only
+- Target: two sentences maximum  
+- Always end with CONFIDENCE LEVEL and AVOID IF sections
+- Total response must be under 500 words
 """
 
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=700,
+            max_tokens=550,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text

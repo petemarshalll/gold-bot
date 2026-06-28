@@ -153,9 +153,15 @@ def check_drawdown_protection():
 def send_telegram(message):
     # Telegram max length is 4096 characters
     # Trim cleanly if too long
-    if len(message) > 3800:
-        message = message[:3800] + "\n\n_...message trimmed for length_"
-    
+    if len(message) > 4000:
+        # Find the last complete sentence before the limit
+        trimmed = message[:4000]
+        last_period = trimmed.rfind('.')
+        if last_period > 3500:
+            message = trimmed[:last_period + 1] + "\n\n_✅ Analysis complete_"
+        else:
+            message = trimmed + "\n\n_✅ Analysis complete_"
+            
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -290,12 +296,14 @@ Rate as LOW / MEDIUM / HIGH and explain why in one sentence.
 List any specific reasons to skip this trade entirely.
 
 Be direct and concise. Use the headers exactly as shown.
+
+IMPORTANT: You must complete every section fully. Keep each section to 3 sentences maximum. Never leave a sentence unfinished.
 """
 
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=800,
+            max_tokens=700,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text

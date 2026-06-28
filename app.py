@@ -493,7 +493,7 @@ Maximum 3 sentences per section. Be direct and actionable.
 
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=400,
+            max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
 

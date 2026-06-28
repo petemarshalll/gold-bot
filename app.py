@@ -38,14 +38,14 @@ drawdown_protection = False
 # KEY LEVELS — update these every Sunday
 # ============================================================
 KEY_LEVELS = {
-    "weekly_high": 2400.00,
-    "weekly_low": 2330.00,
-    "major_resistance": 2395.00,
-    "major_support": 2340.00,
-    "daily_high": 2375.00,
-    "daily_low": 2348.00,
-    "dealing_range_high": 2400.00,
-    "dealing_range_low": 2330.00,
+    "weekly_high": 4200.00,
+    "weekly_low": 3950.00,
+    "major_resistance": 4100.00,
+    "major_support": 3975.00,
+    "daily_high": 4091.00,
+    "daily_low": 4064.00,
+    "dealing_range_high": 4100.00,
+    "dealing_range_low": 3975.00,
 }
 
 # ============================================================

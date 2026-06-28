@@ -646,24 +646,28 @@ def auto_update_levels():
         # Get today's candle
         today = gold.tail(1)
 
+        # Flatten columns if yfinance returns MultiIndex
+        if isinstance(gold.columns, pd.MultiIndex):
+            gold.columns = gold.columns.get_level_values(0)
+
         # Calculate levels automatically
-        weekly_high = round(float(weekly['High'].max()), 2)
-        weekly_low = round(float(weekly['Low'].min()), 2)
-        daily_high = round(float(today['High'].iloc[0]), 2)
-        daily_low = round(float(today['Low'].iloc[0]), 2)
+        weekly_high = round(float(weekly['High'].max().item()), 2)
+        weekly_low = round(float(weekly['Low'].min().item()), 2)
+        daily_high = round(float(today['High'].values[0]), 2)
+        daily_low = round(float(today['Low'].values[0]), 2)
 
         # Find key resistance — highest high of last 10 days
         recent = gold.tail(10)
-        major_resistance = round(float(recent['High'].max()), 2)
+        major_resistance = round(float(recent['High'].max().item()), 2)
         
         # Find key support — lowest low of last 10 days
-        major_support = round(float(recent['Low'].min()), 2)
+        major_support = round(float(recent['Low'].min().item()), 2)
 
         # Dealing range based on last 20 days
         full_range = gold.tail(20)
-        dealing_range_high = round(float(full_range['High'].max()), 2)
-        dealing_range_low = round(float(full_range['Low'].min()), 2)
-
+        dealing_range_high = round(float(full_range['High'].max().item()), 2)
+        dealing_range_low = round(float(full_range['Low'].min().item()), 2)
+        
         # Update the global KEY_LEVELS automatically
         KEY_LEVELS = {
             "weekly_high": weekly_high,

@@ -3,3 +3,5 @@ anthropic
 requests
 python-dotenv
 apscheduler
+yfinance
+pandas

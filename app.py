@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
+import yfinance as yf
+import pandas as pd
 
 # Load secret keys from .env file
 load_dotenv()
@@ -625,6 +627,84 @@ def update_pnl():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# AUTO LEVEL DETECTION — runs every Sunday 9pm automatically
+# ============================================================
+@app.route('/auto-levels', methods=['GET'])
+def auto_update_levels():
+    global KEY_LEVELS
+    try:
+        # Pull last 30 days of gold data from Yahoo Finance
+        gold = yf.download('GC=F', period='30d', interval='1d', progress=False)
+
+        if gold.empty:
+            send_telegram("⚠️ Auto level update failed — no data returned from Yahoo Finance")
+            return jsonify({"status": "error", "message": "no data"})
+
+        # Get this week's candles (last 5 trading days)
+        weekly = gold.tail(5)
+        
+        # Get today's candle
+        today = gold.tail(1)
+
+        # Calculate levels automatically
+        weekly_high = round(float(weekly['High'].max()), 2)
+        weekly_low = round(float(weekly['Low'].min()), 2)
+        daily_high = round(float(today['High'].iloc[0]), 2)
+        daily_low = round(float(today['Low'].iloc[0]), 2)
+
+        # Find key resistance — highest high of last 10 days
+        recent = gold.tail(10)
+        major_resistance = round(float(recent['High'].max()), 2)
+        
+        # Find key support — lowest low of last 10 days
+        major_support = round(float(recent['Low'].min()), 2)
+
+        # Dealing range based on last 20 days
+        full_range = gold.tail(20)
+        dealing_range_high = round(float(full_range['High'].max()), 2)
+        dealing_range_low = round(float(full_range['Low'].min()), 2)
+
+        # Update the global KEY_LEVELS automatically
+        KEY_LEVELS = {
+            "weekly_high": weekly_high,
+            "weekly_low": weekly_low,
+            "major_resistance": major_resistance,
+            "major_support": major_support,
+            "daily_high": daily_high,
+            "daily_low": daily_low,
+            "dealing_range_high": dealing_range_high,
+            "dealing_range_low": dealing_range_low,
+        }
+
+        # Send confirmation to Telegram
+        levels_text = "\n".join([
+            f"- {k.replace('_', ' ').title()}: {v}" 
+            for k, v in KEY_LEVELS.items()
+        ])
+
+        telegram_message = f"""
+🤖 *Auto Level Update Complete*
+_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
+
+Levels have been automatically calculated from live market data and updated for the coming week:
+
+{levels_text}
+
+_Claude will use these levels in all analysis until next Sunday_ ✅
+"""
+        send_telegram(telegram_message)
+
+        return jsonify({
+            "status": "levels auto updated",
+            "levels": KEY_LEVELS
+        })
+
+    except Exception as e:
+        error_msg = f"⚠️ Auto level update error: {str(e)}"
+        send_telegram(error_msg)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -710,6 +790,15 @@ if __name__ == '__main__':
         func=lambda: morning_briefing(),
         trigger='cron',
         hour=7,
+        minute=0
+    )
+
+    # Auto update key levels every Sunday at 9pm UTC
+    scheduler.add_job(
+        func=lambda: auto_update_levels(),
+        trigger='cron',
+        day_of_week='sun',
+        hour=21,
         minute=0
     )
     

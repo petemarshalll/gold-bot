@@ -10,13 +10,14 @@ import os
 import json
 import csv
 import re
+import zipfile
+import io
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import yfinance as yf
 import pandas as pd
-import cot_reports as cot
 
 load_dotenv()
 
@@ -68,7 +69,7 @@ KEY_LEVELS = {
 }
 
 # ============================================================
-# PERSISTENT DATA — saves and loads across restarts
+# PERSISTENT DATA
 # ============================================================
 def save_state():
     try:
@@ -94,7 +95,6 @@ def load_state():
     try:
         with open('bot_state.json', 'r') as f:
             state = json.load(f)
-
         KEY_LEVELS.update(state.get('key_levels', {}))
         paper_trades = state.get('paper_trades', [])
         daily_pnl = state.get('daily_pnl', 0)
@@ -102,7 +102,6 @@ def load_state():
         current_balance = state.get('current_balance', 10000)
         trading_days = state.get('trading_days', 0)
         consecutive_losses = state.get('consecutive_losses', 0)
-
         print(f"State loaded — {len(paper_trades)} trades, balance ${current_balance}")
     except FileNotFoundError:
         print("No saved state found — starting fresh")
@@ -157,94 +156,60 @@ def check_spread(high, low, price):
         high = float(high)
         low = float(low)
         price = float(price)
-
-        # Calculate candle spread as proxy for market spread
         candle_range = high - low
         spread_pct = (candle_range / price) * 100
-
-        # Normal gold spread on 15m candle
-        # Under 0.1% = tight, good conditions
-        # 0.1-0.2% = normal
-        # Over 0.3% = wide, be cautious
-        # Over 0.5% = very wide, avoid
-
         if spread_pct > 0.5:
-            return True, f"⚠️ VERY WIDE spread detected ({spread_pct:.2f}%) — high slippage risk, avoid entry"
+            return True, f"⚠️ VERY WIDE spread ({spread_pct:.2f}%) — high slippage risk, avoid entry"
         elif spread_pct > 0.3:
             return True, f"⚠️ Wide spread ({spread_pct:.2f}%) — reduce position size if entering"
         else:
             return False, f"Spread normal ({spread_pct:.2f}%) — good entry conditions"
-
     except Exception as e:
         return False, "Spread check unavailable"
 
 # ============================================================
-# NEWS RISK CHECK — uses live economic calendar
+# NEWS RISK CHECK
 # ============================================================
 def check_news_risk():
     try:
         finnhub_key = os.getenv("FINNHUB_API_KEY")
-        
         if not finnhub_key:
             return check_news_risk_fallback()
-
-        # Get today's date
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        
-        # Pull economic calendar from Finnhub
         url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={today}&token={finnhub_key}"
         response = requests.get(url, timeout=5)
-        
         if response.status_code != 200:
             return check_news_risk_fallback()
-
         data = response.json()
         events = data.get('economicCalendar', [])
-
-        # Filter for high impact events
-        high_impact_keywords = [
-            'NFP', 'Non-Farm', 'CPI', 'Fed', 'FOMC', 'Interest Rate',
-            'GDP', 'Unemployment', 'Inflation', 'Powell', 'Treasury'
-        ]
-
+        high_impact_keywords = ['NFP', 'Non-Farm', 'CPI', 'Fed', 'FOMC', 'Interest Rate', 'GDP', 'Unemployment', 'Inflation', 'Powell', 'Treasury']
         now_utc = datetime.now(timezone.utc)
         current_minutes = now_utc.hour * 60 + now_utc.minute
-
         for event in events:
             impact = event.get('impact', '').lower()
             event_name = event.get('event', '')
             event_time = event.get('time', '')
-
-            # Only care about high impact events
             if impact not in ['high', '3']:
                 continue
-
-            # Check if any keyword matches
             is_relevant = any(kw.lower() in event_name.lower() for kw in high_impact_keywords)
             if not is_relevant:
                 continue
-
-            # Parse event time
             try:
                 if event_time:
                     event_dt = datetime.strptime(f"{today} {event_time}", '%Y-%m-%d %H:%M')
                     event_minutes = event_dt.hour * 60 + event_dt.minute
                     time_diff = abs(current_minutes - event_minutes)
-
                     if time_diff <= 30:
                         return True, f"⚠️ HIGH IMPACT: {event_name} at {event_time} UTC — avoid new trades"
             except:
                 continue
-
         return False, "No major news risk detected"
-
     except Exception as e:
         print(f"News calendar error: {e}")
         return check_news_risk_fallback()
 
 
 def check_news_risk_fallback():
-    # Fallback to hardcoded times if API fails
     hour = datetime.now(timezone.utc).hour
     minute = datetime.now(timezone.utc).minute
     weekday = datetime.now(timezone.utc).weekday()
@@ -258,16 +223,12 @@ def check_news_risk_fallback():
     return False, "No major news risk detected"
 
 # ============================================================
-# HOUR QUALITY FILTER — based on 2 year backtest data
+# HOUR QUALITY FILTER
 # ============================================================
 def check_hour_quality():
     hour = datetime.now(timezone.utc).hour
-    
-    # Best hours from backtesting — 55-56% win rate
     best_hours = [21, 22, 23]
-    # Worst hours from backtesting — 44-45% win rate
     worst_hours = [3, 6, 14]
-    
     if hour in best_hours:
         return "OPTIMAL", f"Hour {hour}:00 UTC historically shows 55-56% win rate — weight signals higher"
     elif hour in worst_hours:
@@ -319,6 +280,7 @@ def get_dxy_bias():
     except Exception as e:
         return "UNKNOWN", f"DXY check failed: {str(e)}", "NEUTRAL"
 
+
 def get_dxy_confluence(alert_type, dxy_implication):
     is_bearish = "BEARISH" in alert_type
     is_bullish = "BULLISH" in alert_type
@@ -330,6 +292,69 @@ def get_dxy_confluence(alert_type, dxy_implication):
         return "⚠️ NEUTRAL — DXY flat, no additional confluence", 0
     else:
         return "❌ CONFLICT — DXY opposes this gold signal, reduce confidence", -1
+
+# ============================================================
+# COT REPORT
+# ============================================================
+def get_cot_fallback():
+    return {
+        "date": "unavailable",
+        "spec_bias": "UNKNOWN",
+        "spec_desc": "COT data unavailable this week",
+        "change_desc": "Check cftc.gov for latest positioning",
+        "net_position": 0,
+        "net_change": 0
+    }
+
+
+def get_cot_data():
+    try:
+        year = datetime.now(timezone.utc).year
+        url = f"https://www.cftc.gov/files/dea/history/fut_fin_xls_{year}.zip"
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            return get_cot_fallback()
+        z = zipfile.ZipFile(io.BytesIO(response.content))
+        filename = z.namelist()[0]
+        with z.open(filename) as f:
+            df = pd.read_excel(f)
+        if df.empty:
+            return get_cot_fallback()
+        gold = df[df['Market and Exchange Names'].str.contains('GOLD', case=False, na=False)]
+        if gold.empty:
+            return get_cot_fallback()
+        gold = gold.sort_values('As of Date in Form YYYY-MM-DD', ascending=False)
+        latest = gold.iloc[0]
+        previous = gold.iloc[1] if len(gold) > 1 else gold.iloc[0]
+        noncomm_long = int(latest.get('Noncommercial Positions-Long (All)', 0))
+        noncomm_short = int(latest.get('Noncommercial Positions-Short (All)', 0))
+        prev_long = int(previous.get('Noncommercial Positions-Long (All)', 0))
+        prev_short = int(previous.get('Noncommercial Positions-Short (All)', 0))
+        date = str(latest.get('As of Date in Form YYYY-MM-DD', 'unknown'))
+        net_spec = noncomm_long - noncomm_short
+        prev_net = prev_long - prev_short
+        net_change = net_spec - prev_net
+        if net_spec > 0:
+            spec_bias = "NET LONG"
+            spec_desc = f"Speculators net long {net_spec:,} contracts — bullish institutional bias"
+        else:
+            spec_bias = "NET SHORT"
+            spec_desc = f"Speculators net short {abs(net_spec):,} contracts — bearish institutional bias"
+        if net_change > 0:
+            change_desc = f"Increasing longs (+{net_change:,} contracts this week)"
+        else:
+            change_desc = f"Increasing shorts ({net_change:,} contracts this week)"
+        return {
+            "date": date,
+            "spec_bias": spec_bias,
+            "spec_desc": spec_desc,
+            "change_desc": change_desc,
+            "net_position": net_spec,
+            "net_change": net_change
+        }
+    except Exception as e:
+        print(f"COT error: {e}")
+        return get_cot_fallback()
 
 # ============================================================
 # SEND TELEGRAM
@@ -410,7 +435,7 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
     return trade_id
 
 # ============================================================
-# MONITOR ACTIVE TRADES — SL/TP based
+# MONITOR ACTIVE TRADES
 # ============================================================
 def monitor_active_trades(current_price):
     current_price = float(current_price)
@@ -465,6 +490,16 @@ Result: LOSS ❌ -{points:.2f} points
             json.dump(paper_trades, f, indent=2)
     except Exception as e:
         print(f"Paper trade update error: {e}")
+
+# ============================================================
+# LEARNED RULES
+# ============================================================
+def get_learned_rules():
+    try:
+        with open('learned_rules.txt', 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        return "No learned rules yet — system will develop rules after first self-review."
 
 # ============================================================
 # MAIN CLAUDE ANALYSIS
@@ -560,7 +595,6 @@ Total response must be under 200 words. Every section one line maximum.
             },
             messages=[{"role": "user", "content": prompt}]
         )
-        # Extract text block — skip thinking blocks
         for block in message.content:
             if block.type == "text":
                 return block.text
@@ -578,12 +612,20 @@ def webhook():
         data = request.json
         print(f"Alert received: {data}")
 
+        # Define alert_type first — used throughout
+        alert_type = data.get('type', '')
+
+        # Filter out BULLISH_SWEEP — 39% win rate over 2 years
+        if alert_type == "BULLISH_SWEEP":
+            log_to_csv(alert_type, data.get('price'), "FILTERED", "BULLISH_SWEEP filtered — 39% historical win rate")
+            return jsonify({"status": "filtered", "reason": "BULLISH_SWEEP has 39% win rate over 2 years"})
+
         session_name, session_desc, is_killzone = get_session()
         zone, zone_pct, zone_advice = get_premium_discount(data.get('price', 0))
         news_risk, news_msg = check_news_risk()
         drawdown_active, drawdown_msg = check_drawdown_protection()
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
-        dxy_confluence_msg, dxy_score = get_dxy_confluence(data.get('type', ''), dxy_implication)
+        dxy_confluence_msg, dxy_score = get_dxy_confluence(alert_type, dxy_implication)
         hour_quality, hour_msg = check_hour_quality()
         spread_risk, spread_msg = check_spread(
             data.get('high', 0),
@@ -592,7 +634,7 @@ def webhook():
         )
 
         recent_alerts.append({
-            "type": data.get('type', 'Unknown'),
+            "type": alert_type,
             "price": data.get('price', 'Unknown'),
             "timeframe": data.get('timeframe', '15m'),
             "time": datetime.utcnow().strftime('%H:%M UTC')
@@ -620,25 +662,18 @@ def webhook():
 
         # Adjust confidence based on 2 year backtest data
         if "FVG" in alert_type and confidence == "LOW":
-            confidence = "MEDIUM"  # FVGs historically 53% — upgrade LOW to MEDIUM
+            confidence = "MEDIUM"
         if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
-            confidence = "MEDIUM"  # Bearish sweeps 52% — cap at MEDIUM unless exceptional
+            confidence = "MEDIUM"
 
         if drawdown_active and confidence == "LOW":
-            log_to_csv(data.get('type'), data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
+            log_to_csv(alert_type, data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
             return jsonify({"status": "skipped", "reason": "drawdown protection active"})
 
-# Filter out BULLISH_SWEEP — 39% win rate over 2 years, not viable
-        if alert_type == "BULLISH_SWEEP":
-            log_to_csv(alert_type, data.get('price'), "FILTERED", "BULLISH_SWEEP filtered — 39% historical win rate")
-            print(f"BULLISH_SWEEP filtered out based on backtesting data")
-            return jsonify({"status": "filtered", "reason": "BULLISH_SWEEP has 39% win rate over 2 years"})
-
         if news_risk and confidence != "HIGH":
-            send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {data.get('type')} at {data.get('price')}")
+            send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
             return jsonify({"status": "suppressed", "reason": "news risk"})
 
-        alert_type = data.get('type', '')
         emoji = "🔴" if "BEARISH" in alert_type else "🟢" if "BULLISH" in alert_type else "🟡"
         killzone_badge = "🎯 KILLZONE" if is_killzone else ""
 
@@ -688,11 +723,9 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
             log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time)
 
         monitor_active_trades(data.get('price', 0))
+        save_state()
 
         return jsonify({"status": "ok"})
-    
-    # Save state after every alert
-        save_state()
 
     except Exception as e:
         error_msg = f"⚠️ SYSTEM ERROR: {str(e)}"
@@ -741,8 +774,8 @@ Cover in under 300 words:
 def weekly_bias_report():
     try:
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
-        cot = get_cot_data()
-        cot_summary = f"{cot['spec_bias']} — {cot['spec_desc']} | {cot['change_desc']}"
+        cot_data = get_cot_data()
+        cot_summary = f"{cot_data['spec_bias']} — {cot_data['spec_desc']} | {cot_data['change_desc']}"
         levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in KEY_LEVELS.items()])
         prompt = f"""
 You are an expert XAUUSD analyst. Weekly bias report for an SMC trader.
@@ -798,6 +831,61 @@ Cover in under 250 words:
         )
         send_telegram(f"🌅 *XAUUSD Monday Gap Analysis — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "monday gap sent"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
+# COT WEEKLY REPORT
+# ============================================================
+@app.route('/cot-report', methods=['GET'])
+def cot_report():
+    try:
+        cot_data = get_cot_data()
+        prompt = f"""
+You are an expert gold analyst interpreting the weekly Commitment of Traders report.
+
+## LATEST COT DATA — GOLD FUTURES
+Date: {cot_data['date']}
+Speculator Position: {cot_data['spec_bias']}
+Detail: {cot_data['spec_desc']}
+Weekly Change: {cot_data['change_desc']}
+Net Position: {cot_data['net_position']:,} contracts
+
+## YOUR ANALYSIS
+
+**INSTITUTIONAL BIAS**
+What does this positioning tell us about smart money's view on gold?
+
+**CONFLUENCE WITH TECHNICAL PICTURE**
+Key levels: High {KEY_LEVELS['weekly_high']} | Low {KEY_LEVELS['weekly_low']} | Resistance {KEY_LEVELS['major_resistance']} | Support {KEY_LEVELS['major_support']}
+Does institutional positioning support or conflict with current technical structure?
+
+**TRADING IMPLICATION**
+Should we favour longs or shorts next week based on COT data?
+
+**WARNING SIGNS**
+Any extreme positioning that historically precedes reversals?
+
+Keep it concise and actionable. Maximum 200 words.
+"""
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        analysis = message.content[0].text
+        telegram_message = f"""
+📊 *COT Report Analysis — Gold Futures*
+_Week of {cot_data['date']}_
+
+*Institutional Position:* {cot_data['spec_bias']}
+*Detail:* {cot_data['spec_desc']}
+*Weekly Change:* {cot_data['change_desc']}
+
+{analysis}
+"""
+        send_telegram(telegram_message)
+        return jsonify({"status": "COT report sent", "spec_bias": cot_data['spec_bias'], "net_position": cot_data['net_position']})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -909,6 +997,28 @@ def auto_update_levels():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# INTRADAY LEVEL UPDATER
+# ============================================================
+@app.route('/update-intraday', methods=['GET'])
+def update_intraday():
+    global KEY_LEVELS
+    try:
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        if gold.empty:
+            return jsonify({"status": "no data"})
+        gold.columns = [col[0] for col in gold.columns]
+        todays_high = round(float(gold['High'].max()), 2)
+        todays_low = round(float(gold['Low'].min()), 2)
+        current_price = round(float(gold['Close'].iloc[-1]), 2)
+        KEY_LEVELS['daily_high'] = todays_high
+        KEY_LEVELS['daily_low'] = todays_low
+        print(f"Intraday update: High {todays_high} | Low {todays_low} | Current {current_price}")
+        return jsonify({"status": "intraday levels updated", "daily_high": todays_high, "daily_low": todays_low, "current_price": current_price})
+    except Exception as e:
+        print(f"Intraday update error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # UPDATE KEY LEVELS MANUALLY
 # ============================================================
 @app.route('/update-levels', methods=['POST'])
@@ -923,577 +1033,34 @@ def update_levels():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
-# DASHBOARD
-# ============================================================
-@app.route('/dashboard', methods=['GET'])
-def dashboard():
-    session_name, session_desc, is_killzone = get_session()
-    zone, zone_pct, zone_advice = get_premium_discount(
-        (KEY_LEVELS['dealing_range_high'] + KEY_LEVELS['dealing_range_low']) / 2
-    )
-    dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
-    news_risk, news_msg = check_news_risk()
-
-    zone_color = "#ff4444" if zone == "PREMIUM" else "#44ff88"
-    dxy_color = "#ff4444" if dxy_direction == "BULLISH" else "#44ff88" if dxy_direction == "BEARISH" else "#ffaa00"
-    killzone_badge = "🎯 KILLZONE ACTIVE" if is_killzone else ""
-    news_badge = f"⚠️ {news_msg}" if news_risk else "✅ No major news risk"
-
-    alerts_html = ""
-    for a in reversed(recent_alerts[-10:]):
-        alert_type = a.get('type', '')
-        color = "#ff4444" if "BEARISH" in alert_type else "#44ff88"
-        alerts_html += f"""
-        <div class="alert-row">
-            <span style="color:{color}">●</span>
-            <span class="alert-time">{a.get('time', '')}</span>
-            <span class="alert-type">{alert_type}</span>
-            <span class="alert-tf">{a.get('timeframe', '')} | {a.get('price', '')}</span>
-        </div>
-        """
-    if not alerts_html:
-        alerts_html = "<div class='no-data'>No alerts this session yet</div>"
-
-    trades_html = ""
-    for trade_id, trade in active_trades.items():
-        direction = trade.get('direction', '')
-        color = "#44ff88" if direction == "LONG" else "#ff4444"
-        trades_html += f"""
-        <div class="trade-row">
-            <span style="color:{color}">{'▲' if direction == 'LONG' else '▼'} {direction}</span>
-            <span>Entry: {trade.get('entry', 0):.2f}</span>
-            <span>SL: {trade.get('stop', 0):.2f}</span>
-            <span>TP: {trade.get('target', 0):.2f}</span>
-            <span class="trade-open">OPEN</span>
-        </div>
-        """
-    if not trades_html:
-        trades_html = "<div class='no-data'>No active paper trades</div>"
-
-    levels_html = ""
-    for k, v in KEY_LEVELS.items():
-        label = k.replace('_', ' ').title()
-        levels_html += f"""
-        <div class="level-row">
-            <span class="level-label">{label}</span>
-            <span class="level-value">{v}</span>
-        </div>
-        """
-
-    account = PROP_FIRM_RULES["account_size"]
-    daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
-    total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
-    daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
-    total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
-    daily_status_color = "#ff4444" if daily_used_pct >= 80 else "#ffaa00" if daily_used_pct >= 50 else "#44ff88"
-    total_status_color = "#ff4444" if total_used_pct >= 80 else "#ffaa00" if total_used_pct >= 50 else "#44ff88"
-
-    html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Gold Bot Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="30">
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            background: #0a0a1a;
-            color: #eee;
-            font-family: 'Courier New', monospace;
-            padding: 15px;
-            max-width: 900px;
-            margin: 0 auto;
-        }}
-        .header {{
-            text-align: center;
-            padding: 20px 0 15px;
-            border-bottom: 1px solid #333;
-            margin-bottom: 20px;
-        }}
-        .header h1 {{
-            color: #ffd700;
-            font-size: 24px;
-            letter-spacing: 3px;
-        }}
-        .header .subtitle {{
-            color: #888;
-            font-size: 12px;
-            margin-top: 5px;
-        }}
-        .status-bar {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: #111130;
-            border: 1px solid #ffd700;
-            border-radius: 8px;
-            padding: 12px 20px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-            gap: 10px;
-        }}
-        .status-item {{
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }}
-        .status-label {{
-            color: #888;
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }}
-        .status-value {{
-            color: #ffd700;
-            font-size: 14px;
-            font-weight: bold;
-            margin-top: 3px;
-        }}
-        .grid {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 15px;
-        }}
-        @media (max-width: 600px) {{
-            .grid {{ grid-template-columns: 1fr; }}
-        }}
-        .card {{
-            background: #111130;
-            border: 1px solid #333;
-            border-radius: 8px;
-            padding: 15px;
-        }}
-        .card h3 {{
-            color: #ffd700;
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 2px;
-            margin-bottom: 12px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #333;
-        }}
-        .full-width {{
-            grid-column: 1 / -1;
-        }}
-        .level-row {{
-            display: flex;
-            justify-content: space-between;
-            padding: 5px 0;
-            border-bottom: 1px solid #1a1a3a;
-            font-size: 13px;
-        }}
-        .level-label {{ color: #aaa; }}
-        .level-value {{ color: #ffd700; font-weight: bold; }}
-        .alert-row {{
-            display: flex;
-            gap: 10px;
-            padding: 6px 0;
-            border-bottom: 1px solid #1a1a3a;
-            font-size: 12px;
-            align-items: center;
-            flex-wrap: wrap;
-        }}
-        .alert-time {{ color: #888; min-width: 70px; }}
-        .alert-type {{ color: #fff; flex: 1; }}
-        .alert-tf {{ color: #888; font-size: 11px; }}
-        .trade-row {{
-            display: flex;
-            gap: 15px;
-            padding: 8px 0;
-            border-bottom: 1px solid #1a1a3a;
-            font-size: 12px;
-            align-items: center;
-            flex-wrap: wrap;
-        }}
-        .trade-open {{
-            color: #ffaa00;
-            font-weight: bold;
-            margin-left: auto;
-        }}
-        .prop-row {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 8px 0;
-            border-bottom: 1px solid #1a1a3a;
-            font-size: 13px;
-        }}
-        .prop-label {{ color: #aaa; }}
-        .progress-bar {{
-            background: #222;
-            border-radius: 4px;
-            height: 6px;
-            margin-top: 4px;
-            overflow: hidden;
-        }}
-        .progress-fill {{
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.3s;
-        }}
-        .no-data {{
-            color: #555;
-            font-size: 12px;
-            padding: 10px 0;
-            text-align: center;
-        }}
-        .badge {{
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            font-weight: bold;
-        }}
-        .killzone-badge {{
-            background: #ffd700;
-            color: #000;
-        }}
-        .news-badge {{
-            background: #ff4444;
-            color: #fff;
-        }}
-        .safe-badge {{
-            background: #1a4a2a;
-            color: #44ff88;
-        }}
-        .footer {{
-            text-align: center;
-            color: #555;
-            font-size: 11px;
-            margin-top: 20px;
-            padding-top: 15px;
-            border-top: 1px solid #333;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>🥇 GOLD BOT</h1>
-        <div class="subtitle">Auto-refreshes every 30 seconds | {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</div>
-    </div>
-
-    <div class="status-bar">
-        <div class="status-item">
-            <span class="status-label">System</span>
-            <span class="status-value">🟢 LIVE</span>
-        </div>
-        <div class="status-item">
-            <span class="status-label">Session</span>
-            <span class="status-value">{session_name}</span>
-        </div>
-        <div class="status-item">
-            <span class="status-label">Killzone</span>
-            <span class="status-value">{'🎯 ACTIVE' if is_killzone else '⭕ INACTIVE'}</span>
-        </div>
-        <div class="status-item">
-            <span class="status-label">Zone</span>
-            <span class="status-value" style="color:{zone_color}">{zone} {zone_pct}%</span>
-        </div>
-        <div class="status-item">
-            <span class="status-label">DXY</span>
-            <span class="status-value" style="color:{dxy_color}">{dxy_direction}</span>
-        </div>
-        <div class="status-item">
-            <span class="status-label">Alerts Today</span>
-            <span class="status-value">{len(recent_alerts)}</span>
-        </div>
-    </div>
-
-    <div style="margin-bottom:15px;">
-        {'<span class="badge news-badge">⚠️ ' + news_msg + '</span>' if news_risk else '<span class="badge safe-badge">✅ No major news risk</span>'}
-    </div>
-
-    <div class="grid">
-        <div class="card">
-            <h3>📊 Key Levels</h3>
-            {levels_html}
-        </div>
-
-        <div class="card">
-            <h3>🏦 Prop Firm Status</h3>
-            <div class="prop-row">
-                <span class="prop-label">Account Size</span>
-                <span style="color:#ffd700">${account:,.2f}</span>
-            </div>
-            <div class="prop-row">
-                <span class="prop-label">Balance</span>
-                <span style="color:#44ff88">${current_balance:,.2f}</span>
-            </div>
-            <div class="prop-row">
-                <span class="prop-label">Today P&L</span>
-                <span style="color:{'#44ff88' if daily_pnl >= 0 else '#ff4444'}">${daily_pnl:,.2f}</span>
-            </div>
-            <div class="prop-row">
-                <span class="prop-label">Total P&L</span>
-                <span style="color:{'#44ff88' if total_pnl >= 0 else '#ff4444'}">${total_pnl:,.2f}</span>
-            </div>
-            <div style="margin-top:10px;">
-                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;">
-                    <span>Daily Loss Used</span>
-                    <span style="color:{daily_status_color}">{daily_used_pct:.1f}% of {PROP_FIRM_RULES['max_daily_loss_pct']}%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width:{min(daily_used_pct, 100)}%;background:{daily_status_color}"></div>
-                </div>
-            </div>
-            <div style="margin-top:8px;">
-                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;">
-                    <span>Total Drawdown Used</span>
-                    <span style="color:{total_status_color}">{total_used_pct:.1f}% of {PROP_FIRM_RULES['max_total_drawdown_pct']}%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width:{min(total_used_pct, 100)}%;background:{total_status_color}"></div>
-                </div>
-            </div>
-            <div class="prop-row" style="margin-top:10px;">
-                <span class="prop-label">Trading Days</span>
-                <span style="color:#ffd700">{trading_days}/{PROP_FIRM_RULES['min_trading_days']}</span>
-            </div>
-            <div class="prop-row">
-                <span class="prop-label">Drawdown Protection</span>
-                <span style="color:{'#ff4444' if drawdown_protection else '#44ff88'}">{'ACTIVE' if drawdown_protection else 'OFF'}</span>
-            </div>
-        </div>
-
-        <div class="card full-width">
-            <h3>📡 Today's Alerts ({len(recent_alerts)} this session)</h3>
-            {alerts_html}
-        </div>
-
-        <div class="card full-width">
-            <h3>📈 Active Paper Trades ({len(active_trades)} open)</h3>
-            {trades_html}
-        </div>
-    </div>
-
-    <div class="footer">
-        Gold Bot v2.0 | Railway | Auto-refreshes every 30s | Last updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}
-    </div>
-</body>
-</html>
-"""
-    return html
-
-# ============================================================
-# SELF LEARNING — Claude analyses its own performance
-# ============================================================
-@app.route('/self-review', methods=['GET'])
-def self_review():
-    try:
-        # Load trade log
-        trades = []
-        try:
-            with open('trade_log.csv', 'r') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) >= 4:
-                        trades.append({
-                            "time": row[0],
-                            "type": row[1],
-                            "price": row[2],
-                            "confidence": row[3],
-                            "analysis": row[4] if len(row) > 4 else ""
-                        })
-        except FileNotFoundError:
-            trades = []
-
-        # Load paper trades
-        paper = []
-        try:
-            with open('paper_trades.json', 'r') as f:
-                paper = json.load(f)
-        except FileNotFoundError:
-            paper = []
-
-        if len(trades) < 5:
-            send_telegram("⚠️ Self review skipped — not enough trade data yet. Need at least 5 alerts logged.")
-            return jsonify({"status": "insufficient data"})
-
-        # Build performance summary
-        wins = [t for t in paper if t.get('result') == 'WIN']
-        losses = [t for t in paper if t.get('result') == 'LOSS']
-        open_trades = [t for t in paper if t.get('result') == 'OPEN']
-
-        win_rate = len(wins) / (len(wins) + len(losses)) * 100 if (wins or losses) else 0
-
-        # Analyse by type
-        type_performance = {}
-        for trade in paper:
-            t_type = trade.get('type', 'UNKNOWN')
-            if t_type not in type_performance:
-                type_performance[t_type] = {"wins": 0, "losses": 0}
-            if trade.get('result') == 'WIN':
-                type_performance[t_type]['wins'] += 1
-            elif trade.get('result') == 'LOSS':
-                type_performance[t_type]['losses'] += 1
-
-        # Analyse by confidence
-        high_conf = [t for t in paper if t.get('confidence') == 'HIGH']
-        med_conf = [t for t in paper if t.get('confidence') == 'MEDIUM']
-        high_wins = len([t for t in high_conf if t.get('result') == 'WIN'])
-        med_wins = len([t for t in med_conf if t.get('result') == 'WIN'])
-
-        # Build performance text for Claude
-        type_summary = "\n".join([
-            f"- {k}: {v['wins']}W / {v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100) if v['wins']+v['losses'] > 0 else 0}% win rate)"
-            for k, v in type_performance.items()
-        ])
-
-        trades_summary = "\n".join([
-            f"- {t['time']}: {t['type']} | Conf: {t['confidence']} | Result: {t['result']}"
-            for t in paper[-20:]
-        ])
-
-        prompt = f"""
-You are a trading system analyst reviewing the performance of an automated XAUUSD alert system.
-
-## PERFORMANCE DATA
-
-Total Alerts Logged: {len(trades)}
-Closed Paper Trades: {len(wins) + len(losses)}
-Wins: {len(wins)}
-Losses: {len(losses)}
-Win Rate: {win_rate:.1f}%
-Open Trades: {len(open_trades)}
-
-HIGH Confidence trades: {len(high_conf)} total | {high_wins} wins
-MEDIUM Confidence trades: {len(med_conf)} total | {med_wins} wins
-
-## PERFORMANCE BY SETUP TYPE
-{type_summary if type_summary else "No completed trades yet"}
-
-## RECENT TRADE LOG
-{trades_summary if trades_summary else "No trades logged yet"}
-
-## YOUR TASK
-
-Analyse this performance data and provide:
-
-**WHAT IS WORKING**
-Which setup types, sessions or conditions are producing the best results?
-
-**WHAT IS NOT WORKING**
-Which setup types or conditions are consistently losing?
-
-**KEY PATTERN IDENTIFIED**
-The single most important pattern you can see in this data.
-
-**RECOMMENDED RULE CHANGES**
-Specific changes to make to improve performance:
-- Should any setup types be filtered out entirely?
-- Should confidence thresholds be adjusted?
-- Are certain sessions consistently underperforming?
-
-**UPDATED TRADING RULES**
-Write 3-5 specific rules for the system to follow next week based on this data.
-Example format: "Rule 1: Do not flag Asian session standalone FVGs as above MEDIUM confidence"
-
-**NEXT WEEK FOCUS**
-One specific thing to prioritise next week.
-
-Be direct and data driven. Base everything on the actual numbers above.
-"""
-
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        review = message.content[0].text
-
-        # Save as PENDING rules — not applied until approved
-        try:
-            with open('pending_rules.txt', 'w') as f:
-                f.write(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
-                f.write(review)
-            print("Rules saved as pending — awaiting approval")
-        except Exception as e:
-            print(f"Rules save error: {e}")
-
-        telegram_message = f"""
-🧠 *Gold Bot Self-Review Report*
-_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
-
-📊 Stats: {len(trades)} alerts | {len(wins)}W {len(losses)}L | {win_rate:.1f}% win rate
-
-{review}
-
----
-⚠️ *These rules are PENDING YOUR APPROVAL*
-They have NOT been applied to the live system yet.
-
-Approve: https://web-production-387c47.up.railway.app/approve-rules
-
-Reject: https://web-production-387c47.up.railway.app/reject-rules
-
-Review carefully before approving.
-"""
-        send_telegram(telegram_message)
-
-        return jsonify({
-            "status": "self review complete",
-            "win_rate": win_rate,
-            "total_trades": len(trades)
-        })
-
-    except Exception as e:
-        error_msg = f"⚠️ Self review error: {str(e)}"
-        send_telegram(error_msg)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-# ============================================================
-# LOAD LEARNED RULES INTO ANALYSIS
-# ============================================================
-def get_learned_rules():
-    try:
-        with open('learned_rules.txt', 'r') as f:
-            return f.read()
-    except FileNotFoundError:
-        return "No learned rules yet — system will develop rules after first self-review."
-
-# ============================================================
-# SMART ENTRY TIMER — alerts when price hits entry zone
+# SMART ENTRY TIMER
 # ============================================================
 @app.route('/check-entries', methods=['GET'])
 def check_entries():
     try:
         if not active_trades:
             return jsonify({"status": "no active trades to monitor"})
-
-        # Get current gold price
         gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
         if gold.empty:
             return jsonify({"status": "no price data"})
-
         gold.columns = [col[0] for col in gold.columns]
         current_price = round(float(gold['Close'].iloc[-1]), 2)
-
         alerts_sent = 0
         for trade_id, trade in active_trades.items():
             if trade.get('result') != 'OPEN':
                 continue
-
             entry = trade.get('entry', 0)
             stop = trade.get('stop', 0)
             target = trade.get('target', 0)
             direction = trade.get('direction', '')
-
-            # Define entry zone as within 0.3% of entry price
             entry_zone_high = entry * 1.003
             entry_zone_low = entry * 0.997
-
             in_entry_zone = entry_zone_low <= current_price <= entry_zone_high
-
             if in_entry_zone:
                 risk = abs(entry - stop)
                 reward = abs(target - entry)
                 rr = round(reward / risk, 1) if risk > 0 else 0
-
-                message = f"""
+                send_telegram(f"""
 ⏰ *ENTRY ZONE ALERT*
 _{trade['type']} | {trade['time']}_
 
@@ -1508,185 +1075,257 @@ Target: {target}
 R:R = 1:{rr}
 
 _Act now or wait for next candle close confirmation_
-"""
-                send_telegram(message)
+""")
                 alerts_sent += 1
-
-        return jsonify({
-            "status": "checked",
-            "current_price": current_price,
-            "active_trades": len(active_trades),
-            "entry_alerts_sent": alerts_sent
-        })
-
+        return jsonify({"status": "checked", "current_price": current_price, "active_trades": len(active_trades), "entry_alerts_sent": alerts_sent})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
-# INTRADAY LEVEL UPDATER — refreshes daily high/low every 30 mins
+# SELF LEARNING
 # ============================================================
-@app.route('/update-intraday', methods=['GET'])
-def update_intraday():
-    global KEY_LEVELS
+@app.route('/self-review', methods=['GET'])
+def self_review():
     try:
-        # Pull today's 5 minute data
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        trades = []
+        try:
+            with open('trade_log.csv', 'r') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) >= 4:
+                        trades.append({"time": row[0], "type": row[1], "price": row[2], "confidence": row[3], "analysis": row[4] if len(row) > 4 else ""})
+        except FileNotFoundError:
+            trades = []
 
-        if gold.empty:
-            return jsonify({"status": "no data"})
+        paper = []
+        try:
+            with open('paper_trades.json', 'r') as f:
+                paper = json.load(f)
+        except FileNotFoundError:
+            paper = []
 
-        # Flatten MultiIndex
-        gold.columns = [col[0] for col in gold.columns]
+        if len(trades) < 5:
+            send_telegram("⚠️ Self review skipped — not enough trade data yet. Need at least 5 alerts logged.")
+            return jsonify({"status": "insufficient data"})
 
-        # Calculate today's developing high and low
-        todays_high = round(float(gold['High'].max()), 2)
-        todays_low = round(float(gold['Low'].min()), 2)
-        current_price = round(float(gold['Close'].iloc[-1]), 2)
+        wins = [t for t in paper if t.get('result') == 'WIN']
+        losses = [t for t in paper if t.get('result') == 'LOSS']
+        open_trades = [t for t in paper if t.get('result') == 'OPEN']
+        win_rate = len(wins) / (len(wins) + len(losses)) * 100 if (wins or losses) else 0
 
-        # Update just the daily levels
-        KEY_LEVELS['daily_high'] = todays_high
-        KEY_LEVELS['daily_low'] = todays_low
+        type_performance = {}
+        for trade in paper:
+            t_type = trade.get('type', 'UNKNOWN')
+            if t_type not in type_performance:
+                type_performance[t_type] = {"wins": 0, "losses": 0}
+            if trade.get('result') == 'WIN':
+                type_performance[t_type]['wins'] += 1
+            elif trade.get('result') == 'LOSS':
+                type_performance[t_type]['losses'] += 1
 
-        print(f"Intraday update: High {todays_high} | Low {todays_low} | Current {current_price}")
+        high_conf = [t for t in paper if t.get('confidence') == 'HIGH']
+        med_conf = [t for t in paper if t.get('confidence') == 'MEDIUM']
+        high_wins = len([t for t in high_conf if t.get('result') == 'WIN'])
+        med_wins = len([t for t in med_conf if t.get('result') == 'WIN'])
 
-        return jsonify({
-            "status": "intraday levels updated",
-            "daily_high": todays_high,
-            "daily_low": todays_low,
-            "current_price": current_price
-        })
+        type_summary = "\n".join([
+            f"- {k}: {v['wins']}W / {v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100) if v['wins']+v['losses'] > 0 else 0}% win rate)"
+            for k, v in type_performance.items()
+        ])
+
+        trades_summary = "\n".join([
+            f"- {t['time']}: {t['type']} | Conf: {t['confidence']} | Result: {t['result']}"
+            for t in paper[-20:]
+        ])
+
+        prompt = f"""
+You are a trading system analyst reviewing the performance of an automated XAUUSD alert system.
+
+Total Alerts Logged: {len(trades)}
+Closed Paper Trades: {len(wins) + len(losses)}
+Wins: {len(wins)} | Losses: {len(losses)} | Win Rate: {win_rate:.1f}%
+HIGH Confidence: {len(high_conf)} total | {high_wins} wins
+MEDIUM Confidence: {len(med_conf)} total | {med_wins} wins
+
+Performance by type:
+{type_summary if type_summary else "No completed trades yet"}
+
+Recent trades:
+{trades_summary if trades_summary else "No trades logged yet"}
+
+Provide:
+**WHAT IS WORKING** — best performing setups
+**WHAT IS NOT WORKING** — consistently losing setups
+**KEY PATTERN** — single most important finding
+**RECOMMENDED RULE CHANGES** — specific improvements
+**UPDATED TRADING RULES** — 3-5 rules for next week
+**NEXT WEEK FOCUS** — one priority
+
+Be direct and data driven.
+"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        review = message.content[0].text
+
+        try:
+            with open('pending_rules.txt', 'w') as f:
+                f.write(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+                f.write(review)
+        except Exception as e:
+            print(f"Rules save error: {e}")
+
+        send_telegram(f"""
+🧠 *Gold Bot Self-Review Report*
+_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
+
+📊 Stats: {len(trades)} alerts | {len(wins)}W {len(losses)}L | {win_rate:.1f}% win rate
+
+{review}
+
+---
+⚠️ *These rules are PENDING YOUR APPROVAL*
+
+Approve: https://web-production-387c47.up.railway.app/approve-rules
+Reject: https://web-production-387c47.up.railway.app/reject-rules
+""")
+
+        return jsonify({"status": "self review complete", "win_rate": win_rate, "total_trades": len(trades)})
 
     except Exception as e:
-        print(f"Intraday update error: {e}")
+        error_msg = f"⚠️ Self review error: {str(e)}"
+        send_telegram(error_msg)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
-# BACKTESTING BATCH ANALYSER — 2 years of XAUUSD data
+# RULE APPROVAL SYSTEM
+# ============================================================
+@app.route('/approve-rules', methods=['GET'])
+def approve_rules():
+    try:
+        with open('pending_rules.txt', 'r') as f:
+            pending = f.read()
+        with open('learned_rules.txt', 'w') as f:
+            f.write(f"Approved: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+            f.write(pending)
+        with open('pending_rules.txt', 'w') as f:
+            f.write("No pending rules")
+        send_telegram(f"✅ *Rule Update Approved*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nNew learned rules applied to live system.")
+        return jsonify({"status": "rules approved and applied"})
+    except FileNotFoundError:
+        return jsonify({"status": "no pending rules to approve"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/reject-rules', methods=['GET'])
+def reject_rules():
+    try:
+        with open('pending_rules.txt', 'w') as f:
+            f.write("No pending rules")
+        send_telegram(f"❌ *Rule Update Rejected*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nProposed changes discarded. Live rules unchanged.")
+        return jsonify({"status": "rules rejected — live rules unchanged"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/view-rules', methods=['GET'])
+def view_rules():
+    try:
+        active = ""
+        pending = ""
+        try:
+            with open('learned_rules.txt', 'r') as f:
+                active = f.read()
+        except FileNotFoundError:
+            active = "No approved rules yet"
+        try:
+            with open('pending_rules.txt', 'r') as f:
+                pending = f.read()
+        except FileNotFoundError:
+            pending = "No pending rules"
+        return f"""
+<html>
+<head><title>Gold Bot Rules</title></head>
+<body style="background:#0a0a1a;color:#eee;font-family:monospace;padding:30px;max-width:800px;margin:0 auto;">
+<h1 style="color:#ffd700">🧠 Gold Bot — Rule Manager</h1>
+<h2 style="color:#44ff88">✅ Active Rules (live)</h2>
+<pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{active}</pre>
+<h2 style="color:#ffaa00">⏳ Pending Rules (awaiting approval)</h2>
+<pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{pending}</pre>
+<div style="margin-top:30px;display:flex;gap:20px;">
+    <a href="/approve-rules" style="background:#44ff88;color:#000;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">✅ Approve Pending Rules</a>
+    <a href="/reject-rules" style="background:#ff4444;color:#fff;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">❌ Reject Pending Rules</a>
+</div>
+</body>
+</html>
+"""
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
+# ============================================================
+# BACKTESTING
 # ============================================================
 @app.route('/backtest', methods=['GET'])
 def run_backtest():
     try:
         send_telegram("🔍 *Backtesting started — pulling 2 years of XAUUSD data...*\nThis will take about 60 seconds.")
-
-        # Pull 2 years of 1H data
         gold = yf.download('GC=F', period='2y', interval='1h', progress=False)
-
         if gold.empty:
             return jsonify({"status": "error", "message": "no data"})
-
-        # Flatten MultiIndex
         gold.columns = [col[0] for col in gold.columns]
         gold = gold.dropna()
-
         total_candles = len(gold)
         send_telegram(f"📊 Data loaded — {total_candles} candles over 2 years. Detecting signals...")
-
-        # ── SIGNAL DETECTION ──────────────────────────────
         signals = []
-
         for i in range(3, len(gold) - 10):
             candle = gold.iloc[i]
-            prev1 = gold.iloc[i-1]
             prev2 = gold.iloc[i-2]
             next5 = gold.iloc[i+1:i+6]
             next10 = gold.iloc[i+1:i+11]
-
             high = float(candle['High'])
             low = float(candle['Low'])
             close = float(candle['Close'])
-            open_ = float(candle['Open'])
-
-            # ── BEARISH FVG ──
-            # Gap between candle[i-2] low and candle[i] high
             if float(prev2['Low']) > high:
-                fvg_size = float(prev2['Low']) - high
-                fvg_pct = (fvg_size / close) * 100
-
-                # Check outcome — did price go down?
                 future_low = float(next10['Low'].min())
                 future_high = float(next10['High'].max())
                 move_down = close - future_low
                 move_up = future_high - close
-
                 outcome = "WIN" if move_down > move_up else "LOSS"
-                signals.append({
-                    "type": "BEARISH_FVG",
-                    "time": str(gold.index[i]),
-                    "price": close,
-                    "fvg_size": round(fvg_size, 2),
-                    "hour": gold.index[i].hour,
-                    "outcome": outcome,
-                    "move_down": round(move_down, 2),
-                    "move_up": round(move_up, 2)
-                })
-
-            # ── BULLISH FVG ──
-            # Gap between candle[i-2] high and candle[i] low
+                signals.append({"type": "BEARISH_FVG", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
             if float(prev2['High']) < low:
-                fvg_size = low - float(prev2['High'])
                 future_low = float(next10['Low'].min())
                 future_high = float(next10['High'].max())
                 move_up = future_high - close
                 move_down = close - future_low
-
                 outcome = "WIN" if move_up > move_down else "LOSS"
-                signals.append({
-                    "type": "BULLISH_FVG",
-                    "time": str(gold.index[i]),
-                    "price": close,
-                    "fvg_size": round(fvg_size, 2),
-                    "hour": gold.index[i].hour,
-                    "outcome": outcome,
-                    "move_up": round(move_up, 2),
-                    "move_down": round(move_down, 2)
-                })
-
-            # ── BEARISH SWEEP ──
+                signals.append({"type": "BULLISH_FVG", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
             lookback_high = float(gold.iloc[i-10:i]['High'].max())
             if high > lookback_high and close < lookback_high:
                 future_low = float(next5['Low'].min())
                 future_high = float(next5['High'].max())
                 outcome = "WIN" if (close - future_low) > (future_high - close) else "LOSS"
-                signals.append({
-                    "type": "BEARISH_SWEEP",
-                    "time": str(gold.index[i]),
-                    "price": close,
-                    "hour": gold.index[i].hour,
-                    "outcome": outcome,
-                    "move_down": round(close - future_low, 2),
-                    "move_up": round(future_high - close, 2)
-                })
-
-            # ── BULLISH SWEEP ──
+                signals.append({"type": "BEARISH_SWEEP", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
             lookback_low = float(gold.iloc[i-10:i]['Low'].min())
             if low < lookback_low and close > lookback_low:
                 future_low = float(next5['Low'].min())
                 future_high = float(next5['High'].max())
                 outcome = "WIN" if (future_high - close) > (close - future_low) else "LOSS"
-                signals.append({
-                    "type": "BULLISH_SWEEP",
-                    "time": str(gold.index[i]),
-                    "price": close,
-                    "hour": gold.index[i].hour,
-                    "outcome": outcome,
-                    "move_up": round(future_high - close, 2),
-                    "move_down": round(close - future_low, 2)
-                })
+                signals.append({"type": "BULLISH_SWEEP", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
 
-        # ── COMPILE STATISTICS ─────────────────────────────
         total_signals = len(signals)
-
         if total_signals == 0:
-            send_telegram("⚠️ No signals detected — check indicator settings")
+            send_telegram("⚠️ No signals detected")
             return jsonify({"status": "no signals"})
 
         send_telegram(f"✅ {total_signals} signals detected. Compiling statistics...")
 
-        # Overall win rate
         wins = len([s for s in signals if s['outcome'] == 'WIN'])
         overall_wr = round(wins / total_signals * 100, 1)
 
-        # By type
         type_stats = {}
         for s in signals:
             t = s['type']
@@ -1696,39 +1335,18 @@ def run_backtest():
             if s['outcome'] == 'WIN':
                 type_stats[t]['wins'] += 1
 
-        type_summary = "\n".join([
-            f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100)}% win rate)"
-            for k, v in type_stats.items()
-        ])
+        type_summary = "\n".join([f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100)}% win rate)" for k, v in type_stats.items()])
 
-        # By session (hour)
-        session_stats = {
-            "Asian (22-07)": {"wins": 0, "total": 0},
-            "London (07-12)": {"wins": 0, "total": 0},
-            "NY (12-17)": {"wins": 0, "total": 0},
-            "Other (17-22)": {"wins": 0, "total": 0}
-        }
-
+        session_stats = {"Asian (22-07)": {"wins": 0, "total": 0}, "London (07-12)": {"wins": 0, "total": 0}, "NY (12-17)": {"wins": 0, "total": 0}, "Other (17-22)": {"wins": 0, "total": 0}}
         for s in signals:
             hour = s['hour']
-            if hour >= 22 or hour < 7:
-                session = "Asian (22-07)"
-            elif 7 <= hour < 12:
-                session = "London (07-12)"
-            elif 12 <= hour < 17:
-                session = "NY (12-17)"
-            else:
-                session = "Other (17-22)"
+            session = "Asian (22-07)" if (hour >= 22 or hour < 7) else "London (07-12)" if 7 <= hour < 12 else "NY (12-17)" if 12 <= hour < 17 else "Other (17-22)"
             session_stats[session]['total'] += 1
             if s['outcome'] == 'WIN':
                 session_stats[session]['wins'] += 1
 
-        session_summary = "\n".join([
-            f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100) if v['total'] > 0 else 0}% win rate)"
-            for k, v in session_stats.items()
-        ])
+        session_summary = "\n".join([f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100) if v['total'] > 0 else 0}% win rate)" for k, v in session_stats.items()])
 
-        # Best and worst hours
         hour_stats = {}
         for s in signals:
             h = s['hour']
@@ -1741,90 +1359,34 @@ def run_backtest():
         hour_wr = {h: round(v['wins']/v['total']*100) for h, v in hour_stats.items() if v['total'] >= 5}
         best_hours = sorted(hour_wr.items(), key=lambda x: x[1], reverse=True)[:3]
         worst_hours = sorted(hour_wr.items(), key=lambda x: x[1])[:3]
-
         best_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in best_hours])
         worst_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in worst_hours])
 
-        # Save signals to file
-        try:
-            with open('backtest_signals.json', 'w') as f:
-                json.dump(signals[:500], f, indent=2)
-        except Exception as e:
-            print(f"Signal save error: {e}")
-
-        # ── SEND TO CLAUDE FOR ANALYSIS ────────────────────
         prompt = f"""
-You are analysing 2 years of backtesting data for an XAUUSD (Gold) SMC trading system.
+You are analysing 2 years of XAUUSD backtesting data.
 
-## BACKTEST RESULTS SUMMARY
-Total candles analysed: {total_candles}
-Total signals detected: {total_signals}
-Overall win rate: {overall_wr}%
+Total candles: {total_candles} | Total signals: {total_signals} | Overall win rate: {overall_wr}%
 
-## PERFORMANCE BY SIGNAL TYPE
+By signal type:
 {type_summary}
 
-## PERFORMANCE BY SESSION
+By session:
 {session_summary}
 
-## BEST HOURS TO TRADE
-{best_hours_str}
+Best hours: {best_hours_str}
+Worst hours: {worst_hours_str}
 
-## WORST HOURS TO TRADE
-{worst_hours_str}
-
-## YOUR ANALYSIS
-
-Based on this 2 year dataset provide:
-
-**OVERALL ASSESSMENT**
-Is this strategy viable based on the data?
-
-**STRONGEST SETUP**
-Which signal type performs best and why?
-
-**WEAKEST SETUP**
-Which signal type to avoid or filter out?
-
-**BEST SESSION**
-Which session produces the most reliable signals?
-
-**SESSION TO AVOID**
-Which session should be filtered out entirely?
-
-**OPTIMAL TRADING HOURS**
-Specific UTC hours that consistently outperform.
-
-**RECOMMENDED FILTERS**
-3-5 specific rules to add to improve win rate based on this data.
-
-**EXPECTED PERFORMANCE**
-If we apply these filters what win rate should we realistically expect?
-
-Be direct and data driven. Base everything on the numbers above.
+Provide: OVERALL ASSESSMENT, STRONGEST SETUP, WEAKEST SETUP, BEST SESSION, SESSION TO AVOID, OPTIMAL HOURS, RECOMMENDED FILTERS, EXPECTED PERFORMANCE.
+Be direct and data driven.
 """
-
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
-
         analysis = message.content[0].text
 
-        # Save backtest report
-        try:
-            with open('backtest_report.txt', 'w') as f:
-                f.write(f"Backtest Report — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
-                f.write(f"Total Signals: {total_signals}\n")
-                f.write(f"Overall Win Rate: {overall_wr}%\n\n")
-                f.write(f"By Type:\n{type_summary}\n\n")
-                f.write(f"By Session:\n{session_summary}\n\n")
-                f.write(f"Claude Analysis:\n{analysis}")
-        except Exception as e:
-            print(f"Report save error: {e}")
-
-        telegram_message = f"""
+        send_telegram(f"""
 📈 *XAUUSD Backtest Report — 2 Years*
 _{datetime.utcnow().strftime('%d %b %Y')}_
 
@@ -1841,16 +1403,9 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 *Worst Hours:* {worst_hours_str}
 
 {analysis}
-"""
-        send_telegram(telegram_message)
+""")
 
-        return jsonify({
-            "status": "backtest complete",
-            "total_signals": total_signals,
-            "overall_win_rate": overall_wr,
-            "type_stats": type_stats,
-            "session_stats": session_stats
-        })
+        return jsonify({"status": "backtest complete", "total_signals": total_signals, "overall_win_rate": overall_wr})
 
     except Exception as e:
         error_msg = f"⚠️ Backtest error: {str(e)}"
@@ -1858,238 +1413,121 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
-# RULE APPROVAL SYSTEM
+# DASHBOARD
 # ============================================================
-@app.route('/approve-rules', methods=['GET'])
-def approve_rules():
-    try:
-        # Load pending rules
-        with open('pending_rules.txt', 'r') as f:
-            pending = f.read()
+@app.route('/dashboard', methods=['GET'])
+def dashboard():
+    session_name, session_desc, is_killzone = get_session()
+    zone, zone_pct, zone_advice = get_premium_discount((KEY_LEVELS['dealing_range_high'] + KEY_LEVELS['dealing_range_low']) / 2)
+    dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
+    news_risk, news_msg = check_news_risk()
+    zone_color = "#ff4444" if zone == "PREMIUM" else "#44ff88"
+    dxy_color = "#ff4444" if dxy_direction == "BULLISH" else "#44ff88" if dxy_direction == "BEARISH" else "#ffaa00"
 
-        # Apply them to live rules
-        with open('learned_rules.txt', 'w') as f:
-            f.write(f"Approved: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
-            f.write(pending)
+    alerts_html = ""
+    for a in reversed(recent_alerts[-10:]):
+        alert_type = a.get('type', '')
+        color = "#ff4444" if "BEARISH" in alert_type else "#44ff88"
+        alerts_html += f'<div class="alert-row"><span style="color:{color}">●</span><span class="alert-time">{a.get("time", "")}</span><span class="alert-type">{alert_type}</span><span class="alert-tf">{a.get("timeframe", "")} | {a.get("price", "")}</span></div>'
+    if not alerts_html:
+        alerts_html = "<div class='no-data'>No alerts this session yet</div>"
 
-        # Clear pending
-        with open('pending_rules.txt', 'w') as f:
-            f.write("No pending rules")
+    trades_html = ""
+    for trade_id, trade in active_trades.items():
+        direction = trade.get('direction', '')
+        color = "#44ff88" if direction == "LONG" else "#ff4444"
+        trades_html += f'<div class="trade-row"><span style="color:{color}">{"▲" if direction == "LONG" else "▼"} {direction}</span><span>Entry: {trade.get("entry", 0):.2f}</span><span>SL: {trade.get("stop", 0):.2f}</span><span>TP: {trade.get("target", 0):.2f}</span><span class="trade-open">OPEN</span></div>'
+    if not trades_html:
+        trades_html = "<div class='no-data'>No active paper trades</div>"
 
-        send_telegram(f"""
-✅ *Rule Update Approved*
-_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
+    levels_html = "".join([f'<div class="level-row"><span class="level-label">{k.replace("_", " ").title()}</span><span class="level-value">{v}</span></div>' for k, v in KEY_LEVELS.items()])
 
-New learned rules have been applied to the live system.
-Claude will use these rules in all future analysis.
+    account = PROP_FIRM_RULES["account_size"]
+    daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
+    total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
+    daily_status_color = "#ff4444" if daily_used_pct >= 80 else "#ffaa00" if daily_used_pct >= 50 else "#44ff88"
+    total_status_color = "#ff4444" if total_used_pct >= 80 else "#ffaa00" if total_used_pct >= 50 else "#44ff88"
 
-To review active rules visit:
-`https://web-production-387c47.up.railway.app/view-rules`
-""")
-        return jsonify({"status": "rules approved and applied"})
-
-    except FileNotFoundError:
-        return jsonify({"status": "no pending rules to approve"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/reject-rules', methods=['GET'])
-def reject_rules():
-    try:
-        # Clear pending rules
-        with open('pending_rules.txt', 'w') as f:
-            f.write("No pending rules")
-
-        send_telegram(f"""
-❌ *Rule Update Rejected*
-_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
-
-Proposed rule changes have been discarded.
-The system continues using previously approved rules.
-""")
-        return jsonify({"status": "rules rejected — live rules unchanged"})
-
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/view-rules', methods=['GET'])
-def view_rules():
-    try:
-        active = ""
-        pending = ""
-
-        try:
-            with open('learned_rules.txt', 'r') as f:
-                active = f.read()
-        except FileNotFoundError:
-            active = "No approved rules yet"
-
-        try:
-            with open('pending_rules.txt', 'r') as f:
-                pending = f.read()
-        except FileNotFoundError:
-            pending = "No pending rules"
-
-        return f"""
+    return f"""<!DOCTYPE html>
 <html>
-<head><title>Gold Bot Rules</title></head>
-<body style="background:#0a0a1a;color:#eee;font-family:monospace;padding:30px;max-width:800px;margin:0 auto;">
-<h1 style="color:#ffd700">🧠 Gold Bot — Rule Manager</h1>
-
-<h2 style="color:#44ff88">✅ Active Rules (live)</h2>
-<pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{active}</pre>
-
-<h2 style="color:#ffaa00">⏳ Pending Rules (awaiting approval)</h2>
-<pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{pending}</pre>
-
-<div style="margin-top:30px;display:flex;gap:20px;">
-    <a href="/approve-rules" style="background:#44ff88;color:#000;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">
-        ✅ Approve Pending Rules
-    </a>
-    <a href="/reject-rules" style="background:#ff4444;color:#fff;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">
-        ❌ Reject Pending Rules
-    </a>
-</div>
+<head>
+    <title>Gold Bot Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="30">
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ background: #0a0a1a; color: #eee; font-family: 'Courier New', monospace; padding: 15px; max-width: 900px; margin: 0 auto; }}
+        .header {{ text-align: center; padding: 20px 0 15px; border-bottom: 1px solid #333; margin-bottom: 20px; }}
+        .header h1 {{ color: #ffd700; font-size: 24px; letter-spacing: 3px; }}
+        .header .subtitle {{ color: #888; font-size: 12px; margin-top: 5px; }}
+        .status-bar {{ display: flex; justify-content: space-between; align-items: center; background: #111130; border: 1px solid #ffd700; border-radius: 8px; padding: 12px 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }}
+        .status-item {{ display: flex; flex-direction: column; align-items: center; }}
+        .status-label {{ color: #888; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }}
+        .status-value {{ color: #ffd700; font-size: 14px; font-weight: bold; margin-top: 3px; }}
+        .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px; }}
+        @media (max-width: 600px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+        .card {{ background: #111130; border: 1px solid #333; border-radius: 8px; padding: 15px; }}
+        .card h3 {{ color: #ffd700; font-size: 11px; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #333; }}
+        .full-width {{ grid-column: 1 / -1; }}
+        .level-row {{ display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #1a1a3a; font-size: 13px; }}
+        .level-label {{ color: #aaa; }}
+        .level-value {{ color: #ffd700; font-weight: bold; }}
+        .alert-row {{ display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid #1a1a3a; font-size: 12px; align-items: center; flex-wrap: wrap; }}
+        .alert-time {{ color: #888; min-width: 70px; }}
+        .alert-type {{ color: #fff; flex: 1; }}
+        .alert-tf {{ color: #888; font-size: 11px; }}
+        .trade-row {{ display: flex; gap: 15px; padding: 8px 0; border-bottom: 1px solid #1a1a3a; font-size: 12px; align-items: center; flex-wrap: wrap; }}
+        .trade-open {{ color: #ffaa00; font-weight: bold; margin-left: auto; }}
+        .prop-row {{ display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #1a1a3a; font-size: 13px; }}
+        .prop-label {{ color: #aaa; }}
+        .progress-bar {{ background: #222; border-radius: 4px; height: 6px; margin-top: 4px; overflow: hidden; }}
+        .progress-fill {{ height: 100%; border-radius: 4px; }}
+        .no-data {{ color: #555; font-size: 12px; padding: 10px 0; text-align: center; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }}
+        .news-badge {{ background: #ff4444; color: #fff; }}
+        .safe-badge {{ background: #1a4a2a; color: #44ff88; }}
+        .footer {{ text-align: center; color: #555; font-size: 11px; margin-top: 20px; padding-top: 15px; border-top: 1px solid #333; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🥇 GOLD BOT</h1>
+        <div class="subtitle">Auto-refreshes every 30 seconds | {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</div>
+    </div>
+    <div class="status-bar">
+        <div class="status-item"><span class="status-label">System</span><span class="status-value">🟢 LIVE</span></div>
+        <div class="status-item"><span class="status-label">Session</span><span class="status-value">{session_name}</span></div>
+        <div class="status-item"><span class="status-label">Killzone</span><span class="status-value">{'🎯 ACTIVE' if is_killzone else '⭕ INACTIVE'}</span></div>
+        <div class="status-item"><span class="status-label">Zone</span><span class="status-value" style="color:{zone_color}">{zone} {zone_pct}%</span></div>
+        <div class="status-item"><span class="status-label">DXY</span><span class="status-value" style="color:{dxy_color}">{dxy_direction}</span></div>
+        <div class="status-item"><span class="status-label">Alerts Today</span><span class="status-value">{len(recent_alerts)}</span></div>
+    </div>
+    <div style="margin-bottom:15px;">{'<span class="badge news-badge">⚠️ ' + news_msg + '</span>' if news_risk else '<span class="badge safe-badge">✅ No major news risk</span>'}</div>
+    <div class="grid">
+        <div class="card"><h3>📊 Key Levels</h3>{levels_html}</div>
+        <div class="card">
+            <h3>🏦 Prop Firm Status</h3>
+            <div class="prop-row"><span class="prop-label">Account Size</span><span style="color:#ffd700">${account:,.2f}</span></div>
+            <div class="prop-row"><span class="prop-label">Balance</span><span style="color:#44ff88">${current_balance:,.2f}</span></div>
+            <div class="prop-row"><span class="prop-label">Today P&L</span><span style="color:{'#44ff88' if daily_pnl >= 0 else '#ff4444'}">${daily_pnl:,.2f}</span></div>
+            <div class="prop-row"><span class="prop-label">Total P&L</span><span style="color:{'#44ff88' if total_pnl >= 0 else '#ff4444'}">${total_pnl:,.2f}</span></div>
+            <div style="margin-top:10px;">
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Daily Loss Used</span><span style="color:{daily_status_color}">{daily_used_pct:.1f}% of {PROP_FIRM_RULES['max_daily_loss_pct']}%</span></div>
+                <div class="progress-bar"><div class="progress-fill" style="width:{min(daily_used_pct, 100)}%;background:{daily_status_color}"></div></div>
+            </div>
+            <div style="margin-top:8px;">
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Total Drawdown Used</span><span style="color:{total_status_color}">{total_used_pct:.1f}% of {PROP_FIRM_RULES['max_total_drawdown_pct']}%</span></div>
+                <div class="progress-bar"><div class="progress-fill" style="width:{min(total_used_pct, 100)}%;background:{total_status_color}"></div></div>
+            </div>
+            <div class="prop-row" style="margin-top:10px;"><span class="prop-label">Trading Days</span><span style="color:#ffd700">{trading_days}/{PROP_FIRM_RULES['min_trading_days']}</span></div>
+            <div class="prop-row"><span class="prop-label">Drawdown Protection</span><span style="color:{'#ff4444' if drawdown_protection else '#44ff88'}">{'ACTIVE' if drawdown_protection else 'OFF'}</span></div>
+        </div>
+        <div class="card full-width"><h3>📡 Today's Alerts ({len(recent_alerts)} this session)</h3>{alerts_html}</div>
+        <div class="card full-width"><h3>📈 Active Paper Trades ({len(active_trades)} open)</h3>{trades_html}</div>
+    </div>
+    <div class="footer">Gold Bot v2.0 | Railway | Auto-refreshes every 30s | Last updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}</div>
 </body>
-</html>
-"""
-    except Exception as e:
-        return f"Error: {str(e)}", 500
-
-# ============================================================
-# COT REPORT — Commitment of Traders institutional positioning
-# ============================================================
-def get_cot_fallback():
-    return {
-        "date": "unavailable",
-        "spec_bias": "UNKNOWN",
-        "spec_desc": "COT data unavailable this week",
-        "change_desc": "Check cftc.gov for latest positioning",
-        "net_position": 0,
-        "net_change": 0
-    }
-
-def get_cot_data():
-    try:
-        # Pull COT data directly from CFTC
-        df = cot.cot_year(year=2026, cot_report_type='legacy_fut')
-        
-        if df is None or df.empty:
-            return get_cot_fallback()
-
-        # Filter for gold futures — market code 088691
-        gold = df[df['Market and Exchange Names'].str.contains('GOLD', case=False, na=False)]
-        
-        if gold.empty:
-            return get_cot_fallback()
-
-        # Get latest two rows
-        gold = gold.sort_values('As of Date in Form YYYY-MM-DD', ascending=False)
-        latest = gold.iloc[0]
-        previous = gold.iloc[1] if len(gold) > 1 else gold.iloc[0]
-
-        # Extract positioning
-        noncomm_long = int(latest.get('Noncommercial Positions-Long (All)', 0))
-        noncomm_short = int(latest.get('Noncommercial Positions-Short (All)', 0))
-        prev_long = int(previous.get('Noncommercial Positions-Long (All)', 0))
-        prev_short = int(previous.get('Noncommercial Positions-Short (All)', 0))
-
-        date = str(latest.get('As of Date in Form YYYY-MM-DD', 'unknown'))
-        net_spec = noncomm_long - noncomm_short
-        prev_net = prev_long - prev_short
-        net_change = net_spec - prev_net
-
-        if net_spec > 0:
-            spec_bias = "NET LONG"
-            spec_desc = f"Speculators net long {net_spec:,} contracts — bullish institutional bias"
-        else:
-            spec_bias = "NET SHORT"
-            spec_desc = f"Speculators net short {abs(net_spec):,} contracts — bearish institutional bias"
-
-        if net_change > 0:
-            change_desc = f"Increasing longs (+{net_change:,} contracts this week)"
-        else:
-            change_desc = f"Increasing shorts ({net_change:,} contracts this week)"
-
-        return {
-            "date": date,
-            "spec_bias": spec_bias,
-            "spec_desc": spec_desc,
-            "change_desc": change_desc,
-            "net_position": net_spec,
-            "net_change": net_change
-        }
-
-    except Exception as e:
-        print(f"COT error: {e}")
-        return get_cot_fallback()
-    
-# ============================================================
-# COT WEEKLY REPORT — fires every Friday after 3:30pm UTC
-# ============================================================
-@app.route('/cot-report', methods=['GET'])
-def cot_report():
-    try:
-        cot = get_cot_data()
-
-        prompt = f"""
-You are an expert gold analyst interpreting the weekly Commitment of Traders report.
-
-## LATEST COT DATA — GOLD FUTURES
-Date: {cot['date']}
-Speculator Position: {cot['spec_bias']}
-Detail: {cot['spec_desc']}
-Weekly Change: {cot['change_desc']}
-Net Position: {cot['net_position']:,} contracts
-
-## YOUR ANALYSIS
-
-**INSTITUTIONAL BIAS**
-What does this positioning tell us about smart money's view on gold?
-
-**CONFLUENCE WITH TECHNICAL PICTURE**
-Key levels this week: High {KEY_LEVELS['weekly_high']} | Low {KEY_LEVELS['weekly_low']} | Resistance {KEY_LEVELS['major_resistance']} | Support {KEY_LEVELS['major_support']}
-Does institutional positioning support or conflict with current technical structure?
-
-**TRADING IMPLICATION**
-Should we favour longs or shorts next week based on COT data?
-
-**WARNING SIGNS**
-Any extreme positioning that historically precedes reversals?
-
-Keep it concise and actionable. Maximum 200 words.
-"""
-
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        analysis = message.content[0].text
-
-        telegram_message = f"""
-📊 *COT Report Analysis — Gold Futures*
-_Week of {cot['date']}_
-
-*Institutional Position:* {cot['spec_bias']}
-*Detail:* {cot['spec_desc']}
-*Weekly Change:* {cot['change_desc']}
-
-{analysis}
-"""
-        send_telegram(telegram_message)
-
-        return jsonify({
-            "status": "COT report sent",
-            "spec_bias": cot['spec_bias'],
-            "net_position": cot['net_position']
-        })
-
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+</html>"""
 
 # ============================================================
 # HEALTH CHECK
@@ -2130,7 +1568,7 @@ def test():
             news_risk, news_msg, drawdown_active,
             dxy_direction, dxy_desc
         )
-        telegram_message = f"""
+        send_telegram(f"""
 🧪 *TEST ALERT — system working correctly* ✅
 📍 Price: 4088.50
 📊 Zone: {zone} ({zone_pct}%)
@@ -2138,8 +1576,7 @@ def test():
 💵 DXY: {dxy_desc}
 
 {analysis}
-"""
-        send_telegram(telegram_message)
+""")
         return jsonify({"status": "✅ test complete — check your Telegram", "session": session_name, "dxy": dxy_direction})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2155,33 +1592,10 @@ if __name__ == '__main__':
     scheduler.add_job(func=lambda: monday_gap_analysis(), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=lambda: auto_update_levels(), trigger='cron', day_of_week='sun', hour=21, minute=0)
     scheduler.add_job(func=lambda: self_review(), trigger='cron', day_of_week='sun', hour=19, minute=0)
-    scheduler.add_job(
-        func=lambda: check_entries(),
-        trigger='interval',
-        minutes=5,
-        id='entry_monitor'
-    )
-    # COT report every Friday at 4pm UTC (after CFTC release)
-    scheduler.add_job(
-        func=lambda: cot_report(),
-        trigger='cron',
-        day_of_week='fri',
-        hour=16,
-        minute=0,
-        id='cot_report'
-    )
-    scheduler.add_job(
-        func=lambda: update_intraday(),
-        trigger='interval',
-        minutes=30,
-        id='intraday_updater'
-    )
-    scheduler.add_job(
-        func=lambda: save_state(),
-        trigger='interval',
-        minutes=10,
-        id='state_saver'
-    )
+    scheduler.add_job(func=lambda: check_entries(), trigger='interval', minutes=5, id='entry_monitor')
+    scheduler.add_job(func=lambda: cot_report(), trigger='cron', day_of_week='fri', hour=16, minute=0, id='cot_report')
+    scheduler.add_job(func=lambda: update_intraday(), trigger='interval', minutes=30, id='intraday_updater')
+    scheduler.add_job(func=lambda: save_state(), trigger='interval', minutes=10, id='state_saver')
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())
     print("🚀 Gold Alert System starting...")

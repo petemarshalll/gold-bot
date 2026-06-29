@@ -357,6 +357,9 @@ A live market alert has fired. Analyse it thoroughly and give a clear trading as
 ## DRAWDOWN STATUS
 {"⚠️ DRAWDOWN PROTECTION ACTIVE — only flag if genuinely HIGH confidence" if drawdown_active else "Normal mode — standard confidence thresholds apply"}
 
+## LEARNED RULES FROM PAST PERFORMANCE
+{get_learned_rules()}
+
 ## YOUR ANALYSIS — use exactly these headers:
 
 **SETUP VALIDITY**
@@ -1087,6 +1090,174 @@ def dashboard():
     return html
 
 # ============================================================
+# SELF LEARNING — Claude analyses its own performance
+# ============================================================
+@app.route('/self-review', methods=['GET'])
+def self_review():
+    try:
+        # Load trade log
+        trades = []
+        try:
+            with open('trade_log.csv', 'r') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) >= 4:
+                        trades.append({
+                            "time": row[0],
+                            "type": row[1],
+                            "price": row[2],
+                            "confidence": row[3],
+                            "analysis": row[4] if len(row) > 4 else ""
+                        })
+        except FileNotFoundError:
+            trades = []
+
+        # Load paper trades
+        paper = []
+        try:
+            with open('paper_trades.json', 'r') as f:
+                paper = json.load(f)
+        except FileNotFoundError:
+            paper = []
+
+        if len(trades) < 5:
+            send_telegram("⚠️ Self review skipped — not enough trade data yet. Need at least 5 alerts logged.")
+            return jsonify({"status": "insufficient data"})
+
+        # Build performance summary
+        wins = [t for t in paper if t.get('result') == 'WIN']
+        losses = [t for t in paper if t.get('result') == 'LOSS']
+        open_trades = [t for t in paper if t.get('result') == 'OPEN']
+
+        win_rate = len(wins) / (len(wins) + len(losses)) * 100 if (wins or losses) else 0
+
+        # Analyse by type
+        type_performance = {}
+        for trade in paper:
+            t_type = trade.get('type', 'UNKNOWN')
+            if t_type not in type_performance:
+                type_performance[t_type] = {"wins": 0, "losses": 0}
+            if trade.get('result') == 'WIN':
+                type_performance[t_type]['wins'] += 1
+            elif trade.get('result') == 'LOSS':
+                type_performance[t_type]['losses'] += 1
+
+        # Analyse by confidence
+        high_conf = [t for t in paper if t.get('confidence') == 'HIGH']
+        med_conf = [t for t in paper if t.get('confidence') == 'MEDIUM']
+        high_wins = len([t for t in high_conf if t.get('result') == 'WIN'])
+        med_wins = len([t for t in med_conf if t.get('result') == 'WIN'])
+
+        # Build performance text for Claude
+        type_summary = "\n".join([
+            f"- {k}: {v['wins']}W / {v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100) if v['wins']+v['losses'] > 0 else 0}% win rate)"
+            for k, v in type_performance.items()
+        ])
+
+        trades_summary = "\n".join([
+            f"- {t['time']}: {t['type']} | Conf: {t['confidence']} | Result: {t['result']}"
+            for t in paper[-20:]
+        ])
+
+        prompt = f"""
+You are a trading system analyst reviewing the performance of an automated XAUUSD alert system.
+
+## PERFORMANCE DATA
+
+Total Alerts Logged: {len(trades)}
+Closed Paper Trades: {len(wins) + len(losses)}
+Wins: {len(wins)}
+Losses: {len(losses)}
+Win Rate: {win_rate:.1f}%
+Open Trades: {len(open_trades)}
+
+HIGH Confidence trades: {len(high_conf)} total | {high_wins} wins
+MEDIUM Confidence trades: {len(med_conf)} total | {med_wins} wins
+
+## PERFORMANCE BY SETUP TYPE
+{type_summary if type_summary else "No completed trades yet"}
+
+## RECENT TRADE LOG
+{trades_summary if trades_summary else "No trades logged yet"}
+
+## YOUR TASK
+
+Analyse this performance data and provide:
+
+**WHAT IS WORKING**
+Which setup types, sessions or conditions are producing the best results?
+
+**WHAT IS NOT WORKING**
+Which setup types or conditions are consistently losing?
+
+**KEY PATTERN IDENTIFIED**
+The single most important pattern you can see in this data.
+
+**RECOMMENDED RULE CHANGES**
+Specific changes to make to improve performance:
+- Should any setup types be filtered out entirely?
+- Should confidence thresholds be adjusted?
+- Are certain sessions consistently underperforming?
+
+**UPDATED TRADING RULES**
+Write 3-5 specific rules for the system to follow next week based on this data.
+Example format: "Rule 1: Do not flag Asian session standalone FVGs as above MEDIUM confidence"
+
+**NEXT WEEK FOCUS**
+One specific thing to prioritise next week.
+
+Be direct and data driven. Base everything on the actual numbers above.
+"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        review = message.content[0].text
+
+        # Save the updated rules to a file
+        try:
+            with open('learned_rules.txt', 'w') as f:
+                f.write(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+                f.write(review)
+        except Exception as e:
+            print(f"Rules save error: {e}")
+
+        telegram_message = f"""
+🧠 *Gold Bot Self-Review Report*
+_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
+
+📊 Stats: {len(trades)} alerts | {len(wins)}W {len(losses)}L | {win_rate:.1f}% win rate
+
+{review}
+"""
+        send_telegram(telegram_message)
+
+        return jsonify({
+            "status": "self review complete",
+            "win_rate": win_rate,
+            "total_trades": len(trades)
+        })
+
+    except Exception as e:
+        error_msg = f"⚠️ Self review error: {str(e)}"
+        send_telegram(error_msg)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ============================================================
+# LOAD LEARNED RULES INTO ANALYSIS
+# ============================================================
+def get_learned_rules():
+    try:
+        with open('learned_rules.txt', 'r') as f:
+            return f.read()
+    except FileNotFoundError:
+        return "No learned rules yet — system will develop rules after first self-review."
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -1150,6 +1321,7 @@ if __name__ == '__main__':
     scheduler.add_job(func=lambda: weekly_bias_report(), trigger='cron', day_of_week='sun', hour=20, minute=0)
     scheduler.add_job(func=lambda: monday_gap_analysis(), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=lambda: auto_update_levels(), trigger='cron', day_of_week='sun', hour=21, minute=0)
+    scheduler.add_job(func=lambda: self_review(), trigger='cron', day_of_week='sun', hour=19, minute=0)
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())
     print("🚀 Gold Alert System starting...")

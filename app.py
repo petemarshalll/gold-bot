@@ -107,6 +107,35 @@ def get_premium_discount(price):
         return "UNKNOWN", 0, "unable to calculate"
 
 # ============================================================
+# SPREAD MONITOR
+# ============================================================
+def check_spread(high, low, price):
+    try:
+        high = float(high)
+        low = float(low)
+        price = float(price)
+
+        # Calculate candle spread as proxy for market spread
+        candle_range = high - low
+        spread_pct = (candle_range / price) * 100
+
+        # Normal gold spread on 15m candle
+        # Under 0.1% = tight, good conditions
+        # 0.1-0.2% = normal
+        # Over 0.3% = wide, be cautious
+        # Over 0.5% = very wide, avoid
+
+        if spread_pct > 0.5:
+            return True, f"⚠️ VERY WIDE spread detected ({spread_pct:.2f}%) — high slippage risk, avoid entry"
+        elif spread_pct > 0.3:
+            return True, f"⚠️ Wide spread ({spread_pct:.2f}%) — reduce position size if entering"
+        else:
+            return False, f"Spread normal ({spread_pct:.2f}%) — good entry conditions"
+
+    except Exception as e:
+        return False, "Spread check unavailable"
+
+# ============================================================
 # NEWS RISK CHECK
 # ============================================================
 def check_news_risk():
@@ -423,6 +452,11 @@ def webhook():
         drawdown_active, drawdown_msg = check_drawdown_protection()
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
         dxy_confluence_msg, dxy_score = get_dxy_confluence(data.get('type', ''), dxy_implication)
+        spread_risk, spread_msg = check_spread(
+            data.get('high', 0),
+            data.get('low', 0),
+            data.get('price', 0)
+        )
 
         recent_alerts.append({
             "type": data.get('type', 'Unknown'),
@@ -470,6 +504,7 @@ def webhook():
 ⏰ {datetime.utcnow().strftime('%H:%M UTC')} | {session_name}
 ⚠️ News: {news_msg}
 💵 DXY: {dxy_confluence_msg}
+📊 Spread: {spread_msg}
 
 {analysis}
 

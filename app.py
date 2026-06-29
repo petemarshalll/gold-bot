@@ -1360,6 +1360,44 @@ _Act now or wait for next candle close confirmation_
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# INTRADAY LEVEL UPDATER — refreshes daily high/low every 30 mins
+# ============================================================
+@app.route('/update-intraday', methods=['GET'])
+def update_intraday():
+    global KEY_LEVELS
+    try:
+        # Pull today's 5 minute data
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+
+        if gold.empty:
+            return jsonify({"status": "no data"})
+
+        # Flatten MultiIndex
+        gold.columns = [col[0] for col in gold.columns]
+
+        # Calculate today's developing high and low
+        todays_high = round(float(gold['High'].max()), 2)
+        todays_low = round(float(gold['Low'].min()), 2)
+        current_price = round(float(gold['Close'].iloc[-1]), 2)
+
+        # Update just the daily levels
+        KEY_LEVELS['daily_high'] = todays_high
+        KEY_LEVELS['daily_low'] = todays_low
+
+        print(f"Intraday update: High {todays_high} | Low {todays_low} | Current {current_price}")
+
+        return jsonify({
+            "status": "intraday levels updated",
+            "daily_high": todays_high,
+            "daily_low": todays_low,
+            "current_price": current_price
+        })
+
+    except Exception as e:
+        print(f"Intraday update error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -1427,6 +1465,13 @@ if __name__ == '__main__':
         trigger='interval',
         minutes=5,
         id='entry_monitor'
+    )
+    # Update intraday high/low every 30 minutes during market hours
+    scheduler.add_job(
+        func=lambda: update_intraday(),
+        trigger='interval',
+        minutes=30,
+        id='intraday_updater'
     )
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())

@@ -728,8 +728,8 @@ def auto_update_levels():
         gold.columns = [col[0] for col in gold.columns]
         weekly = gold.tail(5)
         today = gold.tail(1)
-        recent = gold.tail(10)
-        full_range = gold.tail(20)
+        recent = gold.tail(5)
+        full_range = gold.tail(10)
         weekly_high = round(float(weekly['High'].max()), 2)
         weekly_low = round(float(weekly['Low'].min()), 2)
         daily_high = round(float(today['High'].iloc[-1]), 2)

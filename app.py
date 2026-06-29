@@ -136,9 +136,72 @@ def check_spread(high, low, price):
         return False, "Spread check unavailable"
 
 # ============================================================
-# NEWS RISK CHECK
+# NEWS RISK CHECK — uses live economic calendar
 # ============================================================
 def check_news_risk():
+    try:
+        finnhub_key = os.getenv("FINNHUB_API_KEY")
+        
+        if not finnhub_key:
+            return check_news_risk_fallback()
+
+        # Get today's date
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        
+        # Pull economic calendar from Finnhub
+        url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={today}&token={finnhub_key}"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code != 200:
+            return check_news_risk_fallback()
+
+        data = response.json()
+        events = data.get('economicCalendar', [])
+
+        # Filter for high impact events
+        high_impact_keywords = [
+            'NFP', 'Non-Farm', 'CPI', 'Fed', 'FOMC', 'Interest Rate',
+            'GDP', 'Unemployment', 'Inflation', 'Powell', 'Treasury'
+        ]
+
+        now_utc = datetime.now(timezone.utc)
+        current_minutes = now_utc.hour * 60 + now_utc.minute
+
+        for event in events:
+            impact = event.get('impact', '').lower()
+            event_name = event.get('event', '')
+            event_time = event.get('time', '')
+
+            # Only care about high impact events
+            if impact not in ['high', '3']:
+                continue
+
+            # Check if any keyword matches
+            is_relevant = any(kw.lower() in event_name.lower() for kw in high_impact_keywords)
+            if not is_relevant:
+                continue
+
+            # Parse event time
+            try:
+                if event_time:
+                    event_dt = datetime.strptime(f"{today} {event_time}", '%Y-%m-%d %H:%M')
+                    event_minutes = event_dt.hour * 60 + event_dt.minute
+                    time_diff = abs(current_minutes - event_minutes)
+
+                    if time_diff <= 30:
+                        return True, f"⚠️ HIGH IMPACT: {event_name} at {event_time} UTC — avoid new trades"
+            except:
+                continue
+
+        return False, "No major news risk detected"
+
+    except Exception as e:
+        print(f"News calendar error: {e}")
+        return check_news_risk_fallback()
+
+
+def check_news_risk_fallback():
+    # Fallback to hardcoded times if API fails
     hour = datetime.now(timezone.utc).hour
     minute = datetime.now(timezone.utc).minute
     weekday = datetime.now(timezone.utc).weekday()

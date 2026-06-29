@@ -257,6 +257,24 @@ def check_news_risk_fallback():
     return False, "No major news risk detected"
 
 # ============================================================
+# HOUR QUALITY FILTER — based on 2 year backtest data
+# ============================================================
+def check_hour_quality():
+    hour = datetime.now(timezone.utc).hour
+    
+    # Best hours from backtesting — 55-56% win rate
+    best_hours = [21, 22, 23]
+    # Worst hours from backtesting — 44-45% win rate
+    worst_hours = [3, 6, 14]
+    
+    if hour in best_hours:
+        return "OPTIMAL", f"Hour {hour}:00 UTC historically shows 55-56% win rate — weight signals higher"
+    elif hour in worst_hours:
+        return "POOR", f"Hour {hour}:00 UTC historically shows 44-45% win rate — reduce confidence"
+    else:
+        return "NORMAL", f"Hour {hour}:00 UTC — standard win rate expected"
+
+# ============================================================
 # DRAWDOWN PROTECTION
 # ============================================================
 def check_drawdown_protection():
@@ -557,6 +575,7 @@ def webhook():
         drawdown_active, drawdown_msg = check_drawdown_protection()
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
         dxy_confluence_msg, dxy_score = get_dxy_confluence(data.get('type', ''), dxy_implication)
+        hour_quality, hour_msg = check_hour_quality()
         spread_risk, spread_msg = check_spread(
             data.get('high', 0),
             data.get('low', 0),
@@ -590,9 +609,21 @@ def webhook():
         elif "LOW" in analysis.upper() and "CONFIDENCE" in analysis.upper():
             confidence = "LOW"
 
+        # Adjust confidence based on 2 year backtest data
+        if "FVG" in alert_type and confidence == "LOW":
+            confidence = "MEDIUM"  # FVGs historically 53% — upgrade LOW to MEDIUM
+        if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
+            confidence = "MEDIUM"  # Bearish sweeps 52% — cap at MEDIUM unless exceptional
+
         if drawdown_active and confidence == "LOW":
             log_to_csv(data.get('type'), data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
             return jsonify({"status": "skipped", "reason": "drawdown protection active"})
+
+# Filter out BULLISH_SWEEP — 39% win rate over 2 years, not viable
+        if alert_type == "BULLISH_SWEEP":
+            log_to_csv(alert_type, data.get('price'), "FILTERED", "BULLISH_SWEEP filtered — 39% historical win rate")
+            print(f"BULLISH_SWEEP filtered out based on backtesting data")
+            return jsonify({"status": "filtered", "reason": "BULLISH_SWEEP has 39% win rate over 2 years"})
 
         if news_risk and confidence != "HIGH":
             send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {data.get('type')} at {data.get('price')}")
@@ -610,6 +641,7 @@ def webhook():
 ⚠️ News: {news_msg}
 💵 DXY: {dxy_confluence_msg}
 📊 Spread: {spread_msg}
+🕐 Hour Quality: {hour_msg}
 
 {analysis}
 

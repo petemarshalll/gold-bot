@@ -1258,6 +1258,73 @@ def get_learned_rules():
         return "No learned rules yet — system will develop rules after first self-review."
 
 # ============================================================
+# SMART ENTRY TIMER — alerts when price hits entry zone
+# ============================================================
+@app.route('/check-entries', methods=['GET'])
+def check_entries():
+    try:
+        if not active_trades:
+            return jsonify({"status": "no active trades to monitor"})
+
+        # Get current gold price
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        if gold.empty:
+            return jsonify({"status": "no price data"})
+
+        gold.columns = [col[0] for col in gold.columns]
+        current_price = round(float(gold['Close'].iloc[-1]), 2)
+
+        alerts_sent = 0
+        for trade_id, trade in active_trades.items():
+            if trade.get('result') != 'OPEN':
+                continue
+
+            entry = trade.get('entry', 0)
+            stop = trade.get('stop', 0)
+            target = trade.get('target', 0)
+            direction = trade.get('direction', '')
+
+            # Define entry zone as within 0.3% of entry price
+            entry_zone_high = entry * 1.003
+            entry_zone_low = entry * 0.997
+
+            in_entry_zone = entry_zone_low <= current_price <= entry_zone_high
+
+            if in_entry_zone:
+                risk = abs(entry - stop)
+                reward = abs(target - entry)
+                rr = round(reward / risk, 1) if risk > 0 else 0
+
+                message = f"""
+⏰ *ENTRY ZONE ALERT*
+_{trade['type']} | {trade['time']}_
+
+Price is NOW in your entry zone!
+
+📍 Current Price: {current_price}
+🎯 Entry Zone: {round(entry_zone_low, 2)} — {round(entry_zone_high, 2)}
+{'▲ LONG' if direction == 'LONG' else '▼ SHORT'}
+
+Stop Loss: {stop}
+Target: {target}
+R:R = 1:{rr}
+
+_Act now or wait for next candle close confirmation_
+"""
+                send_telegram(message)
+                alerts_sent += 1
+
+        return jsonify({
+            "status": "checked",
+            "current_price": current_price,
+            "active_trades": len(active_trades),
+            "entry_alerts_sent": alerts_sent
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -1322,6 +1389,12 @@ if __name__ == '__main__':
     scheduler.add_job(func=lambda: monday_gap_analysis(), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=lambda: auto_update_levels(), trigger='cron', day_of_week='sun', hour=21, minute=0)
     scheduler.add_job(func=lambda: self_review(), trigger='cron', day_of_week='sun', hour=19, minute=0)
+    scheduler.add_job(
+        func=lambda: check_entries(),
+        trigger='interval',
+        minutes=5,
+        id='entry_monitor'
+    )
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())
     print("🚀 Gold Alert System starting...")

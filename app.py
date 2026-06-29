@@ -1562,9 +1562,7 @@ def test():
 # START SERVER
 # ============================================================
 if __name__ == '__main__':
-    if __name__ == '__main__':
     load_state()
-    scheduler = BackgroundScheduler()
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=lambda: morning_briefing(), trigger='cron', hour=7, minute=0)
     scheduler.add_job(func=lambda: weekly_bias_report(), trigger='cron', day_of_week='sun', hour=20, minute=0)
@@ -1577,15 +1575,12 @@ if __name__ == '__main__':
         minutes=5,
         id='entry_monitor'
     )
-    # Update intraday high/low every 30 minutes during market hours
     scheduler.add_job(
         func=lambda: update_intraday(),
         trigger='interval',
         minutes=30,
         id='intraday_updater'
     )
-
-    # Save state every 10 minutes as backup
     scheduler.add_job(
         func=lambda: save_state(),
         trigger='interval',

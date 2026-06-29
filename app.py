@@ -740,6 +740,8 @@ Cover in under 300 words:
 def weekly_bias_report():
     try:
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
+        cot = get_cot_data()
+        cot_summary = f"{cot['spec_bias']} — {cot['spec_desc']} | {cot['change_desc']}"
         levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in KEY_LEVELS.items()])
         prompt = f"""
 You are an expert XAUUSD analyst. Weekly bias report for an SMC trader.
@@ -747,6 +749,7 @@ You are an expert XAUUSD analyst. Weekly bias report for an SMC trader.
 Date: {datetime.utcnow().strftime('%A %d %B %Y')}
 Key levels: {levels_text}
 DXY: {dxy_desc}
+COT Positioning: {cot_summary}
 
 Cover in under 350 words:
 **WEEKLY BIAS** — bullish/bearish/neutral and why
@@ -1955,6 +1958,151 @@ def view_rules():
         return f"Error: {str(e)}", 500
 
 # ============================================================
+# COT REPORT — Commitment of Traders institutional positioning
+# ============================================================
+def get_cot_data():
+    try:
+        # CFTC publishes COT data — we pull gold futures positioning
+        # Gold futures contract code: 088691
+        url = "https://www.quandl.com/api/v3/datasets/CFTC/088691_FO_ALL.json?rows=2&api_key=QUANDL_FREE"
+        
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            return get_cot_fallback()
+
+        data = response.json()
+        dataset = data.get('dataset', {})
+        rows = dataset.get('data', [])
+        
+        if len(rows) < 2:
+            return get_cot_fallback()
+
+        # Latest week
+        latest = rows[0]
+        previous = rows[1]
+
+        # COT data structure:
+        # [date, open_interest, noncomm_long, noncomm_short, 
+        #  noncomm_spread, comm_long, comm_short, ...]
+        
+        date = latest[0]
+        noncomm_long = latest[2]    # Speculators long
+        noncomm_short = latest[3]   # Speculators short
+        comm_long = latest[5]       # Commercials long
+        comm_short = latest[6]      # Commercials short
+
+        prev_noncomm_long = previous[2]
+        prev_noncomm_short = previous[3]
+
+        # Net speculator position
+        net_spec = noncomm_long - noncomm_short
+        prev_net_spec = prev_noncomm_long - prev_noncomm_short
+        net_change = net_spec - prev_net_spec
+
+        if net_spec > 0:
+            spec_bias = "NET LONG"
+            spec_desc = f"Speculators net long {net_spec:,} contracts — bullish institutional bias"
+        else:
+            spec_bias = "NET SHORT"
+            spec_desc = f"Speculators net short {abs(net_spec):,} contracts — bearish institutional bias"
+
+        if net_change > 0:
+            change_desc = f"Increasing longs (+{net_change:,} contracts this week)"
+        else:
+            change_desc = f"Increasing shorts ({net_change:,} contracts this week)"
+
+        return {
+            "date": date,
+            "spec_bias": spec_bias,
+            "spec_desc": spec_desc,
+            "change_desc": change_desc,
+            "net_position": net_spec,
+            "net_change": net_change
+        }
+
+    except Exception as e:
+        print(f"COT error: {e}")
+        return get_cot_fallback()
+
+
+def get_cot_fallback():
+    return {
+        "date": "unavailable",
+        "spec_bias": "UNKNOWN",
+        "spec_desc": "COT data unavailable this week",
+        "change_desc": "Check cftc.gov for latest positioning",
+        "net_position": 0,
+        "net_change": 0
+    }
+
+
+# ============================================================
+# COT WEEKLY REPORT — fires every Friday after 3:30pm UTC
+# ============================================================
+@app.route('/cot-report', methods=['GET'])
+def cot_report():
+    try:
+        cot = get_cot_data()
+
+        prompt = f"""
+You are an expert gold analyst interpreting the weekly Commitment of Traders report.
+
+## LATEST COT DATA — GOLD FUTURES
+Date: {cot['date']}
+Speculator Position: {cot['spec_bias']}
+Detail: {cot['spec_desc']}
+Weekly Change: {cot['change_desc']}
+Net Position: {cot['net_position']:,} contracts
+
+## YOUR ANALYSIS
+
+**INSTITUTIONAL BIAS**
+What does this positioning tell us about smart money's view on gold?
+
+**CONFLUENCE WITH TECHNICAL PICTURE**
+Key levels this week: High {KEY_LEVELS['weekly_high']} | Low {KEY_LEVELS['weekly_low']} | Resistance {KEY_LEVELS['major_resistance']} | Support {KEY_LEVELS['major_support']}
+Does institutional positioning support or conflict with current technical structure?
+
+**TRADING IMPLICATION**
+Should we favour longs or shorts next week based on COT data?
+
+**WARNING SIGNS**
+Any extreme positioning that historically precedes reversals?
+
+Keep it concise and actionable. Maximum 200 words.
+"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        analysis = message.content[0].text
+
+        telegram_message = f"""
+📊 *COT Report Analysis — Gold Futures*
+_Week of {cot['date']}_
+
+*Institutional Position:* {cot['spec_bias']}
+*Detail:* {cot['spec_desc']}
+*Weekly Change:* {cot['change_desc']}
+
+{analysis}
+"""
+        send_telegram(telegram_message)
+
+        return jsonify({
+            "status": "COT report sent",
+            "spec_bias": cot['spec_bias'],
+            "net_position": cot['net_position']
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -2023,6 +2171,15 @@ if __name__ == '__main__':
         trigger='interval',
         minutes=5,
         id='entry_monitor'
+    )
+    # COT report every Friday at 4pm UTC (after CFTC release)
+    scheduler.add_job(
+        func=lambda: cot_report(),
+        trigger='cron',
+        day_of_week='fri',
+        hour=16,
+        minute=0,
+        id='cot_report'
     )
     scheduler.add_job(
         func=lambda: update_intraday(),

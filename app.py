@@ -406,30 +406,30 @@ Rate out of 10:
 Long or Short? One sentence reason.
 
 **ENTRY ZONE**
-Specific price zone.
+One line — specific price zone only.
 
 **STOP LOSS**
-Specific level and one sentence reason.
+One line — specific level only.
 
 **TARGET**
-Primary target level. Secondary if applicable.
+One line — primary target only.
 
 **RISK:REWARD**
-Entry / Stop / Target / RR — one line only.
+One line — Entry / SL / TP / RR ratio.
 
 **CONFIDENCE LEVEL**
-LOW / MEDIUM / HIGH — one sentence max.
+One line — LOW / MEDIUM / HIGH and single reason.
 
 **AVOID IF**
-2 bullet points maximum.
+One line — single most important reason only.
 
-Keep total response under 350 words. Be extremely concise.
+Total response must be under 200 words. Every section one line maximum.
 """
 
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=400,
+            max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text

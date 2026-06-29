@@ -67,6 +67,48 @@ KEY_LEVELS = {
 }
 
 # ============================================================
+# PERSISTENT DATA — saves and loads across restarts
+# ============================================================
+def save_state():
+    try:
+        state = {
+            "key_levels": KEY_LEVELS,
+            "paper_trades": paper_trades,
+            "daily_pnl": daily_pnl,
+            "total_pnl": total_pnl,
+            "current_balance": current_balance,
+            "trading_days": trading_days,
+            "consecutive_losses": consecutive_losses,
+        }
+        with open('bot_state.json', 'w') as f:
+            json.dump(state, f, indent=2)
+        print("State saved successfully")
+    except Exception as e:
+        print(f"State save error: {e}")
+
+
+def load_state():
+    global KEY_LEVELS, paper_trades, daily_pnl, total_pnl
+    global current_balance, trading_days, consecutive_losses
+    try:
+        with open('bot_state.json', 'r') as f:
+            state = json.load(f)
+
+        KEY_LEVELS.update(state.get('key_levels', {}))
+        paper_trades = state.get('paper_trades', [])
+        daily_pnl = state.get('daily_pnl', 0)
+        total_pnl = state.get('total_pnl', 0)
+        current_balance = state.get('current_balance', 10000)
+        trading_days = state.get('trading_days', 0)
+        consecutive_losses = state.get('consecutive_losses', 0)
+
+        print(f"State loaded — {len(paper_trades)} trades, balance ${current_balance}")
+    except FileNotFoundError:
+        print("No saved state found — starting fresh")
+    except Exception as e:
+        print(f"State load error: {e}")
+
+# ============================================================
 # SESSION DETECTION
 # ============================================================
 def get_session():
@@ -607,6 +649,9 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         monitor_active_trades(data.get('price', 0))
 
         return jsonify({"status": "ok"})
+    
+    # Save state after every alert
+        save_state()
 
     except Exception as e:
         error_msg = f"⚠️ SYSTEM ERROR: {str(e)}"
@@ -1517,6 +1562,9 @@ def test():
 # START SERVER
 # ============================================================
 if __name__ == '__main__':
+    if __name__ == '__main__':
+    load_state()
+    scheduler = BackgroundScheduler()
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=lambda: morning_briefing(), trigger='cron', hour=7, minute=0)
     scheduler.add_job(func=lambda: weekly_bias_report(), trigger='cron', day_of_week='sun', hour=20, minute=0)
@@ -1535,6 +1583,14 @@ if __name__ == '__main__':
         trigger='interval',
         minutes=30,
         id='intraday_updater'
+    )
+
+    # Save state every 10 minutes as backup
+    scheduler.add_job(
+        func=lambda: save_state(),
+        trigger='interval',
+        minutes=10,
+        id='state_saver'
     )
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())

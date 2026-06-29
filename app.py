@@ -16,6 +16,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import yfinance as yf
 import pandas as pd
+import cot_reports as cot
 
 load_dotenv()
 
@@ -1960,45 +1961,45 @@ def view_rules():
 # ============================================================
 # COT REPORT — Commitment of Traders institutional positioning
 # ============================================================
+def get_cot_fallback():
+    return {
+        "date": "unavailable",
+        "spec_bias": "UNKNOWN",
+        "spec_desc": "COT data unavailable this week",
+        "change_desc": "Check cftc.gov for latest positioning",
+        "net_position": 0,
+        "net_change": 0
+    }
+
 def get_cot_data():
     try:
-        # CFTC publishes COT data — we pull gold futures positioning
-        # Gold futures contract code: 088691
-        url = "https://www.quandl.com/api/v3/datasets/CFTC/088691_FO_ALL.json?rows=2&api_key=QUANDL_FREE"
+        # Pull COT data directly from CFTC
+        df = cot.cot_year(year=2026, cot_report_type='legacy_fut')
         
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code != 200:
+        if df is None or df.empty:
             return get_cot_fallback()
 
-        data = response.json()
-        dataset = data.get('dataset', {})
-        rows = dataset.get('data', [])
+        # Filter for gold futures — market code 088691
+        gold = df[df['Market and Exchange Names'].str.contains('GOLD', case=False, na=False)]
         
-        if len(rows) < 2:
+        if gold.empty:
             return get_cot_fallback()
 
-        # Latest week
-        latest = rows[0]
-        previous = rows[1]
+        # Get latest two rows
+        gold = gold.sort_values('As of Date in Form YYYY-MM-DD', ascending=False)
+        latest = gold.iloc[0]
+        previous = gold.iloc[1] if len(gold) > 1 else gold.iloc[0]
 
-        # COT data structure:
-        # [date, open_interest, noncomm_long, noncomm_short, 
-        #  noncomm_spread, comm_long, comm_short, ...]
-        
-        date = latest[0]
-        noncomm_long = latest[2]    # Speculators long
-        noncomm_short = latest[3]   # Speculators short
-        comm_long = latest[5]       # Commercials long
-        comm_short = latest[6]      # Commercials short
+        # Extract positioning
+        noncomm_long = int(latest.get('Noncommercial Positions-Long (All)', 0))
+        noncomm_short = int(latest.get('Noncommercial Positions-Short (All)', 0))
+        prev_long = int(previous.get('Noncommercial Positions-Long (All)', 0))
+        prev_short = int(previous.get('Noncommercial Positions-Short (All)', 0))
 
-        prev_noncomm_long = previous[2]
-        prev_noncomm_short = previous[3]
-
-        # Net speculator position
+        date = str(latest.get('As of Date in Form YYYY-MM-DD', 'unknown'))
         net_spec = noncomm_long - noncomm_short
-        prev_net_spec = prev_noncomm_long - prev_noncomm_short
-        net_change = net_spec - prev_net_spec
+        prev_net = prev_long - prev_short
+        net_change = net_spec - prev_net
 
         if net_spec > 0:
             spec_bias = "NET LONG"
@@ -2024,19 +2025,7 @@ def get_cot_data():
     except Exception as e:
         print(f"COT error: {e}")
         return get_cot_fallback()
-
-
-def get_cot_fallback():
-    return {
-        "date": "unavailable",
-        "spec_bias": "UNKNOWN",
-        "spec_desc": "COT data unavailable this week",
-        "change_desc": "Check cftc.gov for latest positioning",
-        "net_position": 0,
-        "net_change": 0
-    }
-
-
+    
 # ============================================================
 # COT WEEKLY REPORT — fires every Friday after 3:30pm UTC
 # ============================================================

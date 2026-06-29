@@ -559,7 +559,11 @@ Total response must be under 200 words. Every section one line maximum.
             },
             messages=[{"role": "user", "content": prompt}]
         )
-        return message.content[0].text
+        # Extract text block — skip thinking blocks
+        for block in message.content:
+            if block.type == "text":
+                return block.text
+        return "No analysis returned"
     except Exception as e:
         return f"Claude analysis error: {str(e)}"
 

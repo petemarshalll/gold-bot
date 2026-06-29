@@ -1392,11 +1392,12 @@ Be direct and data driven. Base everything on the actual numbers above.
 
         review = message.content[0].text
 
-        # Save the updated rules to a file
+        # Save as PENDING rules — not applied until approved
         try:
-            with open('learned_rules.txt', 'w') as f:
-                f.write(f"Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+            with open('pending_rules.txt', 'w') as f:
+                f.write(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
                 f.write(review)
+            print("Rules saved as pending — awaiting approval")
         except Exception as e:
             print(f"Rules save error: {e}")
 
@@ -1407,6 +1408,16 @@ _{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
 📊 Stats: {len(trades)} alerts | {len(wins)}W {len(losses)}L | {win_rate:.1f}% win rate
 
 {review}
+
+---
+⚠️ *These rules are PENDING YOUR APPROVAL*
+They have NOT been applied to the live system yet.
+
+Approve: https://web-production-387c47.up.railway.app/approve-rules
+
+Reject: https://web-production-387c47.up.railway.app/reject-rules
+
+Review carefully before approving.
 """
         send_telegram(telegram_message)
 
@@ -1833,6 +1844,107 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
         error_msg = f"⚠️ Backtest error: {str(e)}"
         send_telegram(error_msg)
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
+# RULE APPROVAL SYSTEM
+# ============================================================
+@app.route('/approve-rules', methods=['GET'])
+def approve_rules():
+    try:
+        # Load pending rules
+        with open('pending_rules.txt', 'r') as f:
+            pending = f.read()
+
+        # Apply them to live rules
+        with open('learned_rules.txt', 'w') as f:
+            f.write(f"Approved: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+            f.write(pending)
+
+        # Clear pending
+        with open('pending_rules.txt', 'w') as f:
+            f.write("No pending rules")
+
+        send_telegram(f"""
+✅ *Rule Update Approved*
+_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
+
+New learned rules have been applied to the live system.
+Claude will use these rules in all future analysis.
+
+To review active rules visit:
+`https://web-production-387c47.up.railway.app/view-rules`
+""")
+        return jsonify({"status": "rules approved and applied"})
+
+    except FileNotFoundError:
+        return jsonify({"status": "no pending rules to approve"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/reject-rules', methods=['GET'])
+def reject_rules():
+    try:
+        # Clear pending rules
+        with open('pending_rules.txt', 'w') as f:
+            f.write("No pending rules")
+
+        send_telegram(f"""
+❌ *Rule Update Rejected*
+_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
+
+Proposed rule changes have been discarded.
+The system continues using previously approved rules.
+""")
+        return jsonify({"status": "rules rejected — live rules unchanged"})
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/view-rules', methods=['GET'])
+def view_rules():
+    try:
+        active = ""
+        pending = ""
+
+        try:
+            with open('learned_rules.txt', 'r') as f:
+                active = f.read()
+        except FileNotFoundError:
+            active = "No approved rules yet"
+
+        try:
+            with open('pending_rules.txt', 'r') as f:
+                pending = f.read()
+        except FileNotFoundError:
+            pending = "No pending rules"
+
+        return f"""
+<html>
+<head><title>Gold Bot Rules</title></head>
+<body style="background:#0a0a1a;color:#eee;font-family:monospace;padding:30px;max-width:800px;margin:0 auto;">
+<h1 style="color:#ffd700">🧠 Gold Bot — Rule Manager</h1>
+
+<h2 style="color:#44ff88">✅ Active Rules (live)</h2>
+<pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{active}</pre>
+
+<h2 style="color:#ffaa00">⏳ Pending Rules (awaiting approval)</h2>
+<pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{pending}</pre>
+
+<div style="margin-top:30px;display:flex;gap:20px;">
+    <a href="/approve-rules" style="background:#44ff88;color:#000;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">
+        ✅ Approve Pending Rules
+    </a>
+    <a href="/reject-rules" style="background:#ff4444;color:#fff;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">
+        ❌ Reject Pending Rules
+    </a>
+</div>
+</body>
+</html>
+"""
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
 # ============================================================
 # HEALTH CHECK

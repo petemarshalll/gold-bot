@@ -415,21 +415,21 @@ Specific level and one sentence reason.
 Primary target level. Secondary if applicable.
 
 **RISK:REWARD**
-Entry / Stop / Target / RR ratio.
+Entry / Stop / Target / RR — one line only.
 
 **CONFIDENCE LEVEL**
-LOW / MEDIUM / HIGH — one sentence reason.
+LOW / MEDIUM / HIGH — one sentence max.
 
 **AVOID IF**
-3 bullet points maximum.
+2 bullet points maximum.
 
-Keep total response under 400 words. Be direct.
+Keep total response under 250 words. Be extremely concise.
 """
 
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=350,
+            max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text

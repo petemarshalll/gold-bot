@@ -429,7 +429,7 @@ Total response must be under 200 words. Every section one line maximum.
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=500,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text

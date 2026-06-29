@@ -733,6 +733,360 @@ def update_levels():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# DASHBOARD
+# ============================================================
+@app.route('/dashboard', methods=['GET'])
+def dashboard():
+    session_name, session_desc, is_killzone = get_session()
+    zone, zone_pct, zone_advice = get_premium_discount(
+        (KEY_LEVELS['dealing_range_high'] + KEY_LEVELS['dealing_range_low']) / 2
+    )
+    dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
+    news_risk, news_msg = check_news_risk()
+
+    zone_color = "#ff4444" if zone == "PREMIUM" else "#44ff88"
+    dxy_color = "#ff4444" if dxy_direction == "BULLISH" else "#44ff88" if dxy_direction == "BEARISH" else "#ffaa00"
+    killzone_badge = "🎯 KILLZONE ACTIVE" if is_killzone else ""
+    news_badge = f"⚠️ {news_msg}" if news_risk else "✅ No major news risk"
+
+    alerts_html = ""
+    for a in reversed(recent_alerts[-10:]):
+        alert_type = a.get('type', '')
+        color = "#ff4444" if "BEARISH" in alert_type else "#44ff88"
+        alerts_html += f"""
+        <div class="alert-row">
+            <span style="color:{color}">●</span>
+            <span class="alert-time">{a.get('time', '')}</span>
+            <span class="alert-type">{alert_type}</span>
+            <span class="alert-tf">{a.get('timeframe', '')} | {a.get('price', '')}</span>
+        </div>
+        """
+    if not alerts_html:
+        alerts_html = "<div class='no-data'>No alerts this session yet</div>"
+
+    trades_html = ""
+    for trade_id, trade in active_trades.items():
+        direction = trade.get('direction', '')
+        color = "#44ff88" if direction == "LONG" else "#ff4444"
+        trades_html += f"""
+        <div class="trade-row">
+            <span style="color:{color}">{'▲' if direction == 'LONG' else '▼'} {direction}</span>
+            <span>Entry: {trade.get('entry', 0):.2f}</span>
+            <span>SL: {trade.get('stop', 0):.2f}</span>
+            <span>TP: {trade.get('target', 0):.2f}</span>
+            <span class="trade-open">OPEN</span>
+        </div>
+        """
+    if not trades_html:
+        trades_html = "<div class='no-data'>No active paper trades</div>"
+
+    levels_html = ""
+    for k, v in KEY_LEVELS.items():
+        label = k.replace('_', ' ').title()
+        levels_html += f"""
+        <div class="level-row">
+            <span class="level-label">{label}</span>
+            <span class="level-value">{v}</span>
+        </div>
+        """
+
+    account = PROP_FIRM_RULES["account_size"]
+    daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
+    total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
+    daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
+    total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
+    daily_status_color = "#ff4444" if daily_used_pct >= 80 else "#ffaa00" if daily_used_pct >= 50 else "#44ff88"
+    total_status_color = "#ff4444" if total_used_pct >= 80 else "#ffaa00" if total_used_pct >= 50 else "#44ff88"
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Gold Bot Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="30">
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            background: #0a0a1a;
+            color: #eee;
+            font-family: 'Courier New', monospace;
+            padding: 15px;
+            max-width: 900px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            padding: 20px 0 15px;
+            border-bottom: 1px solid #333;
+            margin-bottom: 20px;
+        }}
+        .header h1 {{
+            color: #ffd700;
+            font-size: 24px;
+            letter-spacing: 3px;
+        }}
+        .header .subtitle {{
+            color: #888;
+            font-size: 12px;
+            margin-top: 5px;
+        }}
+        .status-bar {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #111130;
+            border: 1px solid #ffd700;
+            border-radius: 8px;
+            padding: 12px 20px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }}
+        .status-item {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+        .status-label {{
+            color: #888;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        .status-value {{
+            color: #ffd700;
+            font-size: 14px;
+            font-weight: bold;
+            margin-top: 3px;
+        }}
+        .grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+        }}
+        @media (max-width: 600px) {{
+            .grid {{ grid-template-columns: 1fr; }}
+        }}
+        .card {{
+            background: #111130;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }}
+        .card h3 {{
+            color: #ffd700;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #333;
+        }}
+        .full-width {{
+            grid-column: 1 / -1;
+        }}
+        .level-row {{
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #1a1a3a;
+            font-size: 13px;
+        }}
+        .level-label {{ color: #aaa; }}
+        .level-value {{ color: #ffd700; font-weight: bold; }}
+        .alert-row {{
+            display: flex;
+            gap: 10px;
+            padding: 6px 0;
+            border-bottom: 1px solid #1a1a3a;
+            font-size: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }}
+        .alert-time {{ color: #888; min-width: 70px; }}
+        .alert-type {{ color: #fff; flex: 1; }}
+        .alert-tf {{ color: #888; font-size: 11px; }}
+        .trade-row {{
+            display: flex;
+            gap: 15px;
+            padding: 8px 0;
+            border-bottom: 1px solid #1a1a3a;
+            font-size: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }}
+        .trade-open {{
+            color: #ffaa00;
+            font-weight: bold;
+            margin-left: auto;
+        }}
+        .prop-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #1a1a3a;
+            font-size: 13px;
+        }}
+        .prop-label {{ color: #aaa; }}
+        .progress-bar {{
+            background: #222;
+            border-radius: 4px;
+            height: 6px;
+            margin-top: 4px;
+            overflow: hidden;
+        }}
+        .progress-fill {{
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s;
+        }}
+        .no-data {{
+            color: #555;
+            font-size: 12px;
+            padding: 10px 0;
+            text-align: center;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+        }}
+        .killzone-badge {{
+            background: #ffd700;
+            color: #000;
+        }}
+        .news-badge {{
+            background: #ff4444;
+            color: #fff;
+        }}
+        .safe-badge {{
+            background: #1a4a2a;
+            color: #44ff88;
+        }}
+        .footer {{
+            text-align: center;
+            color: #555;
+            font-size: 11px;
+            margin-top: 20px;
+            padding-top: 15px;
+            border-top: 1px solid #333;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🥇 GOLD BOT</h1>
+        <div class="subtitle">Auto-refreshes every 30 seconds | {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</div>
+    </div>
+
+    <div class="status-bar">
+        <div class="status-item">
+            <span class="status-label">System</span>
+            <span class="status-value">🟢 LIVE</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Session</span>
+            <span class="status-value">{session_name}</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Killzone</span>
+            <span class="status-value">{'🎯 ACTIVE' if is_killzone else '⭕ INACTIVE'}</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Zone</span>
+            <span class="status-value" style="color:{zone_color}">{zone} {zone_pct}%</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">DXY</span>
+            <span class="status-value" style="color:{dxy_color}">{dxy_direction}</span>
+        </div>
+        <div class="status-item">
+            <span class="status-label">Alerts Today</span>
+            <span class="status-value">{len(recent_alerts)}</span>
+        </div>
+    </div>
+
+    <div style="margin-bottom:15px;">
+        {'<span class="badge news-badge">⚠️ ' + news_msg + '</span>' if news_risk else '<span class="badge safe-badge">✅ No major news risk</span>'}
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h3>📊 Key Levels</h3>
+            {levels_html}
+        </div>
+
+        <div class="card">
+            <h3>🏦 Prop Firm Status</h3>
+            <div class="prop-row">
+                <span class="prop-label">Account Size</span>
+                <span style="color:#ffd700">${account:,.2f}</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">Balance</span>
+                <span style="color:#44ff88">${current_balance:,.2f}</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">Today P&L</span>
+                <span style="color:{'#44ff88' if daily_pnl >= 0 else '#ff4444'}">${daily_pnl:,.2f}</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">Total P&L</span>
+                <span style="color:{'#44ff88' if total_pnl >= 0 else '#ff4444'}">${total_pnl:,.2f}</span>
+            </div>
+            <div style="margin-top:10px;">
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;">
+                    <span>Daily Loss Used</span>
+                    <span style="color:{daily_status_color}">{daily_used_pct:.1f}% of {PROP_FIRM_RULES['max_daily_loss_pct']}%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width:{min(daily_used_pct, 100)}%;background:{daily_status_color}"></div>
+                </div>
+            </div>
+            <div style="margin-top:8px;">
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;">
+                    <span>Total Drawdown Used</span>
+                    <span style="color:{total_status_color}">{total_used_pct:.1f}% of {PROP_FIRM_RULES['max_total_drawdown_pct']}%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width:{min(total_used_pct, 100)}%;background:{total_status_color}"></div>
+                </div>
+            </div>
+            <div class="prop-row" style="margin-top:10px;">
+                <span class="prop-label">Trading Days</span>
+                <span style="color:#ffd700">{trading_days}/{PROP_FIRM_RULES['min_trading_days']}</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">Drawdown Protection</span>
+                <span style="color:{'#ff4444' if drawdown_protection else '#44ff88'}">{'ACTIVE' if drawdown_protection else 'OFF'}</span>
+            </div>
+        </div>
+
+        <div class="card full-width">
+            <h3>📡 Today's Alerts ({len(recent_alerts)} this session)</h3>
+            {alerts_html}
+        </div>
+
+        <div class="card full-width">
+            <h3>📈 Active Paper Trades ({len(active_trades)} open)</h3>
+            {trades_html}
+        </div>
+    </div>
+
+    <div class="footer">
+        Gold Bot v2.0 | Railway | Auto-refreshes every 30s | Last updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}
+    </div>
+</body>
+</html>
+"""
+    return html
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])

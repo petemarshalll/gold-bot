@@ -1506,6 +1506,303 @@ def update_intraday():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# BACKTESTING BATCH ANALYSER — 2 years of XAUUSD data
+# ============================================================
+@app.route('/backtest', methods=['GET'])
+def run_backtest():
+    try:
+        send_telegram("🔍 *Backtesting started — pulling 2 years of XAUUSD data...*\nThis will take about 60 seconds.")
+
+        # Pull 2 years of 1H data
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False)
+
+        if gold.empty:
+            return jsonify({"status": "error", "message": "no data"})
+
+        # Flatten MultiIndex
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+
+        total_candles = len(gold)
+        send_telegram(f"📊 Data loaded — {total_candles} candles over 2 years. Detecting signals...")
+
+        # ── SIGNAL DETECTION ──────────────────────────────
+        signals = []
+
+        for i in range(3, len(gold) - 10):
+            candle = gold.iloc[i]
+            prev1 = gold.iloc[i-1]
+            prev2 = gold.iloc[i-2]
+            next5 = gold.iloc[i+1:i+6]
+            next10 = gold.iloc[i+1:i+11]
+
+            high = float(candle['High'])
+            low = float(candle['Low'])
+            close = float(candle['Close'])
+            open_ = float(candle['Open'])
+
+            # ── BEARISH FVG ──
+            # Gap between candle[i-2] low and candle[i] high
+            if float(prev2['Low']) > high:
+                fvg_size = float(prev2['Low']) - high
+                fvg_pct = (fvg_size / close) * 100
+
+                # Check outcome — did price go down?
+                future_low = float(next10['Low'].min())
+                future_high = float(next10['High'].max())
+                move_down = close - future_low
+                move_up = future_high - close
+
+                outcome = "WIN" if move_down > move_up else "LOSS"
+                signals.append({
+                    "type": "BEARISH_FVG",
+                    "time": str(gold.index[i]),
+                    "price": close,
+                    "fvg_size": round(fvg_size, 2),
+                    "hour": gold.index[i].hour,
+                    "outcome": outcome,
+                    "move_down": round(move_down, 2),
+                    "move_up": round(move_up, 2)
+                })
+
+            # ── BULLISH FVG ──
+            # Gap between candle[i-2] high and candle[i] low
+            if float(prev2['High']) < low:
+                fvg_size = low - float(prev2['High'])
+                future_low = float(next10['Low'].min())
+                future_high = float(next10['High'].max())
+                move_up = future_high - close
+                move_down = close - future_low
+
+                outcome = "WIN" if move_up > move_down else "LOSS"
+                signals.append({
+                    "type": "BULLISH_FVG",
+                    "time": str(gold.index[i]),
+                    "price": close,
+                    "fvg_size": round(fvg_size, 2),
+                    "hour": gold.index[i].hour,
+                    "outcome": outcome,
+                    "move_up": round(move_up, 2),
+                    "move_down": round(move_down, 2)
+                })
+
+            # ── BEARISH SWEEP ──
+            lookback_high = float(gold.iloc[i-10:i]['High'].max())
+            if high > lookback_high and close < lookback_high:
+                future_low = float(next5['Low'].min())
+                future_high = float(next5['High'].max())
+                outcome = "WIN" if (close - future_low) > (future_high - close) else "LOSS"
+                signals.append({
+                    "type": "BEARISH_SWEEP",
+                    "time": str(gold.index[i]),
+                    "price": close,
+                    "hour": gold.index[i].hour,
+                    "outcome": outcome,
+                    "move_down": round(close - future_low, 2),
+                    "move_up": round(future_high - close, 2)
+                })
+
+            # ── BULLISH SWEEP ──
+            lookback_low = float(gold.iloc[i-10:i]['Low'].min())
+            if low < lookback_low and close > lookback_low:
+                future_low = float(next5['Low'].min())
+                future_high = float(next5['High'].max())
+                outcome = "WIN" if (future_high - close) > (close - future_low) else "LOSS"
+                signals.append({
+                    "type": "BULLISH_SWEEP",
+                    "time": str(gold.index[i]),
+                    "price": close,
+                    "hour": gold.index[i].hour,
+                    "outcome": outcome,
+                    "move_up": round(future_high - close, 2),
+                    "move_down": round(close - future_low, 2)
+                })
+
+        # ── COMPILE STATISTICS ─────────────────────────────
+        total_signals = len(signals)
+
+        if total_signals == 0:
+            send_telegram("⚠️ No signals detected — check indicator settings")
+            return jsonify({"status": "no signals"})
+
+        send_telegram(f"✅ {total_signals} signals detected. Compiling statistics...")
+
+        # Overall win rate
+        wins = len([s for s in signals if s['outcome'] == 'WIN'])
+        overall_wr = round(wins / total_signals * 100, 1)
+
+        # By type
+        type_stats = {}
+        for s in signals:
+            t = s['type']
+            if t not in type_stats:
+                type_stats[t] = {'wins': 0, 'total': 0}
+            type_stats[t]['total'] += 1
+            if s['outcome'] == 'WIN':
+                type_stats[t]['wins'] += 1
+
+        type_summary = "\n".join([
+            f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100)}% win rate)"
+            for k, v in type_stats.items()
+        ])
+
+        # By session (hour)
+        session_stats = {
+            "Asian (22-07)": {"wins": 0, "total": 0},
+            "London (07-12)": {"wins": 0, "total": 0},
+            "NY (12-17)": {"wins": 0, "total": 0},
+            "Other (17-22)": {"wins": 0, "total": 0}
+        }
+
+        for s in signals:
+            hour = s['hour']
+            if hour >= 22 or hour < 7:
+                session = "Asian (22-07)"
+            elif 7 <= hour < 12:
+                session = "London (07-12)"
+            elif 12 <= hour < 17:
+                session = "NY (12-17)"
+            else:
+                session = "Other (17-22)"
+            session_stats[session]['total'] += 1
+            if s['outcome'] == 'WIN':
+                session_stats[session]['wins'] += 1
+
+        session_summary = "\n".join([
+            f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100) if v['total'] > 0 else 0}% win rate)"
+            for k, v in session_stats.items()
+        ])
+
+        # Best and worst hours
+        hour_stats = {}
+        for s in signals:
+            h = s['hour']
+            if h not in hour_stats:
+                hour_stats[h] = {'wins': 0, 'total': 0}
+            hour_stats[h]['total'] += 1
+            if s['outcome'] == 'WIN':
+                hour_stats[h]['wins'] += 1
+
+        hour_wr = {h: round(v['wins']/v['total']*100) for h, v in hour_stats.items() if v['total'] >= 5}
+        best_hours = sorted(hour_wr.items(), key=lambda x: x[1], reverse=True)[:3]
+        worst_hours = sorted(hour_wr.items(), key=lambda x: x[1])[:3]
+
+        best_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in best_hours])
+        worst_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in worst_hours])
+
+        # Save signals to file
+        try:
+            with open('backtest_signals.json', 'w') as f:
+                json.dump(signals[:500], f, indent=2)
+        except Exception as e:
+            print(f"Signal save error: {e}")
+
+        # ── SEND TO CLAUDE FOR ANALYSIS ────────────────────
+        prompt = f"""
+You are analysing 2 years of backtesting data for an XAUUSD (Gold) SMC trading system.
+
+## BACKTEST RESULTS SUMMARY
+Total candles analysed: {total_candles}
+Total signals detected: {total_signals}
+Overall win rate: {overall_wr}%
+
+## PERFORMANCE BY SIGNAL TYPE
+{type_summary}
+
+## PERFORMANCE BY SESSION
+{session_summary}
+
+## BEST HOURS TO TRADE
+{best_hours_str}
+
+## WORST HOURS TO TRADE
+{worst_hours_str}
+
+## YOUR ANALYSIS
+
+Based on this 2 year dataset provide:
+
+**OVERALL ASSESSMENT**
+Is this strategy viable based on the data?
+
+**STRONGEST SETUP**
+Which signal type performs best and why?
+
+**WEAKEST SETUP**
+Which signal type to avoid or filter out?
+
+**BEST SESSION**
+Which session produces the most reliable signals?
+
+**SESSION TO AVOID**
+Which session should be filtered out entirely?
+
+**OPTIMAL TRADING HOURS**
+Specific UTC hours that consistently outperform.
+
+**RECOMMENDED FILTERS**
+3-5 specific rules to add to improve win rate based on this data.
+
+**EXPECTED PERFORMANCE**
+If we apply these filters what win rate should we realistically expect?
+
+Be direct and data driven. Base everything on the numbers above.
+"""
+
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        analysis = message.content[0].text
+
+        # Save backtest report
+        try:
+            with open('backtest_report.txt', 'w') as f:
+                f.write(f"Backtest Report — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
+                f.write(f"Total Signals: {total_signals}\n")
+                f.write(f"Overall Win Rate: {overall_wr}%\n\n")
+                f.write(f"By Type:\n{type_summary}\n\n")
+                f.write(f"By Session:\n{session_summary}\n\n")
+                f.write(f"Claude Analysis:\n{analysis}")
+        except Exception as e:
+            print(f"Report save error: {e}")
+
+        telegram_message = f"""
+📈 *XAUUSD Backtest Report — 2 Years*
+_{datetime.utcnow().strftime('%d %b %Y')}_
+
+*Data:* {total_candles} candles | {total_signals} signals
+*Overall Win Rate:* {overall_wr}%
+
+*By Signal Type:*
+{type_summary}
+
+*By Session:*
+{session_summary}
+
+*Best Hours:* {best_hours_str}
+*Worst Hours:* {worst_hours_str}
+
+{analysis}
+"""
+        send_telegram(telegram_message)
+
+        return jsonify({
+            "status": "backtest complete",
+            "total_signals": total_signals,
+            "overall_win_rate": overall_wr,
+            "type_stats": type_stats,
+            "session_stats": session_stats
+        })
+
+    except Exception as e:
+        error_msg = f"⚠️ Backtest error: {str(e)}"
+        send_telegram(error_msg)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])

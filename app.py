@@ -34,6 +34,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ============================================================
 recent_alerts = []
 paper_trades = []
+active_trades = {}  # stores open trades with SL and TP
 daily_losses = 0
 consecutive_losses = 0
 drawdown_protection = False
@@ -256,25 +257,100 @@ def log_to_csv(alert_type, price, confidence, analysis):
 # ============================================================
 # PAPER TRADE TRACKER
 # ============================================================
-def log_paper_trade(alert_type, price, direction, entry, stop, target, confidence):
+def log_paper_trade(alert_type, price, direction, entry, stop, target, confidence, alert_time):
+    trade_id = f"{alert_type}_{alert_time.replace(':', '').replace(' ', '_')}"
+    
     trade = {
-        "time": datetime.utcnow().strftime('%Y-%m-%d %H:%M'),
+        "id": trade_id,
+        "time": alert_time,
         "type": alert_type,
         "price": price,
         "direction": direction,
-        "entry": entry,
-        "stop": stop,
-        "target": target,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
         "confidence": confidence,
         "result": "OPEN"
     }
+    
     paper_trades.append(trade)
+    active_trades[trade_id] = trade
 
     try:
         with open('paper_trades.json', 'w') as f:
             json.dump(paper_trades, f, indent=2)
     except Exception as e:
         print(f"Paper trade log error: {e}")
+    
+    return trade_id
+
+
+# ============================================================
+# MONITOR ACTIVE TRADES — checks if SL or TP has been hit
+# ============================================================
+def monitor_active_trades(current_price):
+    current_price = float(current_price)
+    trades_to_close = []
+
+    for trade_id, trade in active_trades.items():
+        if trade['result'] != 'OPEN':
+            continue
+
+        entry = trade['entry']
+        stop = trade['stop']
+        target = trade['target']
+        direction = trade['direction']
+
+        hit_tp = False
+        hit_sl = False
+
+        if direction == 'LONG':
+            if current_price >= target:
+                hit_tp = True
+            elif current_price <= stop:
+                hit_sl = True
+        elif direction == 'SHORT':
+            if current_price <= target:
+                hit_tp = True
+            elif current_price >= stop:
+                hit_sl = True
+
+        if hit_tp:
+            points = abs(target - entry)
+            trade['result'] = 'WIN'
+            message = f"""
+✅ *TRADE CLOSED — TARGET HIT*
+Alert: {trade['type']} | {trade['time']}
+Direction: {direction}
+Entry: {entry}
+Target: {target} ← hit at {current_price}
+Result: WIN ✅ +{points:.2f} points
+"""
+            send_telegram(message)
+            trades_to_close.append(trade_id)
+
+        elif hit_sl:
+            points = abs(stop - entry)
+            trade['result'] = 'LOSS'
+            message = f"""
+❌ *TRADE CLOSED — STOP HIT*
+Alert: {trade['type']} | {trade['time']}
+Direction: {direction}
+Entry: {entry}
+Stop: {stop} ← hit at {current_price}
+Result: LOSS ❌ -{points:.2f} points
+"""
+            send_telegram(message)
+            trades_to_close.append(trade_id)
+
+    for trade_id in trades_to_close:
+        del active_trades[trade_id]
+
+    try:
+        with open('paper_trades.json', 'w') as f:
+            json.dump(paper_trades, f, indent=2)
+    except Exception as e:
+        print(f"Paper trade update error: {e}")
 
 # ============================================================
 # MAIN CLAUDE ANALYSIS
@@ -368,7 +444,7 @@ CRITICAL FORMATTING RULES:
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1000,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text
@@ -478,11 +554,66 @@ def webhook():
 
 {analysis}
 
-_Confidence: {confidence} | Log this trade in your journal_
+_Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
 """
 
         send_telegram(telegram_message)
         log_to_csv(alert_type, data.get('price'), confidence, analysis)
+
+        # Extract direction, SL and TP from Claude's analysis
+        direction = "SHORT" if "SHORT" in analysis.upper() or "BEARISH" in alert_type else "LONG"
+        
+        # Extract entry, SL and TP using simple text parsing
+        import re
+        
+        entry_price = float(data.get('price', 0))
+        stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
+        target_price = entry_price * 0.99 if direction == "SHORT" else entry_price * 1.01
+
+        # Try to extract actual SL from analysis
+        sl_patterns = [
+            r'Stop(?:\s+Loss)?[:\s]+(\d+\.?\d*)',
+            r'stop[:\s]+(\d+\.?\d*)',
+            r'SL[:\s]+(\d+\.?\d*)',
+        ]
+        for pattern in sl_patterns:
+            match = re.search(pattern, analysis, re.IGNORECASE)
+            if match:
+                extracted = float(match.group(1))
+                if 3000 < extracted < 5000:
+                    stop_price = extracted
+                    break
+
+        # Try to extract actual TP from analysis
+        tp_patterns = [
+            r'Target(?:\s+1)?[:\s]+(\d+\.?\d*)',
+            r'target[:\s]+(\d+\.?\d*)',
+            r'TP[:\s]+(\d+\.?\d*)',
+        ]
+        for pattern in tp_patterns:
+            match = re.search(pattern, analysis, re.IGNORECASE)
+            if match:
+                extracted = float(match.group(1))
+                if 3000 < extracted < 5000:
+                    target_price = extracted
+                    break
+
+        # Only log HIGH and MEDIUM confidence trades as paper trades
+        if confidence in ["HIGH", "MEDIUM"]:
+            alert_time = datetime.utcnow().strftime('%H:%M UTC')
+            log_paper_trade(
+                alert_type, 
+                data.get('price'), 
+                direction,
+                entry_price,
+                stop_price,
+                target_price,
+                confidence,
+                alert_time
+            )
+
+        # Monitor existing active trades with current price
+        monitor_active_trades(data.get('price', 0))
 
         return jsonify({"status": "ok"})
 
@@ -524,7 +655,7 @@ Keep it punchy and practical. This trader uses SMC — FVGs, sweeps, order block
 
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=500,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -580,7 +711,7 @@ Keep it punchy, practical and SMC focused.
 
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=600,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -620,7 +751,7 @@ Maximum 3 sentences per section. Be direct and actionable.
 
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=300,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
 

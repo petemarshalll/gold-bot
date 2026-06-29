@@ -423,13 +423,13 @@ LOW / MEDIUM / HIGH — one sentence max.
 **AVOID IF**
 2 bullet points maximum.
 
-Keep total response under 250 words. Be extremely concise.
+Keep total response under 350 words. Be extremely concise.
 """
 
     try:
         message = claude_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=300,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
         return message.content[0].text
@@ -1399,15 +1399,13 @@ def test():
             dxy_direction, dxy_desc
         )
         telegram_message = f"""
-🧪 *TEST ALERT — XAUUSD System Check*
+🧪 *TEST ALERT — system working correctly* ✅
 📍 Price: 4088.50
 📊 Zone: {zone} ({zone_pct}%)
 ⏰ {datetime.utcnow().strftime('%H:%M UTC')} | {session_name}
 💵 DXY: {dxy_desc}
 
 {analysis}
-
-_This was a test alert — system is working correctly_ ✅
 """
         send_telegram(telegram_message)
         return jsonify({"status": "✅ test complete — check your Telegram", "session": session_name, "dxy": dxy_direction})

@@ -12,6 +12,7 @@ import csv
 import re
 import zipfile
 import io
+import threading
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -620,22 +621,33 @@ Total response must be under 200 words. Every section one line maximum.
         return f"Claude analysis error: {str(e)}"
 
 # ============================================================
-# WEBHOOK
+# WEBHOOK — responds instantly, processes in background thread
 # ============================================================
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    global recent_alerts
     try:
         data = request.json
         print(f"Alert received: {data}")
-
-        # Define alert_type first — used throughout
         alert_type = data.get('type', '')
 
-        # Filter out BULLISH_SWEEP — 39% win rate over 2 years
         if alert_type == "BULLISH_SWEEP":
             log_to_csv(alert_type, data.get('price'), "FILTERED", "BULLISH_SWEEP filtered — 39% historical win rate")
             return jsonify({"status": "filtered", "reason": "BULLISH_SWEEP has 39% win rate over 2 years"})
+
+        thread = threading.Thread(target=process_webhook_alert, args=(data,))
+        thread.start()
+
+        return jsonify({"status": "received", "processing": "background"})
+
+    except Exception as e:
+        print(f"Webhook receive error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def process_webhook_alert(data):
+    global recent_alerts
+    try:
+        alert_type = data.get('type', '')
 
         session_name, session_desc, is_killzone = get_session()
         zone, zone_pct, zone_advice = get_premium_discount(data.get('price', 0))
@@ -677,7 +689,6 @@ def webhook():
         elif "LOW" in analysis.upper() and "CONFIDENCE" in analysis.upper():
             confidence = "LOW"
 
-        # Adjust confidence based on 2 year backtest data
         if "FVG" in alert_type and confidence == "LOW":
             confidence = "MEDIUM"
         if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
@@ -685,11 +696,11 @@ def webhook():
 
         if drawdown_active and confidence == "LOW":
             log_to_csv(alert_type, data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
-            return jsonify({"status": "skipped", "reason": "drawdown protection active"})
+            return
 
         if news_risk and confidence != "HIGH":
             send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
-            return jsonify({"status": "suppressed", "reason": "news risk"})
+            return
 
         emoji = "🔴" if "BEARISH" in alert_type else "🟢" if "BULLISH" in alert_type else "🟡"
         killzone_badge = "🎯 KILLZONE" if is_killzone else ""
@@ -735,7 +746,6 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     target_price = extracted
                     break
 
-        # Derive direction from the actual SL/TP numbers — more reliable than text parsing
         if target_price > stop_price:
             direction = "LONG"
         elif target_price < stop_price:
@@ -743,7 +753,6 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         else:
             direction = "LONG"
 
-        # Validate SL/TP actually make sense for the direction before logging
         valid_trade = False
         if direction == "LONG" and target_price > entry_price > stop_price:
             valid_trade = True
@@ -759,13 +768,11 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         monitor_active_trades(data.get('price', 0))
         save_state()
 
-        return jsonify({"status": "ok"})
-
     except Exception as e:
         error_msg = f"⚠️ SYSTEM ERROR: {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
-        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ============================================================
 # MORNING BRIEFING
 # ============================================================
@@ -1082,7 +1089,7 @@ def monitor_trades_endpoint():
         return jsonify({"status": "checked", "current_price": current_price})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-    
+
 # ============================================================
 # SMART ENTRY TIMER
 # ============================================================
@@ -1370,17 +1377,15 @@ def run_scored_backtest():
             if sig_type is None:
                 continue
             if sig_type == "BULLISH_SWEEP":
-                continue  # already known to be filtered live
+                continue
 
             is_bearish_type = "BEARISH" in sig_type
             score = 0
 
-            # Killzone alignment (London 7-9, NY 12-14)
             is_killzone = (7 <= hour < 9) or (12 <= hour < 14)
             if is_killzone:
                 score += 2
 
-            # Premium/Discount using a wider 50-candle range — closer to real weekly structure
             range_high = float(gold.iloc[i-50:i]['High'].max())
             range_low = float(gold.iloc[i-50:i]['Low'].min())
             midpoint = (range_high + range_low) / 2
@@ -1388,16 +1393,13 @@ def run_scored_backtest():
             if (is_bearish_type and is_premium) or (not is_bearish_type and not is_premium):
                 score += 2
 
-            # Key level proximity — near the 50-candle high/low
             near_high = abs(high - range_high) / range_high < 0.008
             near_low = abs(low - range_low) / range_low < 0.008
             if near_high or near_low:
                 score += 2
 
-            # Timeframe/structure placeholder — 1hr data only, partial credit
             score += 1
 
-            # Clean structure — real check: was recent momentum actually aligned with this signal's direction?
             recent_closes = gold.iloc[max(0, i-3):i]['Close'].values
             if len(recent_closes) >= 2:
                 momentum = recent_closes[-1] - recent_closes[0]
@@ -1405,9 +1407,8 @@ def run_scored_backtest():
                     score += 1
 
             if score < 5:
-                continue  # below minimum threshold, skip — mirrors live filtering
+                continue
 
-            # --- Simulate a more realistic SL/TP outcome ---
             entry = close
             atr_proxy = float(gold.iloc[i-14:i]['High'].max()) - float(gold.iloc[i-14:i]['Low'].min())
             atr_proxy = atr_proxy / 14 if atr_proxy > 0 else entry * 0.002
@@ -1440,7 +1441,7 @@ def run_scored_backtest():
                         break
 
             if outcome == "OPEN":
-                continue  # didn't resolve within window, skip for clean stats
+                continue
 
             signals.append({
                 "type": sig_type,
@@ -1488,7 +1489,7 @@ Simulated RR used: 1:3 (stop = 2.5x ATR proxy, widened from previous run)
 *By Confluence Band:*
 {band_summary}
 
-_Fixes applied this run: real momentum check for clean structure (was previously a no-op bug), wider 50-candle premium/discount window, wider simulated stop to reduce noise-triggered losses. Compare this against the previous run and live results._
+_Fixes applied this run: real momentum check for clean structure, wider 50-candle premium/discount window, wider simulated stop._
 """)
 
         return jsonify({
@@ -1502,7 +1503,7 @@ _Fixes applied this run: real momentum check for clean structure (was previously
         error_msg = f"⚠️ Scored backtest error: {str(e)}"
         send_telegram(error_msg)
         return jsonify({"status": "error", "message": str(e)}), 500
-    
+
 # ============================================================
 # BACKTESTING
 # ============================================================

@@ -710,14 +710,8 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         send_telegram(telegram_message)
         log_to_csv(alert_type, data.get('price'), confidence, analysis)
 
-# Read Claude's actual stated direction rather than guessing from alert type
-        direction = "LONG"
-        direction_match = re.search(r'TRADE DIRECTION\**\s*\n*\**\s*(LONG|SHORT)', analysis, re.IGNORECASE)
-        if direction_match:
-            direction = direction_match.group(1).upper()
-        elif "SHORT" in analysis.upper():
-            direction = "SHORT" 
-            entry_price = float(data.get('price', 0))
+        entry_price = float(data.get('price', 0))
+        direction = "SHORT" if "BEARISH" in alert_type else "LONG"
         stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
         target_price = entry_price * 0.99 if direction == "SHORT" else entry_price * 1.01
 
@@ -738,6 +732,14 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                 if 3000 < extracted < 5500:
                     target_price = extracted
                     break
+
+        # Derive direction from the actual SL/TP numbers — more reliable than text parsing
+        if target_price > stop_price:
+            direction = "LONG"
+        elif target_price < stop_price:
+            direction = "SHORT"
+        else:
+            direction = "LONG"
 
         # Validate SL/TP actually make sense for the direction before logging
         valid_trade = False
@@ -762,7 +764,6 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         print(error_msg)
         send_telegram(error_msg)
         return jsonify({"status": "error", "message": str(e)}), 500
-
 # ============================================================
 # MORNING BRIEFING
 # ============================================================

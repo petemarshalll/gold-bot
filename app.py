@@ -13,6 +13,7 @@ import re
 import zipfile
 import io
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -391,6 +392,36 @@ def get_cot_data():
         return get_cot_fallback()
 
 # ============================================================
+# CLAUDE API CALL WITH RETRY
+# Wraps every claude_client.messages.create() call with a couple of
+# short retries on transient failures (rate limits, momentary 5xx,
+# network blips). The bot runs unattended for days at a time, so a
+# single dropped API call shouldn't silently lose an alert's
+# analysis or a scheduled report.
+# ============================================================
+def call_claude(messages, max_tokens=400, thinking=None, retries=2, base_delay=2):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            kwargs = {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": max_tokens,
+                "messages": messages,
+            }
+            if thinking:
+                kwargs["thinking"] = thinking
+            return claude_client.messages.create(**kwargs)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                wait = base_delay * (2 ** attempt)
+                print(f"Claude API error (attempt {attempt + 1}/{retries + 1}): {e} — retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                print(f"Claude API error — all {retries + 1} attempts failed: {e}")
+    raise last_error
+
+# ============================================================
 # SEND TELEGRAM
 # ============================================================
 def send_telegram(message):
@@ -445,7 +476,7 @@ def log_to_csv(alert_type, price, confidence, analysis):
 # ============================================================
 # PAPER TRADE TRACKER
 # ============================================================
-def log_paper_trade(alert_type, price, direction, entry, stop, target, confidence, alert_time):
+def log_paper_trade(alert_type, price, direction, entry, stop, target, confidence, alert_time, context=None):
     trade_id = f"{alert_type}_{alert_time.replace(':', '').replace(' ', '_')}"
     trade = {
         "id": trade_id,
@@ -459,6 +490,12 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
         "confidence": confidence,
         "result": "OPEN"
     }
+    # Extra market context at the moment the trade was logged — session,
+    # killzone, premium/discount zone, DXY confluence, confluence score
+    # etc — so self-review can find patterns beyond just "alert type",
+    # e.g. "BEARISH_FVG wins 80% in a killzone but 35% outside one".
+    if context:
+        trade.update(context)
     paper_trades.append(trade)
     active_trades[trade_id] = trade
     try:
@@ -467,6 +504,53 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
     except Exception as e:
         print(f"Paper trade log error: {e}")
     return trade_id
+
+# ============================================================
+# CONFLUENCE SCORE EXTRACTION
+# ============================================================
+def extract_confluence_score(analysis):
+    """Pulls the numeric X/10 confluence score out of Claude's analysis
+    text so it can be logged alongside the trade, instead of being
+    thrown away after the Telegram message is sent."""
+    match = re.search(r'CONFLUENCE SCORE[^\d]{0,20}(\d{1,2})\s*/\s*10', analysis, re.IGNORECASE)
+    if match:
+        score = int(match.group(1))
+        if 0 <= score <= 10:
+            return score
+    return None
+
+# ============================================================
+# PRE-TRADE RISK EXPOSURE CHECK
+# Checks whether logging a new paper trade would push total open
+# risk across all currently-open trades past the prop firm's daily
+# loss limit, BEFORE logging it — rather than only catching it
+# reactively after trades close (which is what daily_pnl/
+# drawdown_protection already do via apply_trade_pnl).
+# ============================================================
+def get_open_risk_exposure():
+    account = PROP_FIRM_RULES["account_size"]
+    risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+    open_count = sum(1 for t in active_trades.values() if t.get('result') == 'OPEN')
+    return open_count * risk_per_trade, open_count
+
+def check_risk_cap_before_trade():
+    """Returns (allowed: bool, message: str). Disallows opening a new
+    paper trade if doing so — combined with the worst case of all
+    currently open trades hitting stop loss — would exceed the
+    account's daily loss limit."""
+    account = PROP_FIRM_RULES["account_size"]
+    risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+    daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
+    existing_risk, open_count = get_open_risk_exposure()
+    already_lost_today = abs(min(daily_pnl, 0))
+    projected_worst_case = already_lost_today + existing_risk + risk_per_trade
+    if projected_worst_case > daily_loss_limit:
+        return False, (f"⚠️ Trade NOT logged — opening it would risk a worst-case "
+                        f"${projected_worst_case:,.2f} today (across {open_count} open "
+                        f"trade(s) + today's losses already taken), beyond the "
+                        f"{PROP_FIRM_RULES['max_daily_loss_pct']}% daily limit "
+                        f"(${daily_loss_limit:,.2f}). Skipped to protect the account.")
+    return True, ""
 
 # ============================================================
 # MONITOR ACTIVE TRADES
@@ -675,14 +759,10 @@ Total response must be under 200 words. Every section one line maximum.
 """
 
     try:
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=16000,
-            thinking={
-                "type": "enabled",
-                "budget_tokens": 10000
-            },
-            messages=[{"role": "user", "content": prompt}]
+            thinking={"type": "enabled", "budget_tokens": 10000}
         )
         for block in message.content:
             if block.type == "text":
@@ -830,9 +910,28 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         elif direction == "SHORT" and target_price < entry_price < stop_price:
             valid_trade = True
 
+        confluence_score = extract_confluence_score(analysis)
+
         if confidence in ["HIGH", "MEDIUM"] and valid_trade:
-            alert_time = datetime.utcnow().strftime('%H:%M UTC')
-            log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time)
+            risk_ok, risk_msg = check_risk_cap_before_trade()
+            if risk_ok:
+                alert_time = datetime.utcnow().strftime('%H:%M UTC')
+                trade_context = {
+                    "session": session_name,
+                    "killzone": is_killzone,
+                    "zone": zone,
+                    "zone_pct": zone_pct,
+                    "dxy_direction": dxy_direction,
+                    "dxy_implication": dxy_implication,
+                    "news_risk": news_risk,
+                    "spread_risk": spread_risk,
+                    "hour_quality": hour_quality,
+                    "confluence_score": confluence_score,
+                }
+                log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time, context=trade_context)
+            else:
+                print(risk_msg)
+                send_telegram(risk_msg)
         elif confidence in ["HIGH", "MEDIUM"] and not valid_trade:
             print(f"Skipped logging paper trade — SL/TP inconsistent. Dir:{direction} Entry:{entry_price} SL:{stop_price} TP:{target_price}")
 
@@ -868,10 +967,9 @@ Cover in under 300 words:
 5. What to avoid
 6. One sentence summary
 """
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400
         )
         send_telegram(f"☀️ *XAUUSD Morning Briefing — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "briefing sent"})
@@ -904,10 +1002,9 @@ Cover in under 350 words:
 **AVOID** — what not to trade
 **SUMMARY** — one sentence
 """
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400
         )
         send_telegram(f"📊 *XAUUSD Weekly Bias — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "weekly bias sent"})
@@ -935,10 +1032,9 @@ Cover in under 250 words:
 **ASIAN SESSION** — likely direction before London
 **AVOID** — traps smart money sets at Monday open
 """
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400
         )
         send_telegram(f"🌅 *XAUUSD Monday Gap Analysis — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "monday gap sent"})
@@ -979,10 +1075,9 @@ Any extreme positioning that historically precedes reversals?
 
 Keep it concise and actionable. Maximum 200 words.
 """
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400
         )
         analysis = message.content[0].text
         telegram_message = f"""
@@ -1266,13 +1361,36 @@ def self_review():
         high_wins = len([t for t in high_conf if t.get('result') == 'WIN'])
         med_wins = len([t for t in med_conf if t.get('result') == 'WIN'])
 
+        # Killzone vs non-killzone breakdown — only meaningful for trades
+        # logged after the richer-logging update, older trades won't have
+        # a 'killzone' field and are simply excluded from this split.
+        kz_wins = len([t for t in paper if t.get('killzone') is True and t.get('result') == 'WIN'])
+        kz_losses = len([t for t in paper if t.get('killzone') is True and t.get('result') == 'LOSS'])
+        non_kz_wins = len([t for t in paper if t.get('killzone') is False and t.get('result') == 'WIN'])
+        non_kz_losses = len([t for t in paper if t.get('killzone') is False and t.get('result') == 'LOSS'])
+        kz_wr = round(kz_wins / (kz_wins + kz_losses) * 100, 1) if (kz_wins + kz_losses) > 0 else None
+        non_kz_wr = round(non_kz_wins / (non_kz_wins + non_kz_losses) * 100, 1) if (non_kz_wins + non_kz_losses) > 0 else None
+
         type_summary = "\n".join([
             f"- {k}: {v['wins']}W / {v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100) if v['wins']+v['losses'] > 0 else 0}% win rate)"
             for k, v in type_performance.items()
         ])
 
+        killzone_summary = (
+            f"- Inside killzone: {kz_wins}W/{kz_losses}L ({kz_wr}% win rate)\n"
+            f"- Outside killzone: {non_kz_wins}W/{non_kz_losses}L ({non_kz_wr}% win rate)"
+            if kz_wr is not None or non_kz_wr is not None
+            else "No killzone data yet (only trades logged since the richer-logging update have this)"
+        )
+
+        # Per-trade detail now includes confluence score, killzone status,
+        # DXY implication and premium/discount zone — this is what lets
+        # Claude actually spot cross-factor patterns instead of only
+        # alert-type win rates.
         trades_summary = "\n".join([
-            f"- {t['time']}: {t['type']} | Conf: {t['confidence']} | Result: {t['result']}"
+            f"- {t['time']}: {t['type']} | Conf:{t['confidence']} | Score:{t.get('confluence_score', '-')}/10 | "
+            f"KZ:{t.get('killzone', '-')} | DXY:{t.get('dxy_implication', '-')} | Zone:{t.get('zone', '-')} | "
+            f"Result:{t['result']}"
             for t in paper[-20:]
         ])
 
@@ -1288,13 +1406,16 @@ MEDIUM Confidence: {len(med_conf)} total | {med_wins} wins
 Performance by type:
 {type_summary if type_summary else "No completed trades yet"}
 
-Recent trades:
+Performance by killzone status:
+{killzone_summary}
+
+Recent trades (Score = Claude's confluence score out of 10, KZ = was it inside a killzone, DXY = DXY implication at entry, Zone = premium/discount zone):
 {trades_summary if trades_summary else "No trades logged yet"}
 
 Provide:
-**WHAT IS WORKING** — best performing setups
-**WHAT IS NOT WORKING** — consistently losing setups
-**KEY PATTERN** — single most important finding
+**WHAT IS WORKING** — best performing setups, and which session/killzone/DXY/zone conditions correlate with wins
+**WHAT IS NOT WORKING** — consistently losing setups, and which conditions correlate with losses
+**KEY PATTERN** — single most important finding, ideally one that combines alert type with session/killzone/DXY/confluence score
 **RECOMMENDED RULE CHANGES** — specific improvements
 **UPDATED TRADING RULES** — 3-5 rules for next week
 **NEXT WEEK FOCUS** — one priority
@@ -1302,10 +1423,9 @@ Provide:
 Be direct and data driven.
 """
 
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400
         )
         review = message.content[0].text
 
@@ -1502,10 +1622,9 @@ Worst hours: {worst_hours_str}
 Provide: OVERALL ASSESSMENT, STRONGEST SETUP, WEAKEST SETUP, BEST SESSION, SESSION TO AVOID, OPTIMAL HOURS, RECOMMENDED FILTERS, EXPECTED PERFORMANCE.
 Be direct and data driven.
 """
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
+        message = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500
         )
         analysis = message.content[0].text
         send_telegram(f"""
@@ -1645,6 +1764,39 @@ def dashboard():
 </html>"""
 
 # ============================================================
+# DAILY HEARTBEAT
+# Sent once a day so silence in Telegram is never ambiguous between
+# "market's quiet" and "the bot is down". This is a plain function
+# (not a Flask route) so the scheduler can call it directly without
+# the app-context issue that affected the other scheduled jobs.
+# ============================================================
+def send_heartbeat():
+    try:
+        open_trades = sum(1 for t in active_trades.values() if t.get('result') == 'OPEN')
+        msg = f"""
+💓 *Daily Heartbeat — system running normally*
+{datetime.now(timezone.utc).strftime('%d %b %Y — %H:%M UTC')}
+
+Alerts today: {len(recent_alerts)}
+Active trades: {open_trades}
+Balance: ${current_balance:,.2f}
+Total P&L: ${total_pnl:,.2f}
+Trading days: {trading_days}/{PROP_FIRM_RULES['min_trading_days']}
+Drawdown protection: {'ACTIVE ⚠️' if drawdown_protection else 'OFF ✅'}
+"""
+        send_telegram(msg)
+    except Exception as e:
+        print(f"Heartbeat error: {e}")
+
+@app.route('/heartbeat', methods=['GET'])
+def heartbeat_endpoint():
+    try:
+        send_heartbeat()
+        return jsonify({"status": "heartbeat sent"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 @app.route('/health', methods=['GET'])
@@ -1724,6 +1876,7 @@ if __name__ == '__main__':
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=run_in_context(morning_briefing), trigger='cron', hour=7, minute=0)
+    scheduler.add_job(func=send_heartbeat, trigger='cron', hour=8, minute=0, id='heartbeat')
     scheduler.add_job(func=run_in_context(weekly_bias_report), trigger='cron', day_of_week='sun', hour=20, minute=0)
     scheduler.add_job(func=run_in_context(monday_gap_analysis), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=run_in_context(auto_update_levels), trigger='cron', day_of_week='sun', hour=21, minute=0)

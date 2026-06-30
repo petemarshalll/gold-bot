@@ -112,17 +112,17 @@ def load_state():
         print(f"State load error: {e}")
 
 # ============================================================
-# MARKET HOURS CHECK — gold closed weekends
+# MARKET HOURS CHECK
 # ============================================================
 def is_market_open():
     now = datetime.now(timezone.utc)
     hour = now.hour
-    weekday = now.weekday()  # Monday=0 ... Sunday=6
-    if weekday == 5:  # Saturday — fully closed
+    weekday = now.weekday()
+    if weekday == 5:
         return False
-    if weekday == 6 and hour < 21:  # Sunday before 9pm UTC — closed
+    if weekday == 6 and hour < 21:
         return False
-    if weekday == 4 and hour >= 21:  # Friday after 9pm UTC — closed
+    if weekday == 4 and hour >= 21:
         return False
     return True
 
@@ -1073,7 +1073,7 @@ def update_levels():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
-# CONTINUOUS TRADE MONITOR — checks SL/TP independent of alerts
+# CONTINUOUS TRADE MONITOR
 # ============================================================
 @app.route('/monitor-trades', methods=['GET'])
 def monitor_trades_endpoint():
@@ -1331,180 +1331,6 @@ def view_rules():
         return f"Error: {str(e)}", 500
 
 # ============================================================
-# SCORED BACKTEST — applies live confluence scoring to history
-# ============================================================
-@app.route('/scored-backtest', methods=['GET'])
-def run_scored_backtest():
-    try:
-        send_telegram("🔍 *Scored Backtest started — applying corrected confluence logic to 2 years of XAUUSD data...*\nThis will take 1-2 minutes.")
-
-        gold = yf.download('GC=F', period='2y', interval='1h', progress=False)
-        if gold.empty:
-            return jsonify({"status": "error", "message": "no data"})
-        gold.columns = [col[0] for col in gold.columns]
-        gold = gold.dropna()
-        total_candles = len(gold)
-
-        send_telegram(f"📊 Data loaded — {total_candles} candles. Scoring each signal...")
-
-        signals = []
-
-        for i in range(55, len(gold) - 15):
-            candle = gold.iloc[i]
-            prev2 = gold.iloc[i-2]
-            high = float(candle['High'])
-            low = float(candle['Low'])
-            close = float(candle['Close'])
-            candle_time = gold.index[i]
-            hour = candle_time.hour
-
-            sig_type = None
-            if float(prev2['Low']) > high:
-                sig_type = "BEARISH_FVG"
-            elif float(prev2['High']) < low:
-                sig_type = "BULLISH_FVG"
-
-            lookback_high = float(gold.iloc[i-10:i]['High'].max())
-            lookback_low = float(gold.iloc[i-10:i]['Low'].min())
-            is_bearish_sweep = high > lookback_high and close < lookback_high
-            is_bullish_sweep = low < lookback_low and close > lookback_low
-
-            if is_bearish_sweep and sig_type is None:
-                sig_type = "BEARISH_SWEEP"
-            if is_bullish_sweep and sig_type is None:
-                sig_type = "BULLISH_SWEEP"
-
-            if sig_type is None:
-                continue
-            if sig_type == "BULLISH_SWEEP":
-                continue
-
-            is_bearish_type = "BEARISH" in sig_type
-            score = 0
-
-            is_killzone = (7 <= hour < 9) or (12 <= hour < 14)
-            if is_killzone:
-                score += 2
-
-            range_high = float(gold.iloc[i-50:i]['High'].max())
-            range_low = float(gold.iloc[i-50:i]['Low'].min())
-            midpoint = (range_high + range_low) / 2
-            is_premium = close > midpoint
-            if (is_bearish_type and is_premium) or (not is_bearish_type and not is_premium):
-                score += 2
-
-            near_high = abs(high - range_high) / range_high < 0.008
-            near_low = abs(low - range_low) / range_low < 0.008
-            if near_high or near_low:
-                score += 2
-
-            score += 1
-
-            recent_closes = gold.iloc[max(0, i-3):i]['Close'].values
-            if len(recent_closes) >= 2:
-                momentum = recent_closes[-1] - recent_closes[0]
-                if (is_bearish_type and momentum < 0) or (not is_bearish_type and momentum > 0):
-                    score += 1
-
-            if score < 5:
-                continue
-
-            entry = close
-            atr_proxy = float(gold.iloc[i-14:i]['High'].max()) - float(gold.iloc[i-14:i]['Low'].min())
-            atr_proxy = atr_proxy / 14 if atr_proxy > 0 else entry * 0.002
-
-            if is_bearish_type:
-                stop = entry + (atr_proxy * 2.5)
-                target = entry - (atr_proxy * 2.5 * 3)
-            else:
-                stop = entry - (atr_proxy * 2.5)
-                target = entry + (atr_proxy * 2.5 * 3)
-
-            future = gold.iloc[i+1:i+15]
-            outcome = "OPEN"
-            for _, fcandle in future.iterrows():
-                fhigh = float(fcandle['High'])
-                flow = float(fcandle['Low'])
-                if is_bearish_type:
-                    if fhigh >= stop:
-                        outcome = "LOSS"
-                        break
-                    if flow <= target:
-                        outcome = "WIN"
-                        break
-                else:
-                    if flow <= stop:
-                        outcome = "LOSS"
-                        break
-                    if fhigh >= target:
-                        outcome = "WIN"
-                        break
-
-            if outcome == "OPEN":
-                continue
-
-            signals.append({
-                "type": sig_type,
-                "score": score,
-                "hour": hour,
-                "outcome": outcome
-            })
-
-        total_signals = len(signals)
-        if total_signals == 0:
-            send_telegram("⚠️ No scored signals found at threshold")
-            return jsonify({"status": "no signals"})
-
-        send_telegram(f"✅ {total_signals} signals scored 5+/10. Compiling results...")
-
-        def band_stats(min_score, max_score):
-            band = [s for s in signals if min_score <= s['score'] <= max_score]
-            wins = len([s for s in band if s['outcome'] == 'WIN'])
-            total = len(band)
-            wr = round(wins / total * 100, 1) if total > 0 else 0
-            return total, wins, wr
-
-        bands = {
-            "5/10": band_stats(5, 5),
-            "6/10": band_stats(6, 6),
-            "7-8/10": band_stats(7, 8),
-        }
-
-        overall_wins = len([s for s in signals if s['outcome'] == 'WIN'])
-        overall_wr = round(overall_wins / total_signals * 100, 1)
-
-        band_summary = "\n".join([
-            f"- {label}: {total} signals, {wins}W, {wr}% win rate"
-            for label, (total, wins, wr) in bands.items() if total > 0
-        ])
-
-        send_telegram(f"""
-📈 *Scored Backtest Results — 2 Years (corrected)*
-_{datetime.utcnow().strftime('%d %b %Y')}_
-
-Total scored signals (5+/10, resolved): {total_signals}
-Overall win rate: {overall_wr}%
-Simulated RR used: 1:3 (stop = 2.5x ATR proxy, widened from previous run)
-
-*By Confluence Band:*
-{band_summary}
-
-_Fixes applied this run: real momentum check for clean structure, wider 50-candle premium/discount window, wider simulated stop._
-""")
-
-        return jsonify({
-            "status": "scored backtest complete",
-            "total_signals": total_signals,
-            "overall_win_rate": overall_wr,
-            "bands": {k: {"total": v[0], "wins": v[1], "win_rate": v[2]} for k, v in bands.items()}
-        })
-
-    except Exception as e:
-        error_msg = f"⚠️ Scored backtest error: {str(e)}"
-        send_telegram(error_msg)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# ============================================================
 # BACKTESTING
 # ============================================================
 @app.route('/backtest', methods=['GET'])
@@ -1560,10 +1386,8 @@ def run_backtest():
             return jsonify({"status": "no signals"})
 
         send_telegram(f"✅ {total_signals} signals detected. Compiling statistics...")
-
         wins = len([s for s in signals if s['outcome'] == 'WIN'])
         overall_wr = round(wins / total_signals * 100, 1)
-
         type_stats = {}
         for s in signals:
             t = s['type']
@@ -1572,9 +1396,7 @@ def run_backtest():
             type_stats[t]['total'] += 1
             if s['outcome'] == 'WIN':
                 type_stats[t]['wins'] += 1
-
         type_summary = "\n".join([f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100)}% win rate)" for k, v in type_stats.items()])
-
         session_stats = {"Asian (22-07)": {"wins": 0, "total": 0}, "London (07-12)": {"wins": 0, "total": 0}, "NY (12-17)": {"wins": 0, "total": 0}, "Other (17-22)": {"wins": 0, "total": 0}}
         for s in signals:
             hour = s['hour']
@@ -1582,9 +1404,7 @@ def run_backtest():
             session_stats[session]['total'] += 1
             if s['outcome'] == 'WIN':
                 session_stats[session]['wins'] += 1
-
         session_summary = "\n".join([f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100) if v['total'] > 0 else 0}% win rate)" for k, v in session_stats.items()])
-
         hour_stats = {}
         for s in signals:
             h = s['hour']
@@ -1593,27 +1413,18 @@ def run_backtest():
             hour_stats[h]['total'] += 1
             if s['outcome'] == 'WIN':
                 hour_stats[h]['wins'] += 1
-
         hour_wr = {h: round(v['wins']/v['total']*100) for h, v in hour_stats.items() if v['total'] >= 5}
         best_hours = sorted(hour_wr.items(), key=lambda x: x[1], reverse=True)[:3]
         worst_hours = sorted(hour_wr.items(), key=lambda x: x[1])[:3]
         best_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in best_hours])
         worst_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in worst_hours])
-
         prompt = f"""
 You are analysing 2 years of XAUUSD backtesting data.
-
 Total candles: {total_candles} | Total signals: {total_signals} | Overall win rate: {overall_wr}%
-
-By signal type:
-{type_summary}
-
-By session:
-{session_summary}
-
+By signal type: {type_summary}
+By session: {session_summary}
 Best hours: {best_hours_str}
 Worst hours: {worst_hours_str}
-
 Provide: OVERALL ASSESSMENT, STRONGEST SETUP, WEAKEST SETUP, BEST SESSION, SESSION TO AVOID, OPTIMAL HOURS, RECOMMENDED FILTERS, EXPECTED PERFORMANCE.
 Be direct and data driven.
 """
@@ -1623,7 +1434,6 @@ Be direct and data driven.
             messages=[{"role": "user", "content": prompt}]
         )
         analysis = message.content[0].text
-
         send_telegram(f"""
 📈 *XAUUSD Backtest Report — 2 Years*
 _{datetime.utcnow().strftime('%d %b %Y')}_
@@ -1642,9 +1452,7 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 
 {analysis}
 """)
-
         return jsonify({"status": "backtest complete", "total_signals": total_signals, "overall_win_rate": overall_wr})
-
     except Exception as e:
         error_msg = f"⚠️ Backtest error: {str(e)}"
         send_telegram(error_msg)
@@ -1661,7 +1469,6 @@ def dashboard():
     news_risk, news_msg = check_news_risk()
     zone_color = "#ff4444" if zone == "PREMIUM" else "#44ff88"
     dxy_color = "#ff4444" if dxy_direction == "BULLISH" else "#44ff88" if dxy_direction == "BEARISH" else "#ffaa00"
-
     alerts_html = ""
     for a in reversed(recent_alerts[-10:]):
         alert_type = a.get('type', '')
@@ -1669,7 +1476,6 @@ def dashboard():
         alerts_html += f'<div class="alert-row"><span style="color:{color}">●</span><span class="alert-time">{a.get("time", "")}</span><span class="alert-type">{alert_type}</span><span class="alert-tf">{a.get("timeframe", "")} | {a.get("price", "")}</span></div>'
     if not alerts_html:
         alerts_html = "<div class='no-data'>No alerts this session yet</div>"
-
     trades_html = ""
     for trade_id, trade in active_trades.items():
         direction = trade.get('direction', '')
@@ -1677,15 +1483,12 @@ def dashboard():
         trades_html += f'<div class="trade-row"><span style="color:{color}">{"▲" if direction == "LONG" else "▼"} {direction}</span><span>Entry: {trade.get("entry", 0):.2f}</span><span>SL: {trade.get("stop", 0):.2f}</span><span>TP: {trade.get("target", 0):.2f}</span><span class="trade-open">OPEN</span></div>'
     if not trades_html:
         trades_html = "<div class='no-data'>No active paper trades</div>"
-
     levels_html = "".join([f'<div class="level-row"><span class="level-label">{k.replace("_", " ").title()}</span><span class="level-value">{v}</span></div>' for k, v in KEY_LEVELS.items()])
-
     account = PROP_FIRM_RULES["account_size"]
     daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
     total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
     daily_status_color = "#ff4444" if daily_used_pct >= 80 else "#ffaa00" if daily_used_pct >= 50 else "#44ff88"
     total_status_color = "#ff4444" if total_used_pct >= 80 else "#ffaa00" if total_used_pct >= 50 else "#44ff88"
-
     return f"""<!DOCTYPE html>
 <html>
 <head>

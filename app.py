@@ -1327,7 +1327,7 @@ def view_rules():
 @app.route('/scored-backtest', methods=['GET'])
 def run_scored_backtest():
     try:
-        send_telegram("🔍 *Scored Backtest started — applying live confluence logic to 2 years of XAUUSD data...*\nThis will take 1-2 minutes.")
+        send_telegram("🔍 *Scored Backtest started — applying corrected confluence logic to 2 years of XAUUSD data...*\nThis will take 1-2 minutes.")
 
         gold = yf.download('GC=F', period='2y', interval='1h', progress=False)
         if gold.empty:
@@ -1340,7 +1340,7 @@ def run_scored_backtest():
 
         signals = []
 
-        for i in range(25, len(gold) - 15):
+        for i in range(55, len(gold) - 15):
             candle = gold.iloc[i]
             prev2 = gold.iloc[i-2]
             high = float(candle['High'])
@@ -1370,7 +1370,7 @@ def run_scored_backtest():
             if sig_type == "BULLISH_SWEEP":
                 continue  # already known to be filtered live
 
-            # --- Score this signal the same way live alerts are scored ---
+            is_bearish_type = "BEARISH" in sig_type
             score = 0
 
             # Killzone alignment (London 7-9, NY 12-14)
@@ -1378,46 +1378,44 @@ def run_scored_backtest():
             if is_killzone:
                 score += 2
 
-            # Premium/Discount using a rolling 20-candle range
-            range_high = float(gold.iloc[i-20:i]['High'].max())
-            range_low = float(gold.iloc[i-20:i]['Low'].min())
+            # Premium/Discount using a wider 50-candle range — closer to real weekly structure
+            range_high = float(gold.iloc[i-50:i]['High'].max())
+            range_low = float(gold.iloc[i-50:i]['Low'].min())
             midpoint = (range_high + range_low) / 2
             is_premium = close > midpoint
-            is_bearish_type = "BEARISH" in sig_type
             if (is_bearish_type and is_premium) or (not is_bearish_type and not is_premium):
                 score += 2
 
-            # Key level proximity — near rolling high/low
-            near_high = abs(high - range_high) / range_high < 0.005
-            near_low = abs(low - range_low) / range_low < 0.005
+            # Key level proximity — near the 50-candle high/low
+            near_high = abs(high - range_high) / range_high < 0.008
+            near_low = abs(low - range_low) / range_low < 0.008
             if near_high or near_low:
                 score += 2
 
-            # Timeframe/structure placeholder — 1hr data only, give partial credit
+            # Timeframe/structure placeholder — 1hr data only, partial credit
             score += 1
 
-            # Clean structure — no opposite signal in prior 3 candles
-            prior_window = gold.iloc[max(0, i-3):i]
-            clean = True
-            for j in range(len(prior_window) - 2):
-                p2 = prior_window.iloc[j]
-                p0 = prior_window.iloc[j+2] if j+2 < len(prior_window) else None
-            score += 1 if clean else 0
+            # Clean structure — real check: was recent momentum actually aligned with this signal's direction?
+            recent_closes = gold.iloc[max(0, i-3):i]['Close'].values
+            if len(recent_closes) >= 2:
+                momentum = recent_closes[-1] - recent_closes[0]
+                if (is_bearish_type and momentum < 0) or (not is_bearish_type and momentum > 0):
+                    score += 1
 
             if score < 5:
                 continue  # below minimum threshold, skip — mirrors live filtering
 
-            # --- Simulate a realistic SL/TP outcome (not just direction) ---
+            # --- Simulate a more realistic SL/TP outcome ---
             entry = close
             atr_proxy = float(gold.iloc[i-14:i]['High'].max()) - float(gold.iloc[i-14:i]['Low'].min())
             atr_proxy = atr_proxy / 14 if atr_proxy > 0 else entry * 0.002
 
             if is_bearish_type:
-                stop = entry + (atr_proxy * 1.5)
-                target = entry - (atr_proxy * 1.5 * 3)
+                stop = entry + (atr_proxy * 2.5)
+                target = entry - (atr_proxy * 2.5 * 3)
             else:
-                stop = entry - (atr_proxy * 1.5)
-                target = entry + (atr_proxy * 1.5 * 3)
+                stop = entry - (atr_proxy * 2.5)
+                target = entry + (atr_proxy * 2.5 * 3)
 
             future = gold.iloc[i+1:i+15]
             outcome = "OPEN"
@@ -1478,17 +1476,17 @@ def run_scored_backtest():
         ])
 
         send_telegram(f"""
-📈 *Scored Backtest Results — 2 Years*
+📈 *Scored Backtest Results — 2 Years (corrected)*
 _{datetime.utcnow().strftime('%d %b %Y')}_
 
 Total scored signals (5+/10, resolved): {total_signals}
 Overall win rate: {overall_wr}%
-Simulated RR used: 1:3 (stop = 1.5x ATR proxy)
+Simulated RR used: 1:3 (stop = 2.5x ATR proxy, widened from previous run)
 
 *By Confluence Band:*
 {band_summary}
 
-_This applies the same scoring logic as live alerts to 2 years of history, with simulated SL/TP outcomes rather than simple direction. Use alongside live results — if they broadly agree, that's strong evidence the edge is real._
+_Fixes applied this run: real momentum check for clean structure (was previously a no-op bug), wider 50-candle premium/discount window, wider simulated stop to reduce noise-triggered losses. Compare this against the previous run and live results._
 """)
 
         return jsonify({
@@ -1502,7 +1500,7 @@ _This applies the same scoring logic as live alerts to 2 years of history, with 
         error_msg = f"⚠️ Scored backtest error: {str(e)}"
         send_telegram(error_msg)
         return jsonify({"status": "error", "message": str(e)}), 500
-
+    
 # ============================================================
 # BACKTESTING
 # ============================================================

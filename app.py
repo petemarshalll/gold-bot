@@ -76,6 +76,7 @@ def save_state():
         state = {
             "key_levels": KEY_LEVELS,
             "paper_trades": paper_trades,
+            "active_trades": active_trades,
             "daily_pnl": daily_pnl,
             "total_pnl": total_pnl,
             "current_balance": current_balance,
@@ -90,13 +91,14 @@ def save_state():
 
 
 def load_state():
-    global KEY_LEVELS, paper_trades, daily_pnl, total_pnl
+    global KEY_LEVELS, paper_trades, active_trades, daily_pnl, total_pnl
     global current_balance, trading_days, consecutive_losses
     try:
         with open('bot_state.json', 'r') as f:
             state = json.load(f)
         KEY_LEVELS.update(state.get('key_levels', {}))
         paper_trades = state.get('paper_trades', [])
+        active_trades = state.get('active_trades', {})
         daily_pnl = state.get('daily_pnl', 0)
         total_pnl = state.get('total_pnl', 0)
         current_balance = state.get('current_balance', 10000)

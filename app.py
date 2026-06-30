@@ -520,6 +520,22 @@ def extract_confluence_score(analysis):
     return None
 
 # ============================================================
+# CONFIDENCE EXTRACTION
+# Reads the actual word (HIGH/MEDIUM/LOW) directly under the
+# "CONFIDENCE LEVEL" header, instead of checking whether "HIGH" or
+# "LOW" appear ANYWHERE in the whole analysis text. The old approach
+# misfired constantly in SMC trading text specifically, since "high"
+# and "low" are core price-structure vocabulary (Daily High, candle
+# high, liquidity low) that show up regardless of the actual stated
+# confidence.
+# ============================================================
+def extract_confidence(analysis):
+    match = re.search(r'CONFIDENCE LEVEL\**\s*\n+\s*\**\s*(HIGH|MEDIUM|LOW)\b', analysis, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return "MEDIUM"  # safe default if the header format ever changes
+
+# ============================================================
 # PRE-TRADE RISK EXPOSURE CHECK
 # Checks whether logging a new paper trade would push total open
 # risk across all currently-open trades past the prop firm's daily
@@ -834,11 +850,7 @@ def process_webhook_alert(data):
             dxy_direction, dxy_desc
         )
 
-        confidence = "MEDIUM"
-        if "HIGH" in analysis.upper() and "CONFIDENCE" in analysis.upper():
-            confidence = "HIGH"
-        elif "LOW" in analysis.upper() and "CONFIDENCE" in analysis.upper():
-            confidence = "LOW"
+        confidence = extract_confidence(analysis)
 
         if "FVG" in alert_type and confidence == "LOW":
             confidence = "MEDIUM"

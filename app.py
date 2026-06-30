@@ -109,6 +109,21 @@ def load_state():
         print(f"State load error: {e}")
 
 # ============================================================
+# MARKET HOURS CHECK — gold closed weekends
+# ============================================================
+def is_market_open():
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    weekday = now.weekday()  # Monday=0 ... Sunday=6
+    if weekday == 5:  # Saturday — fully closed
+        return False
+    if weekday == 6 and hour < 21:  # Sunday before 9pm UTC — closed
+        return False
+    if weekday == 4 and hour >= 21:  # Friday after 9pm UTC — closed
+        return False
+    return True
+
+# ============================================================
 # SESSION DETECTION
 # ============================================================
 def get_session():
@@ -695,8 +710,14 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         send_telegram(telegram_message)
         log_to_csv(alert_type, data.get('price'), confidence, analysis)
 
-        direction = "SHORT" if "SHORT" in analysis.upper() or "BEARISH" in alert_type else "LONG"
-        entry_price = float(data.get('price', 0))
+# Read Claude's actual stated direction rather than guessing from alert type
+        direction = "LONG"
+        direction_match = re.search(r'TRADE DIRECTION\**\s*\n*\**\s*(LONG|SHORT)', analysis, re.IGNORECASE)
+        if direction_match:
+            direction = direction_match.group(1).upper()
+        elif "SHORT" in analysis.upper():
+            direction = "SHORT" 
+            entry_price = float(data.get('price', 0))
         stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
         target_price = entry_price * 0.99 if direction == "SHORT" else entry_price * 1.01
 
@@ -718,9 +739,18 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     target_price = extracted
                     break
 
-        if confidence in ["HIGH", "MEDIUM"]:
+        # Validate SL/TP actually make sense for the direction before logging
+        valid_trade = False
+        if direction == "LONG" and target_price > entry_price > stop_price:
+            valid_trade = True
+        elif direction == "SHORT" and target_price < entry_price < stop_price:
+            valid_trade = True
+
+        if confidence in ["HIGH", "MEDIUM"] and valid_trade:
             alert_time = datetime.utcnow().strftime('%H:%M UTC')
             log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time)
+        elif confidence in ["HIGH", "MEDIUM"] and not valid_trade:
+            print(f"Skipped logging paper trade — SL/TP inconsistent. Dir:{direction} Entry:{entry_price} SL:{stop_price} TP:{target_price}")
 
         monitor_active_trades(data.get('price', 0))
         save_state()
@@ -1033,11 +1063,31 @@ def update_levels():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# CONTINUOUS TRADE MONITOR — checks SL/TP independent of alerts
+# ============================================================
+@app.route('/monitor-trades', methods=['GET'])
+def monitor_trades_endpoint():
+    try:
+        if not active_trades:
+            return jsonify({"status": "no active trades"})
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        if gold.empty:
+            return jsonify({"status": "no price data"})
+        gold.columns = [col[0] for col in gold.columns]
+        current_price = round(float(gold['Close'].iloc[-1]), 2)
+        monitor_active_trades(current_price)
+        return jsonify({"status": "checked", "current_price": current_price})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+# ============================================================
 # SMART ENTRY TIMER
 # ============================================================
 @app.route('/check-entries', methods=['GET'])
 def check_entries():
     try:
+        if not is_market_open():
+            return jsonify({"status": "market closed — entry monitor paused"})
         if not active_trades:
             return jsonify({"status": "no active trades to monitor"})
         gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
@@ -1046,6 +1096,7 @@ def check_entries():
         gold.columns = [col[0] for col in gold.columns]
         current_price = round(float(gold['Close'].iloc[-1]), 2)
         alerts_sent = 0
+        notified_trades = []
         for trade_id, trade in active_trades.items():
             if trade.get('result') != 'OPEN':
                 continue
@@ -1053,10 +1104,11 @@ def check_entries():
             stop = trade.get('stop', 0)
             target = trade.get('target', 0)
             direction = trade.get('direction', '')
-            entry_zone_high = entry * 1.003
-            entry_zone_low = entry * 0.997
+            entry_zone_high = entry * 1.001
+            entry_zone_low = entry * 0.999
             in_entry_zone = entry_zone_low <= current_price <= entry_zone_high
-            if in_entry_zone:
+            already_notified = trade.get('entry_notified', False)
+            if in_entry_zone and not already_notified:
                 risk = abs(entry - stop)
                 reward = abs(target - entry)
                 rr = round(reward / risk, 1) if risk > 0 else 0
@@ -1077,6 +1129,8 @@ R:R = 1:{rr}
 _Act now or wait for next candle close confirmation_
 """)
                 alerts_sent += 1
+                trade['entry_notified'] = True
+                notified_trades.append(trade_id)
         return jsonify({"status": "checked", "current_price": current_price, "active_trades": len(active_trades), "entry_alerts_sent": alerts_sent})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -1593,6 +1647,7 @@ if __name__ == '__main__':
     scheduler.add_job(func=lambda: auto_update_levels(), trigger='cron', day_of_week='sun', hour=21, minute=0)
     scheduler.add_job(func=lambda: self_review(), trigger='cron', day_of_week='sun', hour=19, minute=0)
     scheduler.add_job(func=lambda: check_entries(), trigger='interval', minutes=5, id='entry_monitor')
+    scheduler.add_job(func=lambda: monitor_trades_endpoint(), trigger='interval', minutes=2, id='trade_monitor')
     scheduler.add_job(func=lambda: cot_report(), trigger='cron', day_of_week='fri', hour=16, minute=0, id='cot_report')
     scheduler.add_job(func=lambda: update_intraday(), trigger='interval', minutes=30, id='intraday_updater')
     scheduler.add_job(func=lambda: save_state(), trigger='interval', minutes=10, id='state_saver')

@@ -1701,16 +1701,37 @@ def test():
 # ============================================================
 if __name__ == '__main__':
     load_state()
+
+    def run_in_context(func):
+        """
+        APScheduler calls these functions directly as plain Python
+        functions, not as real HTTP requests. Several of them are
+        Flask routes that call jsonify(), which requires an active
+        Flask application context — without it they crash with
+        'RuntimeError: Working outside of application context.'
+        This wrapper pushes that context manually before each
+        scheduled run, and catches/logs any other exception so one
+        bad run can't silently kill future runs of the same job.
+        """
+        def wrapper():
+            try:
+                with app.app_context():
+                    func()
+            except Exception as e:
+                print(f"Scheduled job error in {func.__name__}: {e}")
+        wrapper.__name__ = f"wrapped_{func.__name__}"
+        return wrapper
+
     scheduler = BackgroundScheduler()
-    scheduler.add_job(func=lambda: morning_briefing(), trigger='cron', hour=7, minute=0)
-    scheduler.add_job(func=lambda: weekly_bias_report(), trigger='cron', day_of_week='sun', hour=20, minute=0)
-    scheduler.add_job(func=lambda: monday_gap_analysis(), trigger='cron', day_of_week='mon', hour=6, minute=55)
-    scheduler.add_job(func=lambda: auto_update_levels(), trigger='cron', day_of_week='sun', hour=21, minute=0)
-    scheduler.add_job(func=lambda: self_review(), trigger='cron', day_of_week='sun', hour=19, minute=0)
-    scheduler.add_job(func=lambda: check_entries(), trigger='interval', minutes=5, id='entry_monitor')
-    scheduler.add_job(func=lambda: monitor_trades_endpoint(), trigger='interval', minutes=2, id='trade_monitor')
-    scheduler.add_job(func=lambda: cot_report(), trigger='cron', day_of_week='fri', hour=16, minute=0, id='cot_report')
-    scheduler.add_job(func=lambda: update_intraday(), trigger='interval', minutes=30, id='intraday_updater')
+    scheduler.add_job(func=run_in_context(morning_briefing), trigger='cron', hour=7, minute=0)
+    scheduler.add_job(func=run_in_context(weekly_bias_report), trigger='cron', day_of_week='sun', hour=20, minute=0)
+    scheduler.add_job(func=run_in_context(monday_gap_analysis), trigger='cron', day_of_week='mon', hour=6, minute=55)
+    scheduler.add_job(func=run_in_context(auto_update_levels), trigger='cron', day_of_week='sun', hour=21, minute=0)
+    scheduler.add_job(func=run_in_context(self_review), trigger='cron', day_of_week='sun', hour=19, minute=0)
+    scheduler.add_job(func=run_in_context(check_entries), trigger='interval', minutes=5, id='entry_monitor')
+    scheduler.add_job(func=run_in_context(monitor_trades_endpoint), trigger='interval', minutes=2, id='trade_monitor')
+    scheduler.add_job(func=run_in_context(cot_report), trigger='cron', day_of_week='fri', hour=16, minute=0, id='cot_report')
+    scheduler.add_job(func=run_in_context(update_intraday), trigger='interval', minutes=30, id='intraday_updater')
     scheduler.add_job(func=lambda: save_state(), trigger='interval', minutes=10, id='state_saver')
     scheduler.start()
     atexit.register(lambda: scheduler.shutdown())

@@ -29,6 +29,19 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ============================================================
+# PERSISTENT DATA DIRECTORY
+# Set DATA_DIR env var on Railway to the mount path of an attached
+# Volume (e.g. /data) so state survives container restarts/redeploys.
+# Falls back to the working directory if not set (NOT safe across
+# restarts on Railway's default ephemeral filesystem).
+# ============================================================
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def data_path(filename):
+    return os.path.join(DATA_DIR, filename)
+
+# ============================================================
 # MEMORY
 # ============================================================
 recent_alerts = []
@@ -37,6 +50,7 @@ active_trades = {}
 daily_losses = 0
 consecutive_losses = 0
 drawdown_protection = False
+last_trading_day = None
 scheduler = None
 
 # ============================================================
@@ -83,8 +97,9 @@ def save_state():
             "current_balance": current_balance,
             "trading_days": trading_days,
             "consecutive_losses": consecutive_losses,
+            "last_trading_day": last_trading_day,
         }
-        with open('bot_state.json', 'w') as f:
+        with open(data_path('bot_state.json'), 'w') as f:
             json.dump(state, f, indent=2)
         print("State saved successfully")
     except Exception as e:
@@ -93,9 +108,9 @@ def save_state():
 
 def load_state():
     global KEY_LEVELS, paper_trades, active_trades, daily_pnl, total_pnl
-    global current_balance, trading_days, consecutive_losses
+    global current_balance, trading_days, consecutive_losses, last_trading_day
     try:
-        with open('bot_state.json', 'r') as f:
+        with open(data_path('bot_state.json'), 'r') as f:
             state = json.load(f)
         KEY_LEVELS.update(state.get('key_levels', {}))
         paper_trades = state.get('paper_trades', [])
@@ -105,6 +120,7 @@ def load_state():
         current_balance = state.get('current_balance', 10000)
         trading_days = state.get('trading_days', 0)
         consecutive_losses = state.get('consecutive_losses', 0)
+        last_trading_day = state.get('last_trading_day', None)
         print(f"State loaded — {len(paper_trades)} trades, balance ${current_balance}")
     except FileNotFoundError:
         print("No saved state found — starting fresh")
@@ -270,7 +286,7 @@ def check_drawdown_protection():
 # ============================================================
 def get_dxy_bias():
     try:
-        dxy = yf.download('DX-Y.NYB', period='5d', interval='1h', progress=False)
+        dxy = yf.download('DX-Y.NYB', period='5d', interval='1h', progress=False, timeout=10)
         if dxy.empty:
             return "UNKNOWN", "DXY data unavailable", "NEUTRAL"
         if isinstance(dxy.columns, pd.MultiIndex):
@@ -404,11 +420,11 @@ def send_telegram(message):
             "parse_mode": "Markdown"
         }
         try:
-            response = requests.post(url, json=payload)
+            response = requests.post(url, json=payload, timeout=10)
             print(f"Telegram sent: {response.status_code}")
             if response.status_code == 400:
                 payload["parse_mode"] = "None"
-                requests.post(url, json=payload)
+                requests.post(url, json=payload, timeout=10)
         except Exception as e:
             print(f"Telegram error: {e}")
 
@@ -417,7 +433,7 @@ def send_telegram(message):
 # ============================================================
 def log_to_csv(alert_type, price, confidence, analysis):
     try:
-        with open('trade_log.csv', 'a', newline='') as f:
+        with open(data_path('trade_log.csv'), 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 datetime.utcnow().strftime('%Y-%m-%d %H:%M'),
@@ -446,7 +462,7 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
     paper_trades.append(trade)
     active_trades[trade_id] = trade
     try:
-        with open('paper_trades.json', 'w') as f:
+        with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
     except Exception as e:
         print(f"Paper trade log error: {e}")
@@ -455,6 +471,59 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
 # ============================================================
 # MONITOR ACTIVE TRADES
 # ============================================================
+def apply_trade_pnl(trade, result):
+    """
+    Converts a closed paper trade's points result into account-level
+    PnL using a fixed 1% account risk per trade (PROP_FIRM_RULES),
+    and updates daily_pnl / total_pnl / current_balance / trading_days /
+    consecutive_losses so /prop-status and drawdown protection reflect
+    real trade outcomes instead of requiring a manual /update-pnl call.
+    """
+    global daily_pnl, total_pnl, current_balance, trading_days
+    global consecutive_losses, last_trading_day
+
+    account = PROP_FIRM_RULES["account_size"]
+    risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+    stop_distance = abs(trade['entry'] - trade['stop'])
+    dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+
+    if result == 'WIN':
+        points = abs(trade['target'] - trade['entry'])
+        pnl = dollar_per_point * points
+        consecutive_losses = 0
+    else:
+        pnl = -risk_amount
+        consecutive_losses += 1
+
+    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if last_trading_day != today_str:
+        daily_pnl = 0
+        trading_days += 1
+        last_trading_day = today_str
+
+    daily_pnl += pnl
+    total_pnl += pnl
+    current_balance += pnl
+
+    check_drawdown_protection()
+
+    daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
+    total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
+    warnings = []
+    if abs(min(daily_pnl, 0)) >= daily_loss_limit:
+        warnings.append("🚨 DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
+    elif abs(min(daily_pnl, 0)) >= daily_loss_limit * 0.8:
+        warnings.append(f"⚠️ DAILY LOSS WARNING — at {(abs(min(daily_pnl, 0)) / account) * 100:.1f}% of limit")
+    if abs(min(total_pnl, 0)) >= total_drawdown_limit:
+        warnings.append("🚨 TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
+    if consecutive_losses == 3:
+        warnings.append(f"⚠️ DRAWDOWN PROTECTION ACTIVE — {consecutive_losses} consecutive losses, confidence threshold raised")
+    if warnings:
+        send_telegram("\n".join(warnings))
+
+    return pnl
+
+
 def monitor_active_trades(current_price):
     current_price = float(current_price)
     trades_to_close = []
@@ -480,31 +549,33 @@ def monitor_active_trades(current_price):
         if hit_tp:
             points = abs(target - entry)
             trade['result'] = 'WIN'
+            pnl = apply_trade_pnl(trade, 'WIN')
             send_telegram(f"""
 ✅ *TRADE CLOSED — TARGET HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
 Target: {target} ← hit at {current_price}
-Result: WIN ✅ +{points:.2f} points
+Result: WIN ✅ +{points:.2f} points (+${pnl:.2f}) | Balance: ${current_balance:,.2f}
 """)
             trades_to_close.append(trade_id)
         elif hit_sl:
             points = abs(stop - entry)
             trade['result'] = 'LOSS'
+            pnl = apply_trade_pnl(trade, 'LOSS')
             send_telegram(f"""
 ❌ *TRADE CLOSED — STOP HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
 Stop: {stop} ← hit at {current_price}
-Result: LOSS ❌ -{points:.2f} points
+Result: LOSS ❌ -{points:.2f} points (${pnl:.2f}) | Balance: ${current_balance:,.2f}
 """)
             trades_to_close.append(trade_id)
     for trade_id in trades_to_close:
         del active_trades[trade_id]
     try:
-        with open('paper_trades.json', 'w') as f:
+        with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
     except Exception as e:
         print(f"Paper trade update error: {e}")
@@ -514,7 +585,7 @@ Result: LOSS ❌ -{points:.2f} points
 # ============================================================
 def get_learned_rules():
     try:
-        with open('learned_rules.txt', 'r') as f:
+        with open(data_path('learned_rules.txt'), 'r') as f:
             return f.read()
     except FileNotFoundError:
         return "No learned rules yet — system will develop rules after first self-review."
@@ -967,7 +1038,10 @@ Used: {total_used_pct:.1f}% | Remaining: ${total_remaining:,.2f}
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
-# UPDATE P&L
+# UPDATE P&L (manual override — paper trades from TradingView
+# alerts now auto-track PnL via apply_trade_pnl() when they hit
+# SL/TP. Use this endpoint only for manually logging trades placed
+# outside the automated system, e.g. real broker/demo fills.)
 # ============================================================
 @app.route('/update-pnl', methods=['POST'])
 def update_pnl():
@@ -1001,7 +1075,7 @@ def update_pnl():
 def auto_update_levels():
     global KEY_LEVELS
     try:
-        gold = yf.download('GC=F', period='30d', interval='1d', progress=False)
+        gold = yf.download('GC=F', period='30d', interval='1d', progress=False, timeout=10)
         if gold.empty:
             send_telegram("⚠️ Auto level update failed — no data returned")
             return jsonify({"status": "error", "message": "no data"})
@@ -1043,7 +1117,7 @@ def auto_update_levels():
 def update_intraday():
     global KEY_LEVELS
     try:
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
         if gold.empty:
             return jsonify({"status": "no data"})
         gold.columns = [col[0] for col in gold.columns]
@@ -1080,7 +1154,7 @@ def monitor_trades_endpoint():
     try:
         if not active_trades:
             return jsonify({"status": "no active trades"})
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
         if gold.empty:
             return jsonify({"status": "no price data"})
         gold.columns = [col[0] for col in gold.columns]
@@ -1100,7 +1174,7 @@ def check_entries():
             return jsonify({"status": "market closed — entry monitor paused"})
         if not active_trades:
             return jsonify({"status": "no active trades to monitor"})
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False)
+        gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
         if gold.empty:
             return jsonify({"status": "no price data"})
         gold.columns = [col[0] for col in gold.columns]
@@ -1153,7 +1227,7 @@ def self_review():
     try:
         trades = []
         try:
-            with open('trade_log.csv', 'r') as f:
+            with open(data_path('trade_log.csv'), 'r') as f:
                 reader = csv.reader(f)
                 for row in reader:
                     if len(row) >= 4:
@@ -1163,7 +1237,7 @@ def self_review():
 
         paper = []
         try:
-            with open('paper_trades.json', 'r') as f:
+            with open(data_path('paper_trades.json'), 'r') as f:
                 paper = json.load(f)
         except FileNotFoundError:
             paper = []
@@ -1236,7 +1310,7 @@ Be direct and data driven.
         review = message.content[0].text
 
         try:
-            with open('pending_rules.txt', 'w') as f:
+            with open(data_path('pending_rules.txt'), 'w') as f:
                 f.write(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
                 f.write(review)
         except Exception as e:
@@ -1270,12 +1344,12 @@ Reject: https://web-production-387c47.up.railway.app/reject-rules
 @app.route('/approve-rules', methods=['GET'])
 def approve_rules():
     try:
-        with open('pending_rules.txt', 'r') as f:
+        with open(data_path('pending_rules.txt'), 'r') as f:
             pending = f.read()
-        with open('learned_rules.txt', 'w') as f:
+        with open(data_path('learned_rules.txt'), 'w') as f:
             f.write(f"Approved: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
             f.write(pending)
-        with open('pending_rules.txt', 'w') as f:
+        with open(data_path('pending_rules.txt'), 'w') as f:
             f.write("No pending rules")
         send_telegram(f"✅ *Rule Update Approved*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nNew learned rules applied to live system.")
         return jsonify({"status": "rules approved and applied"})
@@ -1288,7 +1362,7 @@ def approve_rules():
 @app.route('/reject-rules', methods=['GET'])
 def reject_rules():
     try:
-        with open('pending_rules.txt', 'w') as f:
+        with open(data_path('pending_rules.txt'), 'w') as f:
             f.write("No pending rules")
         send_telegram(f"❌ *Rule Update Rejected*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nProposed changes discarded. Live rules unchanged.")
         return jsonify({"status": "rules rejected — live rules unchanged"})
@@ -1302,12 +1376,12 @@ def view_rules():
         active = ""
         pending = ""
         try:
-            with open('learned_rules.txt', 'r') as f:
+            with open(data_path('learned_rules.txt'), 'r') as f:
                 active = f.read()
         except FileNotFoundError:
             active = "No approved rules yet"
         try:
-            with open('pending_rules.txt', 'r') as f:
+            with open(data_path('pending_rules.txt'), 'r') as f:
                 pending = f.read()
         except FileNotFoundError:
             pending = "No pending rules"
@@ -1337,7 +1411,7 @@ def view_rules():
 def run_backtest():
     try:
         send_telegram("🔍 *Backtesting started — pulling 2 years of XAUUSD data...*\nThis will take about 60 seconds.")
-        gold = yf.download('GC=F', period='2y', interval='1h', progress=False)
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
         if gold.empty:
             return jsonify({"status": "error", "message": "no data"})
         gold.columns = [col[0] for col in gold.columns]

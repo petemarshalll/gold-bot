@@ -144,6 +144,28 @@ def is_market_open():
     return True
 
 # ============================================================
+# PRICE DATA FRESHNESS CHECK
+# yfinance's free intraday feed can lag or briefly stall — most
+# often seen around gold's daily settlement/rollover window
+# (~22:00-23:00 UTC) or thin Asian-session liquidity. Without this
+# check, a stale "latest" candle gets silently trusted as the
+# current price, which can produce a wrong current-price readout in
+# alerts and a wrong basis for SL/TP or entry-zone checks. This
+# skips acting on the data for one cycle rather than risk that.
+# ============================================================
+def is_price_data_stale(gold_df, max_age_minutes=15):
+    try:
+        last_ts = gold_df.index[-1]
+        if getattr(last_ts, 'tzinfo', None) is None:
+            last_ts = last_ts.tz_localize('UTC')
+        else:
+            last_ts = last_ts.tz_convert('UTC')
+        age_seconds = (datetime.now(timezone.utc) - last_ts.to_pydatetime()).total_seconds()
+        return age_seconds > max_age_minutes * 60
+    except Exception:
+        return False  # fail open — don't block a check over a parsing issue
+
+# ============================================================
 # SESSION DETECTION
 # ============================================================
 def get_session():
@@ -171,8 +193,19 @@ def get_premium_discount(price):
         price = float(price)
         high = KEY_LEVELS["dealing_range_high"]
         low = KEY_LEVELS["dealing_range_low"]
+        # dealing_range only gets a full recalculation once a week
+        # (Sunday auto-levels). If price breaks outside that range
+        # before the next refresh, expand it to include the breakout
+        # rather than silently showing a percentage below 0% or above
+        # 100% against a now-stale range.
+        if price > high:
+            KEY_LEVELS["dealing_range_high"] = price
+            high = price
+        if price < low:
+            KEY_LEVELS["dealing_range_low"] = price
+            low = price
         midpoint = (high + low) / 2
-        percentage = ((price - low) / (high - low)) * 100
+        percentage = ((price - low) / (high - low)) * 100 if high != low else 50.0
         if price > midpoint:
             zone = "PREMIUM"
             advice = "price is expensive — favour shorts, be cautious on longs"
@@ -316,12 +349,18 @@ def get_dxy_bias():
         return "UNKNOWN", f"DXY check failed: {str(e)}", "NEUTRAL"
 
 
-def get_dxy_confluence(alert_type, dxy_implication):
-    is_bearish = "BEARISH" in alert_type
-    is_bullish = "BULLISH" in alert_type
-    if is_bearish and dxy_implication == "BEARISH":
+def get_dxy_confluence(direction, dxy_implication):
+    """
+    Checks DXY against the ACTUAL trade direction Claude settles on,
+    not the raw alert_type keyword. Sweep-type alerts are frequently
+    reversal signals where the real direction is the opposite of the
+    alert label (e.g. BEARISH_SWEEP -> LONG) — checking against
+    alert_type would show backwards confluence/conflict information
+    whenever DXY has a real directional bias.
+    """
+    if direction == "SHORT" and dxy_implication == "BEARISH":
         return "✅ STRONG CONFLUENCE — DXY rising confirms bearish gold bias", 2
-    elif is_bullish and dxy_implication == "BULLISH":
+    elif direction == "LONG" and dxy_implication == "BULLISH":
         return "✅ STRONG CONFLUENCE — DXY falling confirms bullish gold bias", 2
     elif dxy_implication == "NEUTRAL":
         return "⚠️ NEUTRAL — DXY flat, no additional confluence", 0
@@ -481,6 +520,7 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
     trade = {
         "id": trade_id,
         "time": alert_time,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
         "type": alert_type,
         "price": price,
         "direction": direction,
@@ -517,6 +557,29 @@ def extract_confluence_score(analysis):
         score = int(match.group(1))
         if 0 <= score <= 10:
             return score
+    return None
+
+# ============================================================
+# ENTRY ZONE EXTRACTION
+# Pulls the low/high of Claude's stated ENTRY ZONE so the bot can
+# check whether current price has actually reached it, instead of
+# always assuming the live webhook price IS the entry — even when
+# Claude is describing a retest at a level price hasn't reached (or
+# has already moved well past), which is a completely different,
+# not-yet-actionable trade.
+# ============================================================
+def extract_entry_zone(analysis):
+    match = re.search(
+        r'ENTRY ZONE\**\s*\n+\s*\**\s*([\d.]+)\s*[-–—]\s*([\d.]+)',
+        analysis, re.IGNORECASE
+    )
+    if match:
+        try:
+            a = float(match.group(1))
+            b = float(match.group(2))
+            return (min(a, b), max(a, b))
+        except ValueError:
+            return None
     return None
 
 # ============================================================
@@ -622,6 +685,129 @@ def apply_trade_pnl(trade, result):
         send_telegram("\n".join(warnings))
 
     return pnl
+
+# ============================================================
+# WICK-AWARE TRADE SCANNING
+# The quick check in monitor_active_trades() only ever compares the
+# latest candle's CLOSE against stop/target — it can completely miss
+# a stop or target that was briefly touched (a "wick") and then
+# recovered before the next 2-minute poll. A real resting stop-loss
+# order on a broker fills the instant price touches it, wick or not.
+# This scans every 5-minute candle's actual High/Low since the trade
+# opened, so a stop that got touched and recovered is correctly
+# caught as a loss, instead of the trade being left open to
+# eventually — and wrongly — record a win later on.
+# ============================================================
+def scan_candles_for_hit(trade, gold_df):
+    """
+    Returns (hit_type, hit_price, hit_time) — hit_type is 'WIN' or
+    'LOSS' — for the FIRST candle (chronologically) since the trade
+    opened whose High/Low breaches its stop or target. Returns
+    (None, None, None) if no breach is found in the available candle
+    history (trade genuinely still open), or if the trade has no
+    'opened_at' timestamp (older trade logged before this fix —
+    skipped rather than guessed at).
+    """
+    opened_at = trade.get('opened_at')
+    if not opened_at:
+        return None, None, None
+    try:
+        open_ts = pd.Timestamp(opened_at)
+    except Exception:
+        return None, None, None
+
+    idx = gold_df.index
+    idx_tz = getattr(idx, 'tz', None)
+    if idx_tz is not None:
+        # yfinance intraday data is timezone-aware (often the
+        # exchange's local timezone, not UTC) — align open_ts to it.
+        if open_ts.tzinfo is None:
+            open_ts = open_ts.tz_localize('UTC')
+        open_ts = open_ts.tz_convert(idx_tz)
+    else:
+        if open_ts.tzinfo is not None:
+            open_ts = open_ts.tz_convert('UTC').tz_localize(None)
+
+    relevant = gold_df[gold_df.index >= open_ts]
+    if relevant.empty:
+        return None, None, None
+
+    direction = trade['direction']
+    stop = trade['stop']
+    target = trade['target']
+
+    for ts, row in relevant.iterrows():
+        try:
+            low = float(row['Low'])
+            high = float(row['High'])
+        except Exception:
+            continue
+        if direction == 'LONG':
+            hit_target = high >= target
+            hit_stop = low <= stop
+        else:
+            hit_target = low <= target
+            hit_stop = high >= stop
+        if hit_stop:
+            # If a single candle's range spans BOTH levels, there's no
+            # way to know from OHLC alone which was touched first —
+            # assume the stop, since that's the safer assumption for
+            # judging real trading readiness.
+            return 'LOSS', stop, ts
+        if hit_target:
+            return 'WIN', target, ts
+    return None, None, None
+
+
+def thorough_scan_active_trades(gold_df):
+    """
+    Runs after the normal quick check in /monitor-trades. Only looks
+    at trades still OPEN after that check, and catches any that were
+    actually hit via a wick the latest-close check missed.
+    """
+    trades_to_close = []
+    for trade_id, trade in list(active_trades.items()):
+        if trade.get('result') != 'OPEN':
+            continue
+        hit_type, hit_price, hit_time = scan_candles_for_hit(trade, gold_df)
+        if hit_type is None:
+            continue
+        entry = trade['entry']
+        direction = trade['direction']
+        points = abs(hit_price - entry)
+        trade['result'] = hit_type
+        pnl = apply_trade_pnl(trade, hit_type)
+        emoji = "✅" if hit_type == "WIN" else "❌"
+        label = "TARGET HIT" if hit_type == "WIN" else "STOP HIT"
+        level_label = "Target" if hit_type == "WIN" else "Stop"
+        try:
+            if getattr(hit_time, 'tzinfo', None) is not None:
+                hit_time_str = hit_time.tz_convert('UTC').strftime('%H:%M UTC')
+            else:
+                hit_time_str = hit_time.strftime('%H:%M UTC')
+        except Exception:
+            hit_time_str = str(hit_time)
+        sign = "+" if hit_type == "WIN" else "-"
+        pnl_sign = "+" if pnl >= 0 else ""
+        send_telegram(f"""
+{emoji} *TRADE CLOSED — {label} (wick-detected)*
+Alert: {trade['type']} | {trade['time']}
+Direction: {direction}
+Entry: {entry}
+{level_label}: {hit_price} ← touched around {hit_time_str}
+Result: {hit_type} {emoji} {sign}{points:.2f} points ({pnl_sign}${pnl:.2f}) | Balance: ${current_balance:,.2f}
+
+ℹ️ Caught via candle high/low scan, not the live 2-minute price check — price touched this level and may have moved elsewhere since. A real resting stop/limit order would have filled here regardless.
+""")
+        trades_to_close.append(trade_id)
+    for trade_id in trades_to_close:
+        del active_trades[trade_id]
+    if trades_to_close:
+        try:
+            with open(data_path('paper_trades.json'), 'w') as f:
+                json.dump(paper_trades, f, indent=2)
+        except Exception as e:
+            print(f"Paper trade update error: {e}")
 
 
 def monitor_active_trades(current_price):
@@ -821,7 +1007,6 @@ def process_webhook_alert(data):
         news_risk, news_msg = check_news_risk()
         drawdown_active, drawdown_msg = check_drawdown_protection()
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
-        dxy_confluence_msg, dxy_score = get_dxy_confluence(alert_type, dxy_implication)
         hour_quality, hour_msg = check_hour_quality()
         spread_risk, spread_msg = check_spread(
             data.get('high', 0),
@@ -838,10 +1023,28 @@ def process_webhook_alert(data):
         if len(recent_alerts) > 10:
             recent_alerts.pop(0)
 
-        context = "\n".join([
-            f"- {a['time']}: {a['type']} at {a['price']} ({a['timeframe']})"
-            for a in recent_alerts[:-1]
-        ])
+        # Annotate each historical alert with how far price has moved
+        # since it fired, so Claude has an explicit signal for how
+        # stale a reference level is, instead of citing an old FVG
+        # from hours ago and 70+ points away as if it were still live.
+        current_price_val = None
+        try:
+            current_price_val = float(data.get('price', 0))
+        except (TypeError, ValueError):
+            pass
+        context_lines = []
+        for a in recent_alerts[:-1]:
+            moved_str = ""
+            if current_price_val is not None:
+                try:
+                    a_price = float(a['price'])
+                    moved = current_price_val - a_price
+                    direction_word = "up" if moved > 0 else "down" if moved < 0 else "flat"
+                    moved_str = f" — price has since moved {abs(moved):.1f}pts {direction_word}"
+                except (TypeError, ValueError):
+                    pass
+            context_lines.append(f"- {a['time']}: {a['type']} at {a['price']} ({a['timeframe']}){moved_str}")
+        context = "\n".join(context_lines)
 
         analysis = analyse_with_claude(
             data, context, session_name, session_desc,
@@ -865,27 +1068,12 @@ def process_webhook_alert(data):
             send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
             return
 
-        emoji = "🔴" if "BEARISH" in alert_type else "🟢" if "BULLISH" in alert_type else "🟡"
-        killzone_badge = "🎯 KILLZONE" if is_killzone else ""
-
-        telegram_message = f"""
-{emoji} *XAUUSD — {alert_type}* {killzone_badge}
-📍 Price: {data.get('price', 'N/A')}
-📊 Zone: {zone} ({zone_pct}%)
-⏰ {datetime.utcnow().strftime('%H:%M UTC')} | {session_name}
-⚠️ News: {news_msg}
-💵 DXY: {dxy_confluence_msg}
-📊 Spread: {spread_msg}
-🕐 Hour Quality: {hour_msg}
-
-{analysis}
-
-_Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
-"""
-
-        send_telegram(telegram_message)
-        log_to_csv(alert_type, data.get('price'), confidence, analysis)
-
+        # Determine the ACTUAL trade direction (from Claude's stated
+        # SL/TP, not the raw alert_type label) BEFORE building the
+        # emoji or DXY confluence line, so both reflect the real
+        # proposed trade rather than the Pine Script alert keyword —
+        # sweep-type alerts are frequently reversal signals where
+        # these disagree.
         entry_price = float(data.get('price', 0))
         direction = "SHORT" if "BEARISH" in alert_type else "LONG"
         stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
@@ -916,6 +1104,28 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         else:
             direction = "LONG"
 
+        dxy_confluence_msg, dxy_score = get_dxy_confluence(direction, dxy_implication)
+        emoji = "🔴" if direction == "SHORT" else "🟢" if direction == "LONG" else "🟡"
+        killzone_badge = "🎯 KILLZONE" if is_killzone else ""
+
+        telegram_message = f"""
+{emoji} *XAUUSD — {alert_type}* {killzone_badge}
+📍 Price: {data.get('price', 'N/A')}
+📊 Zone: {zone} ({zone_pct}%)
+⏰ {datetime.utcnow().strftime('%H:%M UTC')} | {session_name}
+⚠️ News: {news_msg}
+💵 DXY: {dxy_confluence_msg}
+📊 Spread: {spread_msg}
+🕐 Hour Quality: {hour_msg}
+
+{analysis}
+
+_Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
+"""
+
+        send_telegram(telegram_message)
+        log_to_csv(alert_type, data.get('price'), confidence, analysis)
+
         valid_trade = False
         if direction == "LONG" and target_price > entry_price > stop_price:
             valid_trade = True
@@ -924,7 +1134,21 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
 
         confluence_score = extract_confluence_score(analysis)
 
-        if confidence in ["HIGH", "MEDIUM"] and valid_trade:
+        # Only treat this as a filled trade if current price has actually
+        # reached the entry zone Claude described. A small buffer (0.3%
+        # of price) allows for the normal few-points overshoot seen on
+        # genuinely-triggered setups, without allowing a "wait for a
+        # retest" idea 20+ points away to be silently logged as if it
+        # filled at the current market price.
+        entry_zone = extract_entry_zone(analysis)
+        entry_zone_reached = True
+        if entry_zone:
+            zone_low, zone_high = entry_zone
+            buffer = entry_price * 0.003
+            if not (zone_low - buffer <= entry_price <= zone_high + buffer):
+                entry_zone_reached = False
+
+        if confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached:
             risk_ok, risk_msg = check_risk_cap_before_trade()
             if risk_ok:
                 alert_time = datetime.utcnow().strftime('%H:%M UTC')
@@ -940,10 +1164,20 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     "hour_quality": hour_quality,
                     "confluence_score": confluence_score,
                 }
+                if entry_zone:
+                    trade_context["entry_zone_low"] = entry_zone[0]
+                    trade_context["entry_zone_high"] = entry_zone[1]
                 log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time, context=trade_context)
             else:
                 print(risk_msg)
                 send_telegram(risk_msg)
+        elif confidence in ["HIGH", "MEDIUM"] and valid_trade and not entry_zone_reached:
+            msg = (f"⏳ *Setup noted — not logged as a trade*\n"
+                   f"Current price (${entry_price:,.2f}) hasn't reached the proposed "
+                   f"entry zone (${entry_zone[0]:,.2f}–${entry_zone[1]:,.2f}) yet. "
+                   f"This is a level to watch, not a live trade.")
+            print(msg)
+            send_telegram(msg)
         elif confidence in ["HIGH", "MEDIUM"] and not valid_trade:
             print(f"Skipped logging paper trade — SL/TP inconsistent. Dir:{direction} Entry:{entry_price} SL:{stop_price} TP:{target_price}")
 
@@ -1265,8 +1499,14 @@ def monitor_trades_endpoint():
         if gold.empty:
             return jsonify({"status": "no price data"})
         gold.columns = [col[0] for col in gold.columns]
+        if is_price_data_stale(gold):
+            print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this monitor-trades cycle")
+            return jsonify({"status": "price data stale, skipped"})
         current_price = round(float(gold['Close'].iloc[-1]), 2)
         monitor_active_trades(current_price)
+        # Catch anything the quick check above missed — a stop or
+        # target briefly touched (wicked through) between polls.
+        thorough_scan_active_trades(gold)
         return jsonify({"status": "checked", "current_price": current_price})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -1285,6 +1525,9 @@ def check_entries():
         if gold.empty:
             return jsonify({"status": "no price data"})
         gold.columns = [col[0] for col in gold.columns]
+        if is_price_data_stale(gold):
+            print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this check-entries cycle")
+            return jsonify({"status": "price data stale, skipped"})
         current_price = round(float(gold['Close'].iloc[-1]), 2)
         alerts_sent = 0
         notified_trades = []
@@ -1295,8 +1538,17 @@ def check_entries():
             stop = trade.get('stop', 0)
             target = trade.get('target', 0)
             direction = trade.get('direction', '')
-            entry_zone_high = entry * 1.001
-            entry_zone_low = entry * 0.999
+            # Prefer Claude's actual stated entry zone (stored on trades
+            # logged after the entry-zone fix) over a synthetic ±0.1%
+            # band around the recorded entry price — that band could
+            # reference a price level that was never really the
+            # intended entry in the first place.
+            if trade.get('entry_zone_low') is not None and trade.get('entry_zone_high') is not None:
+                entry_zone_low = trade['entry_zone_low']
+                entry_zone_high = trade['entry_zone_high']
+            else:
+                entry_zone_high = entry * 1.001
+                entry_zone_low = entry * 0.999
             in_entry_zone = entry_zone_low <= current_price <= entry_zone_high
             already_notified = trade.get('entry_notified', False)
             if in_entry_zone and not already_notified:

@@ -52,6 +52,8 @@ daily_losses = 0
 consecutive_losses = 0
 drawdown_protection = False
 last_trading_day = None
+last_pnl_reset_day = None
+daily_alert_count = 0
 scheduler = None
 
 # ============================================================
@@ -99,6 +101,8 @@ def save_state():
             "trading_days": trading_days,
             "consecutive_losses": consecutive_losses,
             "last_trading_day": last_trading_day,
+            "last_pnl_reset_day": last_pnl_reset_day,
+            "daily_alert_count": daily_alert_count,
         }
         with open(data_path('bot_state.json'), 'w') as f:
             json.dump(state, f, indent=2)
@@ -110,6 +114,7 @@ def save_state():
 def load_state():
     global KEY_LEVELS, paper_trades, active_trades, daily_pnl, total_pnl
     global current_balance, trading_days, consecutive_losses, last_trading_day
+    global last_pnl_reset_day, daily_alert_count
     try:
         with open(data_path('bot_state.json'), 'r') as f:
             state = json.load(f)
@@ -122,6 +127,12 @@ def load_state():
         trading_days = state.get('trading_days', 0)
         consecutive_losses = state.get('consecutive_losses', 0)
         last_trading_day = state.get('last_trading_day', None)
+        last_pnl_reset_day = state.get('last_pnl_reset_day', None)
+        daily_alert_count = state.get('daily_alert_count', 0)
+        # Self-heal immediately on load, not just on the next risk
+        # check — keeps /health, /prop-status etc accurate right away
+        # after any restart, e.g. after several idle days.
+        ensure_daily_reset()
         print(f"State loaded — {len(paper_trades)} trades, balance ${current_balance}")
     except FileNotFoundError:
         print("No saved state found — starting fresh")
@@ -612,11 +623,45 @@ def get_open_risk_exposure():
     open_count = sum(1 for t in active_trades.values() if t.get('result') == 'OPEN')
     return open_count * risk_per_trade, open_count
 
+def ensure_daily_reset():
+    """
+    Resets daily_pnl and daily_alert_count if the UTC day has rolled
+    over since the last reset. Centralised so every caller — the
+    scheduled midnight job, the pre-trade risk check, each incoming
+    webhook, and load_state on restart — shares one source of truth
+    for "is it a new day yet" instead of drifting out of sync.
+    Called from multiple places deliberately: if any one of them
+    fails to run for some reason, the others still guarantee this
+    can't silently get stuck the way the old single-path reset did.
+    """
+    global daily_pnl, last_pnl_reset_day, daily_alert_count
+    today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if last_pnl_reset_day != today_str:
+        daily_pnl = 0
+        daily_alert_count = 0
+        last_pnl_reset_day = today_str
+        print(f"Daily counters reset for new UTC day: {today_str}")
+
+
 def check_risk_cap_before_trade():
     """Returns (allowed: bool, message: str). Disallows opening a new
     paper trade if doing so — combined with the worst case of all
     currently open trades hitting stop loss — would exceed the
-    account's daily loss limit."""
+    account's daily loss limit.
+
+    Checks and self-heals the daily reset on every single call,
+    independent of the scheduled midnight job or a trade closing.
+    Without this, a full day's losses freeze daily_pnl at its last
+    value forever: if no new trade can open because daily_pnl is at
+    the limit, no trade can ever close to reset it either — a
+    permanent lockout with no way out. This one check is what
+    actually guarantees that can't happen, regardless of whether
+    the other two reset mechanisms (scheduled job, apply_trade_pnl)
+    ran correctly.
+    """
+    global daily_pnl, last_pnl_reset_day
+    ensure_daily_reset()
+
     account = PROP_FIRM_RULES["account_size"]
     risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
     daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
@@ -643,7 +688,7 @@ def apply_trade_pnl(trade, result):
     real trade outcomes instead of requiring a manual /update-pnl call.
     """
     global daily_pnl, total_pnl, current_balance, trading_days
-    global consecutive_losses, last_trading_day
+    global consecutive_losses, last_trading_day, last_pnl_reset_day
 
     account = PROP_FIRM_RULES["account_size"]
     risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
@@ -659,8 +704,8 @@ def apply_trade_pnl(trade, result):
         consecutive_losses += 1
 
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    ensure_daily_reset()
     if last_trading_day != today_str:
-        daily_pnl = 0
         trading_days += 1
         last_trading_day = today_str
 
@@ -998,8 +1043,11 @@ def webhook():
 
 
 def process_webhook_alert(data):
-    global recent_alerts
+    global recent_alerts, daily_alert_count
     try:
+        ensure_daily_reset()
+        daily_alert_count += 1
+
         alert_type = data.get('type', '')
 
         session_name, session_desc, is_killzone = get_session()
@@ -2036,12 +2084,13 @@ def dashboard():
 # ============================================================
 def send_heartbeat():
     try:
+        ensure_daily_reset()
         open_trades = sum(1 for t in active_trades.values() if t.get('result') == 'OPEN')
         msg = f"""
 💓 *Daily Heartbeat — system running normally*
 {datetime.now(timezone.utc).strftime('%d %b %Y — %H:%M UTC')}
 
-Alerts today: {len(recent_alerts)}
+Alerts today: {daily_alert_count}
 Active trades: {open_trades}
 Balance: ${current_balance:,.2f}
 Total P&L: ${total_pnl:,.2f}
@@ -2141,6 +2190,7 @@ if __name__ == '__main__':
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=run_in_context(morning_briefing), trigger='cron', hour=7, minute=0)
     scheduler.add_job(func=send_heartbeat, trigger='cron', hour=8, minute=0, id='heartbeat')
+    scheduler.add_job(func=ensure_daily_reset, trigger='cron', hour=0, minute=1, id='daily_pnl_reset')
     scheduler.add_job(func=run_in_context(weekly_bias_report), trigger='cron', day_of_week='sun', hour=20, minute=0)
     scheduler.add_job(func=run_in_context(monday_gap_analysis), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=run_in_context(auto_update_levels), trigger='cron', day_of_week='sun', hour=21, minute=0)

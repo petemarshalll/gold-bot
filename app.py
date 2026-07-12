@@ -613,7 +613,13 @@ def extract_confidence(analysis):
     match = re.search(r'CONFIDENCE LEVEL\**\s*\n+\s*\**\s*(HIGH|MEDIUM|LOW)\b', analysis, re.IGNORECASE)
     if match:
         return match.group(1).upper()
-    return "MEDIUM"  # safe default if the header format ever changes
+    # If the header format is ever unparseable, default to LOW rather
+    # than MEDIUM. LOW is genuinely the safe choice here — it's the
+    # one value that does NOT pass the "would_log" gate. Defaulting
+    # to MEDIUM (the old behaviour) would silently let a trade through
+    # whenever we don't actually know what Claude said, which is
+    # exactly the failure shape of the "No trade" bug just fixed.
+    return "LOW"
 
 # ============================================================
 # PRE-TRADE RISK EXPOSURE CHECK
@@ -1141,6 +1147,7 @@ def derive_trade_decision(analysis, alert_type, entry_price):
     stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
     target_price = entry_price * 0.99 if direction == "SHORT" else entry_price * 1.01
 
+    sl_found = False
     sl_patterns = [r'Stop(?:\s+Loss)?[:\s]+(\d+\.?\d*)', r'SL[:\s]+(\d+\.?\d*)']
     for pattern in sl_patterns:
         match = re.search(pattern, analysis, re.IGNORECASE)
@@ -1148,8 +1155,10 @@ def derive_trade_decision(analysis, alert_type, entry_price):
             extracted = float(match.group(1))
             if 3000 < extracted < 5500:
                 stop_price = extracted
+                sl_found = True
                 break
 
+    tp_found = False
     tp_patterns = [r'Target(?:\s+1)?[:\s]+(\d+\.?\d*)', r'TP[:\s]+(\d+\.?\d*)']
     for pattern in tp_patterns:
         match = re.search(pattern, analysis, re.IGNORECASE)
@@ -1157,6 +1166,7 @@ def derive_trade_decision(analysis, alert_type, entry_price):
             extracted = float(match.group(1))
             if 3000 < extracted < 5500:
                 target_price = extracted
+                tp_found = True
                 break
 
     if target_price > stop_price:
@@ -1186,6 +1196,13 @@ def derive_trade_decision(analysis, alert_type, entry_price):
         if not (zone_low - buffer <= entry_price <= zone_high + buffer):
             entry_zone_reached = False
 
+    # If Claude didn't give a real, extractable stop AND target (e.g. it
+    # explicitly wrote "No trade" / N/A), the fallback percentages above
+    # were never Claude's recommendation — they're arbitrary defaults.
+    # Without this check, an explicit rejection could still get logged
+    # as a fabricated trade using those defaults.
+    has_real_trade_params = sl_found and tp_found
+
     return {
         "confidence": confidence,
         "direction": direction,
@@ -1193,7 +1210,8 @@ def derive_trade_decision(analysis, alert_type, entry_price):
         "target_price": target_price,
         "valid_trade": valid_trade,
         "entry_zone_reached": entry_zone_reached,
-        "would_log": confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached,
+        "has_real_trade_params": has_real_trade_params,
+        "would_log": confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and has_real_trade_params,
     }
 
 
@@ -1457,6 +1475,7 @@ def process_webhook_alert(data):
         stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
         target_price = entry_price * 0.99 if direction == "SHORT" else entry_price * 1.01
 
+        sl_found = False
         sl_patterns = [r'Stop(?:\s+Loss)?[:\s]+(\d+\.?\d*)', r'SL[:\s]+(\d+\.?\d*)']
         for pattern in sl_patterns:
             match = re.search(pattern, analysis, re.IGNORECASE)
@@ -1464,8 +1483,10 @@ def process_webhook_alert(data):
                 extracted = float(match.group(1))
                 if 3000 < extracted < 5500:
                     stop_price = extracted
+                    sl_found = True
                     break
 
+        tp_found = False
         tp_patterns = [r'Target(?:\s+1)?[:\s]+(\d+\.?\d*)', r'TP[:\s]+(\d+\.?\d*)']
         for pattern in tp_patterns:
             match = re.search(pattern, analysis, re.IGNORECASE)
@@ -1473,6 +1494,7 @@ def process_webhook_alert(data):
                 extracted = float(match.group(1))
                 if 3000 < extracted < 5500:
                     target_price = extracted
+                    tp_found = True
                     break
 
         if target_price > stop_price:
@@ -1526,7 +1548,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
             if not (zone_low - buffer <= entry_price <= zone_high + buffer):
                 entry_zone_reached = False
 
-        if confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached:
+        if confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and sl_found and tp_found:
             risk_ok, risk_msg = check_risk_cap_before_trade()
             if risk_ok:
                 alert_time = datetime.utcnow().strftime('%H:%M UTC')
@@ -1549,6 +1571,15 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
             else:
                 print(risk_msg)
                 send_telegram(risk_msg)
+        elif confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and not (sl_found and tp_found):
+            # Claude didn't give a real, extractable stop AND target —
+            # most often an explicit "No trade" / N/A response. Without
+            # this check, the fallback percentage defaults above would
+            # get logged as if Claude had recommended them, which it
+            # didn't. The "No trade" reasoning is already visible in the
+            # main analysis message sent earlier, so no separate alert
+            # is needed here — just don't fabricate a trade from it.
+            print(f"Skipped logging paper trade — Claude did not provide a real extractable stop/target (likely an explicit 'No trade' response). Alert:{alert_type}")
         elif confidence in ["HIGH", "MEDIUM"] and valid_trade and not entry_zone_reached:
             msg = (f"⏳ *Setup noted — not logged as a trade*\n"
                    f"Current price (${entry_price:,.2f}) hasn't reached the proposed "

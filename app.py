@@ -1845,6 +1845,37 @@ def view_rules():
 # BACKTESTING
 # ============================================================
 @app.route('/backtest', methods=['GET'])
+def simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, target, max_lookahead=50):
+    """
+    Scans forward candle-by-candle from the signal, checking each
+    candle's actual High/Low for whichever of stop/target was hit
+    FIRST, chronologically — the same honest, wick-aware method
+    already validated for live trading (scan_candles_for_hit),
+    applied here so a backtest 'WIN' means a real trade with this
+    entry/stop/target would genuinely have won, not just "price
+    happened to net move further in one direction over N candles."
+    Returns 'WIN', 'LOSS', or None if neither level was reached
+    within the lookahead window (excluded from stats as
+    inconclusive, rather than forcing a result).
+    """
+    end = min(signal_index + 1 + max_lookahead, len(gold_df))
+    for j in range(signal_index + 1, end):
+        row = gold_df.iloc[j]
+        high = float(row['High'])
+        low = float(row['Low'])
+        if direction == 'LONG':
+            hit_target = high >= target
+            hit_stop = low <= stop
+        else:
+            hit_target = low <= target
+            hit_stop = high >= stop
+        if hit_stop:
+            return 'LOSS'
+        if hit_target:
+            return 'WIN'
+    return None
+
+
 def run_backtest():
     try:
         send_telegram("🔍 *Backtesting started — pulling 2 years of XAUUSD data...*\nThis will take about 60 seconds.")
@@ -1855,48 +1886,61 @@ def run_backtest():
         gold = gold.dropna()
         total_candles = len(gold)
         send_telegram(f"📊 Data loaded — {total_candles} candles over 2 years. Detecting signals...")
+
+        # Mechanical, disclosed risk setup applied identically to every
+        # signal — a small buffer beyond the signal candle's high/low
+        # for the stop (matching how stops are typically set live), and
+        # a fixed 1:2 risk:reward target. This is a stated assumption,
+        # not a discovered one — real live trades use whatever Claude
+        # actually proposes per setup, which varies.
+        RISK_REWARD_TARGET = 2.0
+        BUFFER_PCT = 0.001
+
         signals = []
+        inconclusive_count = 0
         for i in range(3, len(gold) - 10):
             candle = gold.iloc[i]
             prev2 = gold.iloc[i-2]
-            next5 = gold.iloc[i+1:i+6]
-            next10 = gold.iloc[i+1:i+11]
             high = float(candle['High'])
             low = float(candle['Low'])
             close = float(candle['Close'])
+            buffer = close * BUFFER_PCT
+
+            detected = []
             if float(prev2['Low']) > high:
-                future_low = float(next10['Low'].min())
-                future_high = float(next10['High'].max())
-                move_down = close - future_low
-                move_up = future_high - close
-                outcome = "WIN" if move_down > move_up else "LOSS"
-                signals.append({"type": "BEARISH_FVG", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
+                detected.append(("BEARISH_FVG", "SHORT"))
             if float(prev2['High']) < low:
-                future_low = float(next10['Low'].min())
-                future_high = float(next10['High'].max())
-                move_up = future_high - close
-                move_down = close - future_low
-                outcome = "WIN" if move_up > move_down else "LOSS"
-                signals.append({"type": "BULLISH_FVG", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
+                detected.append(("BULLISH_FVG", "LONG"))
             lookback_high = float(gold.iloc[i-10:i]['High'].max())
             if high > lookback_high and close < lookback_high:
-                future_low = float(next5['Low'].min())
-                future_high = float(next5['High'].max())
-                outcome = "WIN" if (close - future_low) > (future_high - close) else "LOSS"
-                signals.append({"type": "BEARISH_SWEEP", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
+                detected.append(("BEARISH_SWEEP", "SHORT"))
             lookback_low = float(gold.iloc[i-10:i]['Low'].min())
             if low < lookback_low and close > lookback_low:
-                future_low = float(next5['Low'].min())
-                future_high = float(next5['High'].max())
-                outcome = "WIN" if (future_high - close) > (close - future_low) else "LOSS"
-                signals.append({"type": "BULLISH_SWEEP", "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
+                detected.append(("BULLISH_SWEEP", "LONG"))
+
+            for sig_type, direction in detected:
+                entry = close
+                if direction == "SHORT":
+                    stop = high + buffer
+                    risk = stop - entry
+                    target = entry - (risk * RISK_REWARD_TARGET)
+                else:
+                    stop = low - buffer
+                    risk = entry - stop
+                    target = entry + (risk * RISK_REWARD_TARGET)
+
+                outcome = simulate_backtest_trade(gold, i, direction, entry, stop, target)
+                if outcome is None:
+                    inconclusive_count += 1
+                    continue
+                signals.append({"type": sig_type, "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
 
         total_signals = len(signals)
         if total_signals == 0:
-            send_telegram("⚠️ No signals detected")
-            return jsonify({"status": "no signals"})
+            send_telegram(f"⚠️ No signals resolved within the lookahead window ({inconclusive_count} detected but inconclusive)")
+            return jsonify({"status": "no resolved signals"})
 
-        send_telegram(f"✅ {total_signals} signals detected. Compiling statistics...")
+        send_telegram(f"✅ {total_signals} signals resolved (stop or target actually hit) | {inconclusive_count} inconclusive and excluded. Compiling statistics...")
         wins = len([s for s in signals if s['outcome'] == 'WIN'])
         overall_wr = round(wins / total_signals * 100, 1)
         type_stats = {}
@@ -1929,15 +1973,25 @@ def run_backtest():
         worst_hours = sorted(hour_wr.items(), key=lambda x: x[1])[:3]
         best_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in best_hours])
         worst_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in worst_hours])
+        expectancy_r = round((overall_wr / 100 * RISK_REWARD_TARGET) - ((1 - overall_wr / 100) * 1), 2)
         prompt = f"""
-You are analysing 2 years of XAUUSD backtesting data.
-Total candles: {total_candles} | Total signals: {total_signals} | Overall win rate: {overall_wr}%
+You are analysing 2 years of XAUUSD backtesting data. Every signal below was
+simulated with a REAL entry, stop, and target (fixed 1:{RISK_REWARD_TARGET:.0f} risk:reward,
+stop set just beyond the signal candle's high/low) — WIN/LOSS was determined
+by scanning forward through actual subsequent candle highs/lows to see
+which level was hit first. {inconclusive_count} additional signals were
+detected but never resolved either level within 50 candles and were
+excluded, not forced into a result.
+
+Total candles: {total_candles} | Resolved signals: {total_signals} | Overall win rate: {overall_wr}%
+Fixed risk:reward used: 1:{RISK_REWARD_TARGET:.0f}
+Expectancy: {expectancy_r}R per trade (this already accounts for the win rate and R:R — a small positive number here is meaningful, a large one is a red flag worth real skepticism, not excitement)
 By signal type: {type_summary}
 By session: {session_summary}
 Best hours: {best_hours_str}
 Worst hours: {worst_hours_str}
-Provide: OVERALL ASSESSMENT, STRONGEST SETUP, WEAKEST SETUP, BEST SESSION, SESSION TO AVOID, OPTIMAL HOURS, RECOMMENDED FILTERS, EXPECTED PERFORMANCE.
-Be direct and data driven.
+Provide: OVERALL ASSESSMENT, STRONGEST SETUP, WEAKEST SETUP, BEST SESSION, SESSION TO AVOID, OPTIMAL HOURS, RECOMMENDED FILTERS.
+Do NOT estimate or restate a different R:R or expected performance figure — the expectancy above is already computed from real simulation, just interpret it honestly. Be direct and data driven.
 """
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
@@ -1945,11 +1999,13 @@ Be direct and data driven.
         )
         analysis = message.content[0].text
         send_telegram(f"""
-📈 *XAUUSD Backtest Report — 2 Years*
+📈 *XAUUSD Backtest Report — 2 Years (real entry/stop/target simulation)*
 _{datetime.utcnow().strftime('%d %b %Y')}_
 
-*Data:* {total_candles} candles | {total_signals} signals
+*Data:* {total_candles} candles | {total_signals} resolved signals | {inconclusive_count} inconclusive (excluded)
 *Overall Win Rate:* {overall_wr}%
+*Fixed Risk:Reward:* 1:{RISK_REWARD_TARGET:.0f}
+*Expectancy:* {expectancy_r}R per trade
 
 *By Signal Type:*
 {type_summary}
@@ -1962,7 +2018,7 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 
 {analysis}
 """)
-        return jsonify({"status": "backtest complete", "total_signals": total_signals, "overall_win_rate": overall_wr})
+        return jsonify({"status": "backtest complete", "total_signals": total_signals, "inconclusive": inconclusive_count, "overall_win_rate": overall_wr, "expectancy_r": expectancy_r})
     except Exception as e:
         error_msg = f"⚠️ Backtest error: {str(e)}"
         send_telegram(error_msg)

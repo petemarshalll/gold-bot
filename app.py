@@ -1844,7 +1844,6 @@ def view_rules():
 # ============================================================
 # BACKTESTING
 # ============================================================
-@app.route('/backtest', methods=['GET'])
 def simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, target, max_lookahead=50):
     """
     Scans forward candle-by-candle from the signal, checking each
@@ -1876,12 +1875,20 @@ def simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, targe
     return None
 
 
+@app.route('/backtest', methods=['GET'])
+def backtest_endpoint():
+    thread = threading.Thread(target=run_backtest)
+    thread.start()
+    return jsonify({"status": "backtest started", "note": "runs in the background — results (including any error) will be sent to Telegram in roughly 30-90 seconds"})
+
+
 def run_backtest():
     try:
         send_telegram("🔍 *Backtesting started — pulling 2 years of XAUUSD data...*\nThis will take about 60 seconds.")
         gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
         if gold.empty:
-            return jsonify({"status": "error", "message": "no data"})
+            send_telegram("⚠️ Backtest error: no price data returned")
+            return
         gold.columns = [col[0] for col in gold.columns]
         gold = gold.dropna()
         total_candles = len(gold)
@@ -1938,7 +1945,7 @@ def run_backtest():
         total_signals = len(signals)
         if total_signals == 0:
             send_telegram(f"⚠️ No signals resolved within the lookahead window ({inconclusive_count} detected but inconclusive)")
-            return jsonify({"status": "no resolved signals"})
+            return
 
         send_telegram(f"✅ {total_signals} signals resolved (stop or target actually hit) | {inconclusive_count} inconclusive and excluded. Compiling statistics...")
         wins = len([s for s in signals if s['outcome'] == 'WIN'])
@@ -2018,11 +2025,10 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 
 {analysis}
 """)
-        return jsonify({"status": "backtest complete", "total_signals": total_signals, "inconclusive": inconclusive_count, "overall_win_rate": overall_wr, "expectancy_r": expectancy_r})
     except Exception as e:
         error_msg = f"⚠️ Backtest error: {str(e)}"
+        print(error_msg)
         send_telegram(error_msg)
-        return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
 # DASHBOARD

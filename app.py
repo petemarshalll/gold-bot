@@ -1882,6 +1882,213 @@ def backtest_endpoint():
     return jsonify({"status": "backtest started", "note": "runs in the background — results (including any error) will be sent to Telegram in roughly 30-90 seconds"})
 
 
+@app.route('/backtest-validate', methods=['GET'])
+def backtest_validate_endpoint():
+    thread = threading.Thread(target=run_backtest_validation)
+    thread.start()
+    return jsonify({"status": "validation started", "note": "runs in the background — results will be sent to Telegram in roughly 30-90 seconds"})
+
+
+def run_backtest_validation():
+    """
+    Out-of-sample check: splits the 2-year dataset chronologically into
+    the first 18 months (in-sample) and the final 6 months (holdout),
+    runs the identical detection + simulation on each independently,
+    and checks whether specific subgroup findings from the full
+    backtest — BULLISH_SWEEP underperformance, the 21-23 UTC window —
+    actually hold up on data that was never used to find them. That's
+    the real test for whether a subgroup result is signal or just
+    noise from comparing too many slices of the same dataset.
+    """
+    try:
+        send_telegram("🔬 *Out-of-sample validation started*\nSplitting 2 years into an 18-month training period and a 6-month holdout, then checking whether the backtest's subgroup findings hold up on data that wasn't used to find them. ~60-90 seconds.")
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        if gold.empty:
+            send_telegram("⚠️ Validation error: no price data returned")
+            return
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+
+        split_date = gold.index[0] + pd.DateOffset(months=18)
+        in_sample = gold[gold.index < split_date]
+        out_sample = gold[gold.index >= split_date]
+
+        if len(in_sample) < 100 or len(out_sample) < 100:
+            send_telegram("⚠️ Validation error: not enough data on one side of the split to be meaningful")
+            return
+
+        send_telegram(f"📊 Split at {split_date.strftime('%d %b %Y')} — {len(in_sample)} in-sample candles, {len(out_sample)} holdout candles. Running simulation on both...")
+
+        in_signals, in_inconclusive = detect_and_simulate_signals(in_sample)
+        out_signals, out_inconclusive = detect_and_simulate_signals(out_sample)
+
+        in_stats = compute_backtest_stats(in_signals)
+        out_stats = compute_backtest_stats(out_signals)
+
+        if in_stats is None or out_stats is None:
+            send_telegram("⚠️ Validation error: not enough resolved signals on one side of the split")
+            return
+
+        def type_wr(stats, sig_type, min_n=20):
+            t = stats["type_stats"].get(sig_type)
+            total = t["total"] if t else 0
+            if not t or total < min_n:
+                return None, total
+            return round(t["wins"] / t["total"] * 100, 1), total
+
+        def hour_window_wr(stats, hours, min_n=20):
+            wins = sum(stats["hour_stats"].get(h, {"wins": 0})["wins"] for h in hours)
+            total = sum(stats["hour_stats"].get(h, {"total": 0})["total"] for h in hours)
+            if total < min_n:
+                return None, total
+            return round(wins / total * 100, 1), total
+
+        in_overall = in_stats["overall_wr"]
+        out_overall = out_stats["overall_wr"]
+
+        in_sweep_wr, in_sweep_n = type_wr(in_stats, "BULLISH_SWEEP")
+        out_sweep_wr, out_sweep_n = type_wr(out_stats, "BULLISH_SWEEP")
+
+        in_hours_wr, in_hours_n = hour_window_wr(in_stats, [21, 22, 23])
+        out_hours_wr, out_hours_n = hour_window_wr(out_stats, [21, 22, 23])
+
+        def verdict(in_wr, out_wr, breakeven=33.3):
+            if in_wr is None or out_wr is None:
+                return "⚪ Not enough holdout data to test"
+            if (in_wr > breakeven) == (out_wr > breakeven):
+                return "✅ Held up — same side of breakeven in both periods"
+            return "❌ Did NOT replicate — flipped sides of breakeven out-of-sample"
+
+        sweep_verdict = verdict(in_sweep_wr, out_sweep_wr)
+        hours_verdict = verdict(in_hours_wr, out_hours_wr)
+
+        report = f"""
+🔬 *Out-of-Sample Validation Report*
+_{datetime.utcnow().strftime('%d %b %Y')}_
+
+Training period (first 18mo): {in_stats['total_signals']} resolved signals
+Holdout period (final 6mo): {out_stats['total_signals']} resolved signals
+
+*Overall win rate:*
+In-sample: {in_overall}% | Out-of-sample: {out_overall}%
+
+*BULLISH_SWEEP win rate* (flagged as weakest setup, {in_sweep_n} in-sample signals):
+In-sample: {f"{in_sweep_wr}%" if in_sweep_wr is not None else "n/a"} | Out-of-sample: {f"{out_sweep_wr}% (n={out_sweep_n})" if out_sweep_wr is not None else f"n/a (only {out_sweep_n} holdout signals)"}
+Verdict: {sweep_verdict}
+
+*21-23 UTC window win rate* (flagged as best hours, {in_hours_n} in-sample signals):
+In-sample: {f"{in_hours_wr}%" if in_hours_wr is not None else "n/a"} | Out-of-sample: {f"{out_hours_wr}% (n={out_hours_n})" if out_hours_wr is not None else f"n/a (only {out_hours_n} holdout signals)"}
+Verdict: {hours_verdict}
+
+_A "held up" verdict means the pattern stayed on the same side of breakeven in both periods — supportive evidence, not proof. "Did not replicate" is a real sign the original finding was noise from comparing too many subgroups. Small holdout sample sizes limit how confident either verdict can be — treat this as a second opinion, not a final answer._
+"""
+        send_telegram(report)
+    except Exception as e:
+        error_msg = f"⚠️ Validation error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
+
+
+RISK_REWARD_TARGET = 2.0
+BUFFER_PCT = 0.001
+
+
+def detect_and_simulate_signals(gold_df, risk_reward=RISK_REWARD_TARGET, buffer_pct=BUFFER_PCT):
+    """
+    Runs the same signal detection + honest wick-aware entry/stop/
+    target simulation used by the main backtest, on whatever
+    DataFrame slice is passed in. Shared by both the full 2-year
+    backtest and the out-of-sample validation split, so the two can
+    never silently drift out of sync with each other.
+    """
+    signals = []
+    inconclusive_count = 0
+    for i in range(3, len(gold_df) - 10):
+        candle = gold_df.iloc[i]
+        prev2 = gold_df.iloc[i-2]
+        high = float(candle['High'])
+        low = float(candle['Low'])
+        close = float(candle['Close'])
+        buffer = close * buffer_pct
+
+        detected = []
+        if float(prev2['Low']) > high:
+            detected.append(("BEARISH_FVG", "SHORT"))
+        if float(prev2['High']) < low:
+            detected.append(("BULLISH_FVG", "LONG"))
+        lookback_high = float(gold_df.iloc[i-10:i]['High'].max())
+        if high > lookback_high and close < lookback_high:
+            detected.append(("BEARISH_SWEEP", "SHORT"))
+        lookback_low = float(gold_df.iloc[i-10:i]['Low'].min())
+        if low < lookback_low and close > lookback_low:
+            detected.append(("BULLISH_SWEEP", "LONG"))
+
+        for sig_type, direction in detected:
+            entry = close
+            if direction == "SHORT":
+                stop = high + buffer
+                risk = stop - entry
+                target = entry - (risk * risk_reward)
+            else:
+                stop = low - buffer
+                risk = entry - stop
+                target = entry + (risk * risk_reward)
+
+            outcome = simulate_backtest_trade(gold_df, i, direction, entry, stop, target)
+            if outcome is None:
+                inconclusive_count += 1
+                continue
+            signals.append({"type": sig_type, "time": str(gold_df.index[i]), "price": close, "hour": gold_df.index[i].hour, "outcome": outcome})
+    return signals, inconclusive_count
+
+
+def compute_backtest_stats(signals, risk_reward=RISK_REWARD_TARGET):
+    """Compiles overall/type/session/hour win-rate breakdowns and
+    expectancy from a list of resolved signals. Returns None if the
+    list is empty, so callers can handle "not enough data" cleanly."""
+    total_signals = len(signals)
+    if total_signals == 0:
+        return None
+    wins = len([s for s in signals if s['outcome'] == 'WIN'])
+    overall_wr = round(wins / total_signals * 100, 1)
+
+    type_stats = {}
+    for s in signals:
+        t = s['type']
+        if t not in type_stats:
+            type_stats[t] = {'wins': 0, 'total': 0}
+        type_stats[t]['total'] += 1
+        if s['outcome'] == 'WIN':
+            type_stats[t]['wins'] += 1
+
+    session_stats = {"Asian (22-07)": {"wins": 0, "total": 0}, "London (07-12)": {"wins": 0, "total": 0}, "NY (12-17)": {"wins": 0, "total": 0}, "Other (17-22)": {"wins": 0, "total": 0}}
+    for s in signals:
+        hour = s['hour']
+        session = "Asian (22-07)" if (hour >= 22 or hour < 7) else "London (07-12)" if 7 <= hour < 12 else "NY (12-17)" if 12 <= hour < 17 else "Other (17-22)"
+        session_stats[session]['total'] += 1
+        if s['outcome'] == 'WIN':
+            session_stats[session]['wins'] += 1
+
+    hour_stats = {}
+    for s in signals:
+        h = s['hour']
+        if h not in hour_stats:
+            hour_stats[h] = {'wins': 0, 'total': 0}
+        hour_stats[h]['total'] += 1
+        if s['outcome'] == 'WIN':
+            hour_stats[h]['wins'] += 1
+
+    expectancy_r = round((overall_wr / 100 * risk_reward) - ((1 - overall_wr / 100) * 1), 2)
+    return {
+        "total_signals": total_signals,
+        "overall_wr": overall_wr,
+        "expectancy_r": expectancy_r,
+        "type_stats": type_stats,
+        "session_stats": session_stats,
+        "hour_stats": hour_stats,
+    }
+
+
 def run_backtest():
     try:
         send_telegram("🔍 *Backtesting started — pulling 2 years of XAUUSD data...*\nThis will take about 60 seconds.")
@@ -1900,47 +2107,7 @@ def run_backtest():
         # a fixed 1:2 risk:reward target. This is a stated assumption,
         # not a discovered one — real live trades use whatever Claude
         # actually proposes per setup, which varies.
-        RISK_REWARD_TARGET = 2.0
-        BUFFER_PCT = 0.001
-
-        signals = []
-        inconclusive_count = 0
-        for i in range(3, len(gold) - 10):
-            candle = gold.iloc[i]
-            prev2 = gold.iloc[i-2]
-            high = float(candle['High'])
-            low = float(candle['Low'])
-            close = float(candle['Close'])
-            buffer = close * BUFFER_PCT
-
-            detected = []
-            if float(prev2['Low']) > high:
-                detected.append(("BEARISH_FVG", "SHORT"))
-            if float(prev2['High']) < low:
-                detected.append(("BULLISH_FVG", "LONG"))
-            lookback_high = float(gold.iloc[i-10:i]['High'].max())
-            if high > lookback_high and close < lookback_high:
-                detected.append(("BEARISH_SWEEP", "SHORT"))
-            lookback_low = float(gold.iloc[i-10:i]['Low'].min())
-            if low < lookback_low and close > lookback_low:
-                detected.append(("BULLISH_SWEEP", "LONG"))
-
-            for sig_type, direction in detected:
-                entry = close
-                if direction == "SHORT":
-                    stop = high + buffer
-                    risk = stop - entry
-                    target = entry - (risk * RISK_REWARD_TARGET)
-                else:
-                    stop = low - buffer
-                    risk = entry - stop
-                    target = entry + (risk * RISK_REWARD_TARGET)
-
-                outcome = simulate_backtest_trade(gold, i, direction, entry, stop, target)
-                if outcome is None:
-                    inconclusive_count += 1
-                    continue
-                signals.append({"type": sig_type, "time": str(gold.index[i]), "price": close, "hour": gold.index[i].hour, "outcome": outcome})
+        signals, inconclusive_count = detect_and_simulate_signals(gold)
 
         total_signals = len(signals)
         if total_signals == 0:
@@ -1948,39 +2115,19 @@ def run_backtest():
             return
 
         send_telegram(f"✅ {total_signals} signals resolved (stop or target actually hit) | {inconclusive_count} inconclusive and excluded. Compiling statistics...")
-        wins = len([s for s in signals if s['outcome'] == 'WIN'])
-        overall_wr = round(wins / total_signals * 100, 1)
-        type_stats = {}
-        for s in signals:
-            t = s['type']
-            if t not in type_stats:
-                type_stats[t] = {'wins': 0, 'total': 0}
-            type_stats[t]['total'] += 1
-            if s['outcome'] == 'WIN':
-                type_stats[t]['wins'] += 1
+        stats = compute_backtest_stats(signals)
+        overall_wr = stats["overall_wr"]
+        expectancy_r = stats["expectancy_r"]
+        type_stats = stats["type_stats"]
+        session_stats = stats["session_stats"]
+        hour_stats = stats["hour_stats"]
         type_summary = "\n".join([f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100)}% win rate)" for k, v in type_stats.items()])
-        session_stats = {"Asian (22-07)": {"wins": 0, "total": 0}, "London (07-12)": {"wins": 0, "total": 0}, "NY (12-17)": {"wins": 0, "total": 0}, "Other (17-22)": {"wins": 0, "total": 0}}
-        for s in signals:
-            hour = s['hour']
-            session = "Asian (22-07)" if (hour >= 22 or hour < 7) else "London (07-12)" if 7 <= hour < 12 else "NY (12-17)" if 12 <= hour < 17 else "Other (17-22)"
-            session_stats[session]['total'] += 1
-            if s['outcome'] == 'WIN':
-                session_stats[session]['wins'] += 1
         session_summary = "\n".join([f"- {k}: {v['wins']}/{v['total']} ({round(v['wins']/v['total']*100) if v['total'] > 0 else 0}% win rate)" for k, v in session_stats.items()])
-        hour_stats = {}
-        for s in signals:
-            h = s['hour']
-            if h not in hour_stats:
-                hour_stats[h] = {'wins': 0, 'total': 0}
-            hour_stats[h]['total'] += 1
-            if s['outcome'] == 'WIN':
-                hour_stats[h]['wins'] += 1
         hour_wr = {h: round(v['wins']/v['total']*100) for h, v in hour_stats.items() if v['total'] >= 5}
         best_hours = sorted(hour_wr.items(), key=lambda x: x[1], reverse=True)[:3]
         worst_hours = sorted(hour_wr.items(), key=lambda x: x[1])[:3]
         best_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in best_hours])
         worst_hours_str = ", ".join([f"{h}:00 UTC ({wr}%)" for h, wr in worst_hours])
-        expectancy_r = round((overall_wr / 100 * RISK_REWARD_TARGET) - ((1 - overall_wr / 100) * 1), 2)
         prompt = f"""
 You are analysing 2 years of XAUUSD backtesting data. Every signal below was
 simulated with a REAL entry, stop, and target (fixed 1:{RISK_REWARD_TARGET:.0f} risk:reward,
@@ -1997,6 +2144,17 @@ By signal type: {type_summary}
 By session: {session_summary}
 Best hours: {best_hours_str}
 Worst hours: {worst_hours_str}
+
+IMPORTANT — multiple comparisons caveat: this data was cut 4 ways by signal
+type, 4 ways by session, and 24 ways by hour — roughly 32 separate
+comparisons against the same ~33% baseline. Individually-striking
+subgroups (especially single-hour buckets) are exactly what you'd expect
+to see by chance alone at this many comparisons, even with zero real
+effect. Explicitly flag this when discussing "best hours" or any small
+subgroup — do not present them with the same confidence as the overall
+win rate, which is not subject to this problem. Signal-type and session
+splits (4-way) are more trustworthy than the 24-way hour split.
+
 Provide: OVERALL ASSESSMENT, STRONGEST SETUP, WEAKEST SETUP, BEST SESSION, SESSION TO AVOID, OPTIMAL HOURS, RECOMMENDED FILTERS.
 Do NOT estimate or restate a different R:R or expected performance figure — the expectancy above is already computed from real simulation, just interpret it honestly. Be direct and data driven.
 """

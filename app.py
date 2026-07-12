@@ -133,6 +133,11 @@ def load_state():
         # check — keeps /health, /prop-status etc accurate right away
         # after any restart, e.g. after several idle days.
         ensure_daily_reset()
+        # drawdown_protection itself isn't persisted (only the
+        # consecutive_losses count is) — recompute it here so a
+        # restart can't show a misleading "OFF" status when the
+        # underlying loss streak actually hasn't cleared.
+        check_drawdown_protection()
         print(f"State loaded — {len(paper_trades)} trades, balance ${current_balance}")
     except FileNotFoundError:
         print("No saved state found — starting fresh")

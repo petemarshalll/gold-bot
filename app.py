@@ -1268,7 +1268,7 @@ Cover in under 300 words:
 """
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400
+            max_tokens=900
         )
         send_telegram(f"☀️ *XAUUSD Morning Briefing — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "briefing sent"})
@@ -1303,7 +1303,7 @@ Cover in under 350 words:
 """
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400
+            max_tokens=1000
         )
         send_telegram(f"📊 *XAUUSD Weekly Bias — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "weekly bias sent"})
@@ -1333,7 +1333,7 @@ Cover in under 250 words:
 """
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400
+            max_tokens=800
         )
         send_telegram(f"🌅 *XAUUSD Monday Gap Analysis — {datetime.utcnow().strftime('%d %b %Y')}*\n\n{message.content[0].text}")
         return jsonify({"status": "monday gap sent"})
@@ -1376,7 +1376,7 @@ Keep it concise and actionable. Maximum 200 words.
 """
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400
+            max_tokens=700
         )
         analysis = message.content[0].text
         telegram_message = f"""
@@ -1742,7 +1742,7 @@ Be direct and data driven.
 
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=400
+            max_tokens=1800
         )
         review = message.content[0].text
 
@@ -1941,7 +1941,7 @@ Be direct and data driven.
 """
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=500
+            max_tokens=1200
         )
         analysis = message.content[0].text
         send_telegram(f"""

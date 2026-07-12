@@ -2247,7 +2247,7 @@ def replay_sample_endpoint():
     return jsonify({
         "status": "replay started",
         "sample_size": est_calls,
-        "note": f"makes ~{est_calls} REAL Claude API calls (real cost — see Telegram for a running estimate). This will take roughly {est_calls * 8 // 60}-{est_calls * 15 // 60} minutes, not seconds. Add ?per_type=N to change the sample size (default 25/type, 100 total)."
+        "note": f"makes ~{est_calls} REAL Claude API calls (real cost — see Telegram for a running estimate). This will take roughly {(est_calls * 8 + est_calls * 1.5) // 60:.0f}-{(est_calls * 15 + est_calls * 1.5) // 60:.0f} minutes, not seconds. Add ?per_type=N to change the sample size (default 25/type, 100 total)."
     })
 
 
@@ -2340,7 +2340,9 @@ def run_live_judgment_replay(per_type=25):
                 message = call_claude(
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=16000,
-                    thinking={"type": "enabled", "budget_tokens": 10000}
+                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    retries=4,
+                    base_delay=5,
                 )
                 analysis = None
                 for block in message.content:
@@ -2382,6 +2384,8 @@ def run_live_judgment_replay(per_type=25):
             except Exception as e:
                 errors += 1
                 print(f"Replay signal {n} error: {e}")
+
+            time.sleep(1.5)  # pace requests -- reduces the chance of hitting a rate limit in the first place, especially right after another heavy run
 
             if (n + 1) % 25 == 0:
                 est_cost_so_far = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)

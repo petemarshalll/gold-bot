@@ -20,6 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
 load_dotenv()
 
@@ -925,6 +926,330 @@ def get_learned_rules():
             return f.read()
     except FileNotFoundError:
         return "No learned rules yet — system will develop rules after first self-review."
+
+# ============================================================
+# POINT-IN-TIME HISTORICAL CONTEXT (for the sampled live-judgment
+# replay). Every function here is explicitly parametrized by a
+# historical timestamp/dataset — none of them touch datetime.now()
+# or any live global state (KEY_LEVELS, learned_rules.txt, etc).
+# That's deliberate: the live equivalents of these functions read
+# "right now", which would leak future information into a historical
+# analysis and make the replay's results meaningless.
+# ============================================================
+def get_session_at(hour):
+    if 22 <= hour or hour < 7:
+        return "Asian Session", "low liquidity — be cautious", False
+    elif 7 <= hour < 9:
+        return "London Open Killzone", "HIGH PROBABILITY WINDOW — institutional orders firing", True
+    elif 9 <= hour < 12:
+        return "London Session", "good activity — valid setups", True
+    elif 12 <= hour < 14:
+        return "New York Open Killzone", "HIGH PROBABILITY WINDOW — institutional orders firing", True
+    elif 14 <= hour < 17:
+        return "New York Session", "high volatility — valid setups", True
+    elif 17 <= hour < 20:
+        return "London Close", "watch for reversals and stop hunts", False
+    else:
+        return "Dead Zone", "NY close — avoid new trades", False
+
+
+def get_news_risk_at(hour, minute, weekday):
+    high_risk_times = [(13, 30), (15, 0), (12, 0)]
+    for risk_hour, risk_minute in high_risk_times:
+        time_diff = abs((hour * 60 + minute) - (risk_hour * 60 + risk_minute))
+        if time_diff <= 30:
+            return True, f"High impact news window — within 30 mins of {risk_hour}:{risk_minute:02d} UTC"
+    if weekday == 4 and 13 <= hour <= 14:
+        return True, "NFP Friday risk window — avoid new trades"
+    return False, "No major news risk detected"
+
+
+def get_hour_quality_at(hour):
+    best_hours = [21, 22, 23]
+    worst_hours = [3, 6, 14]
+    if hour in best_hours:
+        return "OPTIMAL", f"Hour {hour}:00 UTC historically shows 55-56% win rate — weight signals higher"
+    elif hour in worst_hours:
+        return "POOR", f"Hour {hour}:00 UTC historically shows 44-45% win rate — reduce confidence"
+    else:
+        return "NORMAL", f"Hour {hour}:00 UTC — standard win rate expected"
+
+
+def get_dxy_bias_at(dxy_df, timestamp):
+    """Same logic as get_dxy_bias(), but using only DXY data at or
+    before `timestamp` — never data from after it."""
+    try:
+        visible = dxy_df[dxy_df.index <= timestamp]
+        if len(visible) < 5:
+            return "UNKNOWN", "DXY insufficient historical data", "NEUTRAL"
+        closes = visible['Close'].values
+        current = float(closes[-1])
+        previous = float(closes[-5])
+        change_pct = ((current - previous) / previous) * 100
+        if change_pct > 0.15:
+            return "BULLISH", f"DXY rising +{change_pct:.2f}% — BEARISH for gold", "BEARISH"
+        elif change_pct < -0.15:
+            return "BEARISH", f"DXY falling {change_pct:.2f}% — BULLISH for gold", "BULLISH"
+        else:
+            return "NEUTRAL", f"DXY flat ({change_pct:.2f}%) — no strong gold bias", "NEUTRAL"
+    except Exception as e:
+        return "UNKNOWN", f"DXY historical check failed: {str(e)}", "NEUTRAL"
+
+
+def get_premium_discount_at(gold_df, signal_index, price, lookback_candles=240):
+    """Same concept as get_premium_discount(), but the dealing range
+    is a trailing window ending at the signal itself (roughly 10 days
+    of hourly candles), never the live global KEY_LEVELS and never
+    including any candle after the signal."""
+    try:
+        start = max(0, signal_index - lookback_candles)
+        window = gold_df.iloc[start:signal_index + 1]
+        high = float(window['High'].max())
+        low = float(window['Low'].min())
+        price = float(price)
+        if price > high:
+            high = price
+        if price < low:
+            low = price
+        midpoint = (high + low) / 2
+        percentage = ((price - low) / (high - low)) * 100 if high != low else 50.0
+        zone = "PREMIUM" if price > midpoint else "DISCOUNT"
+        advice = "price is expensive — favour shorts, be cautious on longs" if zone == "PREMIUM" else "price is cheap — favour longs, be cautious on shorts"
+        return zone, round(percentage, 1), advice, high, low
+    except Exception:
+        return "UNKNOWN", 0, "unable to calculate", price, price
+
+
+def get_key_levels_at(gold_df, signal_index, lookback_candles=240):
+    """Builds a KEY_LEVELS-style dict from a trailing historical
+    window only, to feed the historical prompt instead of reading
+    the live global KEY_LEVELS (which reflects today, not the
+    signal's actual point in time)."""
+    start = max(0, signal_index - lookback_candles)
+    window = gold_df.iloc[start:signal_index + 1]
+    daily_window = gold_df.iloc[max(0, signal_index - 24):signal_index + 1]
+    return {
+        "weekly_high": round(float(window['High'].max()), 2),
+        "weekly_low": round(float(window['Low'].min()), 2),
+        "major_resistance": round(float(window['High'].max()), 2),
+        "major_support": round(float(window['Low'].min()), 2),
+        "daily_high": round(float(daily_window['High'].max()), 2),
+        "daily_low": round(float(daily_window['Low'].min()), 2),
+    }
+
+
+def build_historical_prompt(alert_data, recent_context, session_name, session_desc, is_killzone,
+                             zone, zone_pct, zone_advice, news_risk, news_msg, historical_key_levels,
+                             timestamp_str, dxy_direction="UNKNOWN", dxy_desc="DXY data unavailable"):
+    """
+    Same structure and headers as analyse_with_claude()'s live prompt,
+    but built entirely from explicit historical values — no reference
+    to datetime.now(), live KEY_LEVELS, or get_learned_rules() (rules
+    learned from later performance would contaminate an earlier
+    historical judgment).
+    """
+    killzone_text = "✅ YES — weight this signal higher" if is_killzone else "❌ NO — standard session, normal weighting"
+    levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in historical_key_levels.items()])
+    return f"""
+You are an expert XAUUSD (Gold) trader with 20 years experience in Smart Money Concepts (SMC).
+A live market alert has fired. Analyse it thoroughly and give a clear trading assessment.
+
+## LIVE ALERT
+- Alert Type: {alert_data.get('type', 'Unknown')}
+- Current Price: {alert_data.get('price', 'Unknown')}
+- Candle High: {alert_data.get('high', 'Unknown')}
+- Candle Low: {alert_data.get('low', 'Unknown')}
+- Timeframe: {alert_data.get('timeframe', '15m')}
+- Time: {timestamp_str}
+
+## SESSION CONTEXT
+- Session: {session_name}
+- Conditions: {session_desc}
+- Inside Killzone: {killzone_text}
+
+## PREMIUM / DISCOUNT
+- Zone: {zone} ({zone_pct}% of dealing range)
+- Implication: {zone_advice}
+
+## KEY LEVELS THIS WEEK
+{levels_text}
+
+## NEWS RISK
+- {news_msg}
+
+## DXY CORRELATION
+- {dxy_desc}
+- Implication: {"DXY confirms bearish gold bias" if dxy_direction == "BULLISH" else "DXY confirms bullish gold bias" if dxy_direction == "BEARISH" else "No directional confluence from DXY"}
+
+## RECENT ALERT HISTORY
+{recent_context if recent_context else "No prior alerts this session"}
+
+## DRAWDOWN STATUS
+Normal mode — standard confidence thresholds apply
+
+## LEARNED RULES FROM PAST PERFORMANCE
+No learned rules available for this historical point in time.
+
+## YOUR ANALYSIS — use exactly these headers:
+
+**SETUP VALIDITY**
+Is this a genuine SMC setup or noise? 2-3 sentences max.
+
+**CONFLUENCE SCORE**
+Rate out of 10:
+- Killzone alignment (2 pts)
+- Premium/Discount alignment (2 pts)
+- Key level proximity (2 pts)
+- Timeframe alignment (2 pts)
+- Clean structure (2 pts)
+
+**TRADE DIRECTION**
+Long or Short? One sentence reason.
+
+**ENTRY ZONE**
+One line — specific price zone only.
+
+**STOP LOSS**
+One line — specific level only.
+
+**TARGET**
+One line — primary target only.
+
+**RISK:REWARD**
+One line — Entry / SL / TP / RR ratio.
+
+**CONFIDENCE LEVEL**
+One line — LOW / MEDIUM / HIGH and single reason.
+
+**AVOID IF**
+One line — single most important reason only.
+
+Total response must be under 200 words. Every section one line maximum.
+"""
+
+
+def derive_trade_decision(analysis, alert_type, entry_price):
+    """
+    Exact copy of the live decision logic from process_webhook_alert
+    (SL/TP extraction, direction-from-SL/TP, valid_trade check,
+    entry-zone-actionability check) — deliberately duplicated rather
+    than refactored out of the live webhook path tonight, to avoid
+    touching live-critical code again this late in the session. If
+    the live logic changes later, this copy needs updating to match.
+    """
+    direction = "SHORT" if "BEARISH" in alert_type else "LONG"
+    stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
+    target_price = entry_price * 0.99 if direction == "SHORT" else entry_price * 1.01
+
+    sl_patterns = [r'Stop(?:\s+Loss)?[:\s]+(\d+\.?\d*)', r'SL[:\s]+(\d+\.?\d*)']
+    for pattern in sl_patterns:
+        match = re.search(pattern, analysis, re.IGNORECASE)
+        if match:
+            extracted = float(match.group(1))
+            if 3000 < extracted < 5500:
+                stop_price = extracted
+                break
+
+    tp_patterns = [r'Target(?:\s+1)?[:\s]+(\d+\.?\d*)', r'TP[:\s]+(\d+\.?\d*)']
+    for pattern in tp_patterns:
+        match = re.search(pattern, analysis, re.IGNORECASE)
+        if match:
+            extracted = float(match.group(1))
+            if 3000 < extracted < 5500:
+                target_price = extracted
+                break
+
+    if target_price > stop_price:
+        direction = "LONG"
+    elif target_price < stop_price:
+        direction = "SHORT"
+    else:
+        direction = "LONG"
+
+    confidence = extract_confidence(analysis)
+    if "FVG" in alert_type and confidence == "LOW":
+        confidence = "MEDIUM"
+    if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
+        confidence = "MEDIUM"
+
+    valid_trade = False
+    if direction == "LONG" and target_price > entry_price > stop_price:
+        valid_trade = True
+    elif direction == "SHORT" and target_price < entry_price < stop_price:
+        valid_trade = True
+
+    entry_zone = extract_entry_zone(analysis)
+    entry_zone_reached = True
+    if entry_zone:
+        zone_low, zone_high = entry_zone
+        buffer = entry_price * 0.003
+        if not (zone_low - buffer <= entry_price <= zone_high + buffer):
+            entry_zone_reached = False
+
+    return {
+        "confidence": confidence,
+        "direction": direction,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "valid_trade": valid_trade,
+        "entry_zone_reached": entry_zone_reached,
+        "would_log": confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached,
+    }
+
+
+def detect_raw_signals(gold_df):
+    """
+    Same pattern-detection as detect_and_simulate_signals(), but
+    returns only the detected signal locations (index, type,
+    direction, price, high, low) without running the mechanical
+    entry/stop/target simulation — the replay uses Claude's own
+    stated entry/stop/target instead of the fixed 1:2 assumption.
+    """
+    detected_signals = []
+    for i in range(3, len(gold_df) - 10):
+        candle = gold_df.iloc[i]
+        prev2 = gold_df.iloc[i-2]
+        high = float(candle['High'])
+        low = float(candle['Low'])
+        close = float(candle['Close'])
+        if float(prev2['Low']) > high:
+            detected_signals.append({"index": i, "type": "BEARISH_FVG", "direction": "SHORT", "price": close, "high": high, "low": low})
+        if float(prev2['High']) < low:
+            detected_signals.append({"index": i, "type": "BULLISH_FVG", "direction": "LONG", "price": close, "high": high, "low": low})
+        lookback_high = float(gold_df.iloc[i-10:i]['High'].max())
+        if high > lookback_high and close < lookback_high:
+            detected_signals.append({"index": i, "type": "BEARISH_SWEEP", "direction": "SHORT", "price": close, "high": high, "low": low})
+        lookback_low = float(gold_df.iloc[i-10:i]['Low'].min())
+        if low < lookback_low and close > lookback_low:
+            detected_signals.append({"index": i, "type": "BULLISH_SWEEP", "direction": "LONG", "price": close, "high": high, "low": low})
+    return detected_signals
+
+
+def stratified_sample_signals(gold_df, per_type=50, seed=42):
+    """
+    Detects every signal across the full dataset, then samples
+    `per_type` of each signal type, evenly spaced across the whole
+    time range (not clustered at the start, end, or wherever signals
+    happen to be densest) — so the sample represents the full 2
+    years, not just one period of it.
+    """
+    all_signals = detect_raw_signals(gold_df)
+    by_type = {}
+    for s in all_signals:
+        by_type.setdefault(s["type"], []).append(s)
+
+    sampled = []
+    for sig_type, sigs in by_type.items():
+        sigs_sorted = sorted(sigs, key=lambda s: s["index"])
+        n = len(sigs_sorted)
+        if n <= per_type:
+            sampled.extend(sigs_sorted)
+        else:
+            positions = np.linspace(0, n - 1, per_type)
+            picked_indices = sorted(set(int(round(p)) for p in positions))
+            sampled.extend([sigs_sorted[i] for i in picked_indices])
+    sampled.sort(key=lambda s: s["index"])
+    return sampled
 
 # ============================================================
 # MAIN CLAUDE ANALYSIS
@@ -1880,6 +2205,185 @@ def backtest_endpoint():
     thread = threading.Thread(target=run_backtest)
     thread.start()
     return jsonify({"status": "backtest started", "note": "runs in the background — results (including any error) will be sent to Telegram in roughly 30-90 seconds"})
+
+
+@app.route('/replay-sample', methods=['GET'])
+def replay_sample_endpoint():
+    per_type = request.args.get('per_type', default=25, type=int)
+    thread = threading.Thread(target=run_live_judgment_replay, args=(per_type,))
+    thread.start()
+    est_calls = per_type * 4
+    return jsonify({
+        "status": "replay started",
+        "sample_size": est_calls,
+        "note": f"makes ~{est_calls} REAL Claude API calls (real cost — see Telegram for a running estimate). This will take roughly {est_calls * 8 // 60}-{est_calls * 15 // 60} minutes, not seconds. Add ?per_type=N to change the sample size (default 25/type, 100 total)."
+    })
+
+
+# Sonnet pricing used for the live cost estimate shown in Telegram.
+# Verify against current rates at https://claude.com/pricing before
+# relying on this for budgeting — pricing can change.
+REPLAY_INPUT_COST_PER_M = 3.00
+REPLAY_OUTPUT_COST_PER_M = 15.00
+
+
+def run_live_judgment_replay(per_type=25):
+    """
+    Samples signals spread across the full 2-year history and runs
+    each one through the REAL live Claude analysis (same prompt
+    structure, same model, same extended thinking budget as the live
+    bot), using only point-in-time historical context so nothing from
+    after each signal leaks into its own analysis. This tests the
+    actual question the raw backtest can't answer: does Claude's live
+    judgment (confidence, confluence, entry-zone gating) turn the flat
+    ~33% raw baseline into something better — or not.
+
+    This makes real, billed API calls. Cost is tracked and reported
+    from actual token usage, not just estimated in advance.
+    """
+    try:
+        est_calls = per_type * 4
+        send_telegram(f"🧪 *Live-judgment replay started*\nSampling ~{est_calls} signals spread across 2 years, running each through the real live Claude analysis with point-in-time historical context (no lookahead). This makes real API calls — expect roughly {est_calls * 8 // 60}-{est_calls * 15 // 60} minutes and a real, small charge to your Anthropic account. Progress updates every 25 signals.")
+
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        if gold.empty:
+            send_telegram("⚠️ Replay error: no gold price data returned")
+            return
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+
+        dxy = yf.download('DX-Y.NYB', period='2y', interval='1h', progress=False, timeout=20)
+        if not dxy.empty:
+            if isinstance(dxy.columns, pd.MultiIndex):
+                dxy.columns = [col[0] for col in dxy.columns]
+            dxy = dxy.dropna(subset=['Close'])
+
+        all_raw_signals = detect_raw_signals(gold)
+        sample = stratified_sample_signals(gold, per_type=per_type)
+        send_telegram(f"📊 {len(gold)} candles loaded, {len(all_raw_signals)} total signals detected, sampled {len(sample)} spread across the full period. Starting analysis...")
+
+        claude_logged = []
+        claude_skipped_gate = 0
+        claude_inconclusive = 0
+        baseline_results = []
+        errors = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        RISK_REWARD = RISK_REWARD_TARGET
+        BUFFER = BUFFER_PCT
+
+        for n, sig in enumerate(sample):
+            i = sig["index"]
+            sig_type = sig["type"]
+            direction = sig["direction"]
+            price = sig["price"]
+            high = sig["high"]
+            low = sig["low"]
+            timestamp = gold.index[i]
+
+            try:
+                # Point-in-time historical context only.
+                session_name, session_desc, is_killzone = get_session_at(timestamp.hour)
+                news_risk, news_msg = get_news_risk_at(timestamp.hour, timestamp.minute, timestamp.weekday())
+                zone, zone_pct, zone_advice, _, _ = get_premium_discount_at(gold, i, price)
+                historical_key_levels = get_key_levels_at(gold, i)
+                if not dxy.empty:
+                    dxy_direction, dxy_desc, dxy_implication = get_dxy_bias_at(dxy, timestamp)
+                else:
+                    dxy_direction, dxy_desc, dxy_implication = "UNKNOWN", "DXY data unavailable", "NEUTRAL"
+
+                prior = [s for s in all_raw_signals if s["index"] < i][-5:]
+                context_lines = []
+                for p in prior:
+                    moved = price - p["price"]
+                    context_lines.append(f"- {gold.index[p['index']].strftime('%H:%M UTC')}: {p['type']} at {round(p['price'],2)} — price has since moved {abs(moved):.1f}pts {'up' if moved>0 else 'down' if moved<0 else 'flat'}")
+                recent_context = "\n".join(context_lines)
+
+                alert_data = {"type": sig_type, "price": price, "high": high, "low": low, "timeframe": "15"}
+                prompt = build_historical_prompt(
+                    alert_data, recent_context, session_name, session_desc, is_killzone,
+                    zone, zone_pct, zone_advice, news_risk, news_msg, historical_key_levels,
+                    timestamp.strftime('%H:%M UTC %d %b %Y'), dxy_direction, dxy_desc
+                )
+
+                message = call_claude(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=16000,
+                    thinking={"type": "enabled", "budget_tokens": 10000}
+                )
+                analysis = None
+                for block in message.content:
+                    if block.type == "text":
+                        analysis = block.text
+                        break
+                if analysis is None:
+                    errors += 1
+                    continue
+
+                usage = getattr(message, 'usage', None)
+                if usage:
+                    total_input_tokens += getattr(usage, 'input_tokens', 0)
+                    total_output_tokens += getattr(usage, 'output_tokens', 0)
+
+                decision = derive_trade_decision(analysis, sig_type, price)
+
+                if decision["would_log"]:
+                    outcome = simulate_backtest_trade(gold, i, decision["direction"], price, decision["stop_price"], decision["target_price"])
+                    if outcome is not None:
+                        claude_logged.append({"type": sig_type, "outcome": outcome, "confidence": decision["confidence"]})
+                    else:
+                        claude_inconclusive += 1
+                else:
+                    claude_skipped_gate += 1
+
+                # Mechanical baseline on this EXACT same signal, for a direct apples-to-apples comparison.
+                buffer = price * BUFFER
+                if direction == "SHORT":
+                    b_stop = high + buffer
+                    b_target = price - (b_stop - price) * RISK_REWARD
+                else:
+                    b_stop = low - buffer
+                    b_target = price + (price - b_stop) * RISK_REWARD
+                b_outcome = simulate_backtest_trade(gold, i, direction, price, b_stop, b_target)
+                if b_outcome is not None:
+                    baseline_results.append(b_outcome)
+
+            except Exception as e:
+                errors += 1
+                print(f"Replay signal {n} error: {e}")
+
+            if (n + 1) % 25 == 0:
+                est_cost_so_far = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)
+                send_telegram(f"⏳ {n + 1}/{len(sample)} processed | {len(claude_logged)} logged by Claude so far | est. cost so far: ${est_cost_so_far:.2f}")
+
+        total_cost = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)
+
+        baseline_wins = len([o for o in baseline_results if o == 'WIN'])
+        baseline_wr = round(baseline_wins / len(baseline_results) * 100, 1) if baseline_results else None
+
+        claude_wins = len([c for c in claude_logged if c["outcome"] == 'WIN'])
+        claude_wr = round(claude_wins / len(claude_logged) * 100, 1) if claude_logged else None
+
+        report = f"""
+🧪 *Live-Judgment Replay Report*
+_{datetime.utcnow().strftime('%d %b %Y')}_
+
+Sampled: {len(sample)} signals spread across 2 years | Errors/skipped: {errors}
+Real API cost incurred: ${total_cost:.2f} ({total_input_tokens:,} input + {total_output_tokens:,} output tokens)
+
+*Raw baseline* (same {len(baseline_results)} resolved signals, mechanical 1:2 R:R, no filtering):
+Win rate: {f"{baseline_wr}%" if baseline_wr is not None else "n/a"}
+
+*Claude-filtered* ({len(claude_logged)} of {len(sample)} signals Claude would have actually logged, using Claude's own stop/target — {claude_skipped_gate} skipped by confidence/entry-zone gating, {claude_inconclusive} logged but never resolved stop/target within the lookahead window):
+Win rate: {f"{claude_wr}%" if claude_wr is not None else "n/a — too few logged to be meaningful"}
+
+_This uses point-in-time historical context only — no live KEY_LEVELS, no learned rules from later performance, DXY computed only from data available at each signal's actual moment. If Claude-filtered beats the raw baseline here, that's genuine early evidence its judgment adds value — not proof, and still no substitute for real accumulating live trades, but a real signal worth taking seriously. If it doesn't beat the baseline, that's equally real and worth taking seriously in the other direction._
+"""
+        send_telegram(report)
+    except Exception as e:
+        error_msg = f"⚠️ Replay error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
 
 
 @app.route('/backtest-validate', methods=['GET'])

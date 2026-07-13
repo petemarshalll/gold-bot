@@ -58,6 +58,30 @@ daily_alert_count = 0
 scheduler = None
 
 # ============================================================
+# VERSION TAGGING
+# Every trade (real and shadow) stores which version of the bot
+# produced it, so results stay comparable across future changes
+# instead of silently mixing data generated under different logic.
+# Bump this whenever a change could meaningfully affect trade
+# decisions (confidence gating, entry logic, risk sizing, etc).
+# ============================================================
+BOT_VERSION = "1.0.0"
+
+# ============================================================
+# SHADOW TRACKING
+# Tracks the outcome of alerts that DIDN'T become real trades —
+# rejected for low confidence, or because price never reached the
+# stated entry zone — but where Claude gave real, extractable
+# stop/target numbers. Kept completely separate from real trades:
+# separate storage, separate monitoring, never touches daily_pnl,
+# total_pnl, current_balance, or drawdown_protection. An explicit
+# "No trade" / N/A response has nothing to test and is correctly
+# never tracked here.
+# ============================================================
+shadow_trades = []
+active_shadow_trades = {}
+
+# ============================================================
 # PROP FIRM RULES
 # ============================================================
 PROP_FIRM_RULES = {
@@ -96,6 +120,8 @@ def save_state():
             "key_levels": KEY_LEVELS,
             "paper_trades": paper_trades,
             "active_trades": active_trades,
+            "shadow_trades": shadow_trades,
+            "active_shadow_trades": active_shadow_trades,
             "daily_pnl": daily_pnl,
             "total_pnl": total_pnl,
             "current_balance": current_balance,
@@ -115,13 +141,15 @@ def save_state():
 def load_state():
     global KEY_LEVELS, paper_trades, active_trades, daily_pnl, total_pnl
     global current_balance, trading_days, consecutive_losses, last_trading_day
-    global last_pnl_reset_day, daily_alert_count
+    global last_pnl_reset_day, daily_alert_count, shadow_trades, active_shadow_trades
     try:
         with open(data_path('bot_state.json'), 'r') as f:
             state = json.load(f)
         KEY_LEVELS.update(state.get('key_levels', {}))
         paper_trades = state.get('paper_trades', [])
         active_trades = state.get('active_trades', {})
+        shadow_trades = state.get('shadow_trades', [])
+        active_shadow_trades = state.get('active_shadow_trades', {})
         daily_pnl = state.get('daily_pnl', 0)
         total_pnl = state.get('total_pnl', 0)
         current_balance = state.get('current_balance', 10000)
@@ -139,7 +167,7 @@ def load_state():
         # restart can't show a misleading "OFF" status when the
         # underlying loss streak actually hasn't cleared.
         check_drawdown_protection()
-        print(f"State loaded — {len(paper_trades)} trades, balance ${current_balance}")
+        print(f"State loaded — {len(paper_trades)} trades, {len(shadow_trades)} shadow trades, balance ${current_balance}")
     except FileNotFoundError:
         print("No saved state found — starting fresh")
     except Exception as e:
@@ -545,7 +573,8 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
         "stop": float(stop),
         "target": float(target),
         "confidence": confidence,
-        "result": "OPEN"
+        "result": "OPEN",
+        "bot_version": BOT_VERSION,
     }
     # Extra market context at the moment the trade was logged — session,
     # killzone, premium/discount zone, DXY confluence, confluence score
@@ -561,6 +590,83 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
     except Exception as e:
         print(f"Paper trade log error: {e}")
     return trade_id
+
+
+def log_shadow_trade(alert_type, price, direction, entry, stop, target, confidence, rejection_reason, context=None):
+    """
+    Records an alert that did NOT become a real trade, but where
+    Claude gave real, extractable stop/target numbers — so its
+    outcome can still be tracked and learned from. Completely
+    separate storage from real trades; never touches daily_pnl,
+    total_pnl, current_balance, or drawdown_protection.
+    """
+    trade_id = f"SHADOW_{alert_type}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+    trade = {
+        "id": trade_id,
+        "time": datetime.utcnow().strftime('%H:%M UTC'),
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "type": alert_type,
+        "price": price,
+        "direction": direction,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "confidence": confidence,
+        "rejection_reason": rejection_reason,
+        "result": "OPEN",
+        "bot_version": BOT_VERSION,
+    }
+    if context:
+        trade.update(context)
+    shadow_trades.append(trade)
+    active_shadow_trades[trade_id] = trade
+    try:
+        with open(data_path('shadow_trades.json'), 'w') as f:
+            json.dump(shadow_trades, f, indent=2)
+    except Exception as e:
+        print(f"Shadow trade log error: {e}")
+    return trade_id
+
+
+def monitor_shadow_trades(gold_df):
+    """
+    Wick-aware monitoring for shadow trades, reusing the exact same
+    scan_candles_for_hit() logic already validated for real trades —
+    that function is pure (reads only the trade dict and candle data,
+    never touches global state), so it's safe to reuse here unchanged.
+    Computes pnl/r_multiple independently for each shadow trade
+    without ever calling apply_trade_pnl(), which is what guarantees
+    this can never affect real balance, daily_pnl, total_pnl, or
+    drawdown_protection.
+    """
+    trades_to_close = []
+    for trade_id, trade in list(active_shadow_trades.items()):
+        if trade.get('result') != 'OPEN':
+            continue
+        hit_type, hit_price, hit_time = scan_candles_for_hit(trade, gold_df)
+        if hit_type is None:
+            continue
+        account = PROP_FIRM_RULES["account_size"]
+        risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+        if hit_type == 'WIN':
+            points = abs(trade['target'] - trade['entry'])
+            stop_distance = abs(trade['entry'] - trade['stop'])
+            dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+            pnl = dollar_per_point * points
+        else:
+            pnl = -risk_amount
+        trade['result'] = hit_type
+        trade['pnl'] = round(pnl, 2)
+        trade['r_multiple'] = round(pnl / risk_amount, 2) if risk_amount > 0 else 0
+        trades_to_close.append(trade_id)
+    for trade_id in trades_to_close:
+        del active_shadow_trades[trade_id]
+    if trades_to_close:
+        try:
+            with open(data_path('shadow_trades.json'), 'w') as f:
+                json.dump(shadow_trades, f, indent=2)
+        except Exception as e:
+            print(f"Shadow trade update error: {e}")
 
 # ============================================================
 # CONFLUENCE SCORE EXTRACTION
@@ -1464,6 +1570,42 @@ def process_webhook_alert(data):
         if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
             confidence = "MEDIUM"
 
+        # Shadow tracking: record what WOULD have happened for every
+        # alert that does NOT become a real trade — including the two
+        # early-exit cases right below (drawdown-skip, news-suppress)
+        # — as long as Claude gave real, extractable stop/target
+        # numbers. An explicit "No trade"/N/A response has nothing to
+        # test and is correctly left untracked, not force-fit with
+        # fabricated levels. Wrapped defensively so a bug here can
+        # never block or alter the real trade path below.
+        try:
+            shadow_entry_price = float(data.get('price', 0))
+            shadow_decision = derive_trade_decision(analysis, alert_type, shadow_entry_price)
+            if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not shadow_decision["would_log"]:
+                if shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
+                    rejection_reason = "LOW_CONFIDENCE"
+                elif not shadow_decision["entry_zone_reached"]:
+                    rejection_reason = "ENTRY_ZONE_NOT_REACHED"
+                else:
+                    rejection_reason = "OTHER"
+                shadow_context = {
+                    "session": session_name,
+                    "killzone": is_killzone,
+                    "zone": zone,
+                    "zone_pct": zone_pct,
+                    "dxy_direction": dxy_direction,
+                    "dxy_implication": dxy_implication,
+                    "news_risk": news_risk,
+                    "spread_risk": spread_risk,
+                    "hour_quality": hour_quality,
+                    "confluence_score": extract_confluence_score(analysis),
+                }
+                log_shadow_trade(alert_type, data.get('price'), shadow_decision["direction"], shadow_entry_price,
+                                  shadow_decision["stop_price"], shadow_decision["target_price"],
+                                  shadow_decision["confidence"], rejection_reason, context=shadow_context)
+        except Exception as e:
+            print(f"Shadow tracking error (non-fatal, real trade path unaffected): {e}")
+
         if drawdown_active and confidence == "LOW":
             log_to_csv(alert_type, data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
             return
@@ -1910,7 +2052,7 @@ def update_levels():
 @app.route('/monitor-trades', methods=['GET'])
 def monitor_trades_endpoint():
     try:
-        if not active_trades:
+        if not active_trades and not active_shadow_trades:
             return jsonify({"status": "no active trades"})
         gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
         if gold.empty:
@@ -1920,11 +2062,14 @@ def monitor_trades_endpoint():
             print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this monitor-trades cycle")
             return jsonify({"status": "price data stale, skipped"})
         current_price = round(float(gold['Close'].iloc[-1]), 2)
-        monitor_active_trades(current_price)
-        # Catch anything the quick check above missed — a stop or
-        # target briefly touched (wicked through) between polls.
-        thorough_scan_active_trades(gold)
-        return jsonify({"status": "checked", "current_price": current_price})
+        if active_trades:
+            monitor_active_trades(current_price)
+            # Catch anything the quick check above missed — a stop or
+            # target briefly touched (wicked through) between polls.
+            thorough_scan_active_trades(gold)
+        if active_shadow_trades:
+            monitor_shadow_trades(gold)
+        return jsonify({"status": "checked", "current_price": current_price, "shadow_trades_open": len(active_shadow_trades)})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2852,6 +2997,86 @@ def dashboard():
 </html>"""
 
 # ============================================================
+# COUNTERFACTUAL REPORT — "trades you didn't take"
+# Compares real trade performance against shadow-tracked rejected
+# alerts, broken down by why each one was rejected. Only shadow
+# trades where Claude gave real, extractable levels are included —
+# an explicit "No trade" response has nothing to test and is
+# correctly excluded rather than force-fit with fabricated numbers.
+# ============================================================
+@app.route('/counterfactual-report', methods=['GET'])
+def counterfactual_report_endpoint():
+    thread = threading.Thread(target=run_counterfactual_report)
+    thread.start()
+    return jsonify({"status": "counterfactual report started"})
+
+
+def run_counterfactual_report():
+    try:
+        try:
+            with open(data_path('shadow_trades.json'), 'r') as f:
+                shadow = json.load(f)
+        except FileNotFoundError:
+            shadow = []
+
+        closed_shadow = [t for t in shadow if t.get('result') in ('WIN', 'LOSS')]
+        open_shadow_count = len([t for t in shadow if t.get('result') == 'OPEN'])
+
+        if len(closed_shadow) < 5:
+            send_telegram(f"⚠️ Counterfactual report skipped — only {len(closed_shadow)} resolved shadow trades so far ({open_shadow_count} still tracking). Need at least 5.")
+            return
+
+        shadow_wins = len([t for t in closed_shadow if t['result'] == 'WIN'])
+        shadow_wr = round(shadow_wins / len(closed_shadow) * 100, 1)
+        shadow_avg_r = round(sum(t.get('r_multiple', 0) for t in closed_shadow) / len(closed_shadow), 2)
+
+        by_reason = {}
+        for t in closed_shadow:
+            reason = t.get('rejection_reason', 'UNKNOWN')
+            if reason not in by_reason:
+                by_reason[reason] = {"wins": 0, "losses": 0, "total_r": 0.0}
+            if t['result'] == 'WIN':
+                by_reason[reason]['wins'] += 1
+            else:
+                by_reason[reason]['losses'] += 1
+            by_reason[reason]['total_r'] += t.get('r_multiple', 0)
+
+        reason_summary = "\n".join([
+            f"- {reason}: {v['wins']}W/{v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100)}% win rate) | Avg R: {round(v['total_r']/(v['wins']+v['losses']), 2)}"
+            for reason, v in by_reason.items()
+        ])
+
+        try:
+            with open(data_path('paper_trades.json'), 'r') as f:
+                real_trades = json.load(f)
+        except FileNotFoundError:
+            real_trades = []
+        real_closed = [t for t in real_trades if t.get('result') in ('WIN', 'LOSS')]
+        real_wr = round(len([t for t in real_closed if t['result'] == 'WIN']) / len(real_closed) * 100, 1) if real_closed else None
+        real_avg_r = round(sum(t.get('r_multiple', 0) for t in real_closed) / len(real_closed), 2) if real_closed else None
+
+        report = f"""
+🔮 *Counterfactual Report — Trades You Didn't Take*
+_{datetime.utcnow().strftime('%d %b %Y')}_
+
+*Trades Taken:* {len(real_closed)} resolved | Win rate: {f"{real_wr}%" if real_wr is not None else "n/a"} | Avg R: {real_avg_r if real_avg_r is not None else "n/a"}
+
+*Trades Rejected — testable* (Claude gave real levels): {len(closed_shadow)} resolved | {open_shadow_count} still tracking
+Win rate: {shadow_wr}% | Avg R: {shadow_avg_r}
+
+*By rejection reason:*
+{reason_summary}
+
+_Only alerts where Claude gave a real, extractable stop and target are tracked here — an explicit "No trade" response has nothing to test and is correctly excluded, not force-fit with fabricated levels. Small samples per reason bucket limit how much confidence to place in any one row — read this as an early signal, not a verdict._
+"""
+        send_telegram(report)
+    except Exception as e:
+        error_msg = f"⚠️ Counterfactual report error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
+
+
+# ============================================================
 # DAILY HEARTBEAT
 # Sent once a day so silence in Telegram is never ambiguous between
 # "market's quiet" and "the bot is down". This is a plain function
@@ -2971,6 +3196,7 @@ if __name__ == '__main__':
     scheduler.add_job(func=run_in_context(monday_gap_analysis), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=run_in_context(auto_update_levels), trigger='cron', day_of_week='sun', hour=21, minute=0)
     scheduler.add_job(func=run_in_context(self_review), trigger='cron', day_of_week='sun', hour=19, minute=0)
+    scheduler.add_job(func=run_counterfactual_report, trigger='cron', day_of_week='sun', hour=19, minute=30, id='counterfactual_report')
     scheduler.add_job(func=run_in_context(check_entries), trigger='interval', minutes=5, id='entry_monitor')
     scheduler.add_job(func=run_in_context(monitor_trades_endpoint), trigger='interval', minutes=2, id='trade_monitor')
     scheduler.add_job(func=run_in_context(cot_report), trigger='cron', day_of_week='fri', hour=16, minute=0, id='cot_report')

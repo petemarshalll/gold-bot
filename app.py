@@ -715,6 +715,14 @@ def apply_trade_pnl(trade, result):
         pnl = -risk_amount
         consecutive_losses += 1
 
+    # Store the actual outcome magnitude on the trade record itself —
+    # not just result WIN/LOSS, but the real dollar pnl and R multiple
+    # achieved. Without this, self-review and any future analysis can
+    # see a trade won or lost, but never by how much — a 1.2R win and
+    # a 4.5R win are indistinguishable in the stored data otherwise.
+    trade['pnl'] = round(pnl, 2)
+    trade['r_multiple'] = round(pnl / risk_amount, 2) if risk_amount > 0 else 0
+
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     ensure_daily_reset()
     if last_trading_day != today_str:
@@ -2023,11 +2031,14 @@ def self_review():
         for trade in paper:
             t_type = trade.get('type', 'UNKNOWN')
             if t_type not in type_performance:
-                type_performance[t_type] = {"wins": 0, "losses": 0}
+                type_performance[t_type] = {"wins": 0, "losses": 0, "total_r": 0.0, "r_count": 0}
             if trade.get('result') == 'WIN':
                 type_performance[t_type]['wins'] += 1
             elif trade.get('result') == 'LOSS':
                 type_performance[t_type]['losses'] += 1
+            if trade.get('r_multiple') is not None:
+                type_performance[t_type]['total_r'] += trade['r_multiple']
+                type_performance[t_type]['r_count'] += 1
 
         high_conf = [t for t in paper if t.get('confidence') == 'HIGH']
         med_conf = [t for t in paper if t.get('confidence') == 'MEDIUM']
@@ -2045,7 +2056,8 @@ def self_review():
         non_kz_wr = round(non_kz_wins / (non_kz_wins + non_kz_losses) * 100, 1) if (non_kz_wins + non_kz_losses) > 0 else None
 
         type_summary = "\n".join([
-            f"- {k}: {v['wins']}W / {v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100) if v['wins']+v['losses'] > 0 else 0}% win rate)"
+            f"- {k}: {v['wins']}W / {v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100) if v['wins']+v['losses'] > 0 else 0}% win rate) | "
+            f"Avg R: {round(v['total_r']/v['r_count'], 2) if v['r_count'] > 0 else 'n/a'}"
             for k, v in type_performance.items()
         ])
 
@@ -2063,7 +2075,7 @@ def self_review():
         trades_summary = "\n".join([
             f"- {t['time']}: {t['type']} | Conf:{t['confidence']} | Score:{t.get('confluence_score', '-')}/10 | "
             f"KZ:{t.get('killzone', '-')} | DXY:{t.get('dxy_implication', '-')} | Zone:{t.get('zone', '-')} | "
-            f"Result:{t['result']}"
+            f"Result:{t['result']} | R:{t.get('r_multiple', '-')}"
             for t in paper[-20:]
         ])
 

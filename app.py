@@ -2520,7 +2520,23 @@ def run_live_judgment_replay(per_type=25):
                 if decision["would_log"]:
                     outcome = simulate_backtest_trade(gold, i, decision["direction"], price, decision["stop_price"], decision["target_price"])
                     if outcome is not None:
-                        claude_logged.append({"type": sig_type, "outcome": outcome, "confidence": decision["confidence"]})
+                        # Compute the real R multiple for THIS trade using
+                        # Claude's own stop/target, not the baseline's fixed
+                        # 1:2 assumption — win rate alone can't tell you if
+                        # a set of trades with mixed, Claude-chosen R:Rs
+                        # (seen ranging 1.6:1 to 7.5:1 in real live alerts)
+                        # is actually profitable.
+                        account = PROP_FIRM_RULES["account_size"]
+                        risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+                        stop_distance = abs(price - decision["stop_price"])
+                        if outcome == 'WIN':
+                            points = abs(decision["target_price"] - price)
+                            dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+                            trade_pnl = dollar_per_point * points
+                        else:
+                            trade_pnl = -risk_amount
+                        trade_r = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
+                        claude_logged.append({"type": sig_type, "outcome": outcome, "confidence": decision["confidence"], "r_multiple": trade_r})
                     else:
                         claude_inconclusive += 1
                 else:
@@ -2552,9 +2568,17 @@ def run_live_judgment_replay(per_type=25):
 
         baseline_wins = len([o for o in baseline_results if o == 'WIN'])
         baseline_wr = round(baseline_wins / len(baseline_results) * 100, 1) if baseline_results else None
+        # Baseline always uses the fixed 1:2 R:R, so expectancy is fully
+        # determined by win rate alone: (win% * 2) - (loss% * 1).
+        baseline_expectancy = round((baseline_wr / 100 * 2) - (1 - baseline_wr / 100), 2) if baseline_wr is not None else None
 
         claude_wins = len([c for c in claude_logged if c["outcome"] == 'WIN'])
         claude_wr = round(claude_wins / len(claude_logged) * 100, 1) if claude_logged else None
+        # Claude-filtered trades use whatever R:R Claude actually proposed
+        # per trade (seen ranging 1.6:1 to 7.5:1 live) -- win rate alone
+        # can't tell you if this is profitable, so this averages the real
+        # per-trade R multiple computed from Claude's own stop/target.
+        claude_avg_r = round(sum(c.get('r_multiple', 0) for c in claude_logged) / len(claude_logged), 2) if claude_logged else None
 
         report = f"""
 🧪 *Live-Judgment Replay Report*
@@ -2564,10 +2588,10 @@ Sampled: {len(sample)} signals spread across 2 years | Errors/skipped: {errors}
 Real API cost incurred: ${total_cost:.2f} ({total_input_tokens:,} input + {total_output_tokens:,} output tokens)
 
 *Raw baseline* (same {len(baseline_results)} resolved signals, mechanical 1:2 R:R, no filtering):
-Win rate: {f"{baseline_wr}%" if baseline_wr is not None else "n/a"}
+Win rate: {f"{baseline_wr}%" if baseline_wr is not None else "n/a"} | Expectancy: {f"{baseline_expectancy}R/trade" if baseline_expectancy is not None else "n/a"}
 
 *Claude-filtered* ({len(claude_logged)} of {len(sample)} signals Claude would have actually logged, using Claude's own stop/target — {claude_skipped_gate} skipped by confidence/entry-zone gating, {claude_inconclusive} logged but never resolved stop/target within the lookahead window):
-Win rate: {f"{claude_wr}%" if claude_wr is not None else "n/a — too few logged to be meaningful"}
+Win rate: {f"{claude_wr}%" if claude_wr is not None else "n/a — too few logged to be meaningful"} | Avg R: {f"{claude_avg_r}R/trade" if claude_avg_r is not None else "n/a"}
 
 _This uses point-in-time historical context only — no live KEY_LEVELS, no learned rules from later performance, DXY computed only from data available at each signal's actual moment. If Claude-filtered beats the raw baseline here, that's genuine early evidence its judgment adds value — not proof, and still no substitute for real accumulating live trades, but a real signal worth taking seriously. If it doesn't beat the baseline, that's equally real and worth taking seriously in the other direction._
 """
@@ -3117,7 +3141,7 @@ def heartbeat_endpoint():
 def health():
     return jsonify({
         "status": "✅ running",
-        "alerts_this_session": len(recent_alerts),
+        "alerts_this_session": daily_alert_count,
         "active_trades": len(active_trades),
         "paper_trades_logged": len(paper_trades),
         "drawdown_protection": drawdown_protection,

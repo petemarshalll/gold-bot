@@ -1581,8 +1581,17 @@ def process_webhook_alert(data):
         try:
             shadow_entry_price = float(data.get('price', 0))
             shadow_decision = derive_trade_decision(analysis, alert_type, shadow_entry_price)
-            if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not shadow_decision["would_log"]:
-                if shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
+            # derive_trade_decision() has no concept of drawdown state
+            # (it's also used for historical replay, where simulating a
+            # live, evolving drawdown streak wouldn't be meaningful) --
+            # so the drawdown rule is applied here instead, matching
+            # exactly what the live path enforces below.
+            blocked_by_drawdown = drawdown_active and shadow_decision["confidence"] != "HIGH"
+            would_actually_log = shadow_decision["would_log"] and not blocked_by_drawdown
+            if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not would_actually_log:
+                if blocked_by_drawdown:
+                    rejection_reason = "DRAWDOWN_PROTECTION"
+                elif shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
                     rejection_reason = "LOW_CONFIDENCE"
                 elif not shadow_decision["entry_zone_reached"]:
                     rejection_reason = "ENTRY_ZONE_NOT_REACHED"
@@ -1606,7 +1615,12 @@ def process_webhook_alert(data):
         except Exception as e:
             print(f"Shadow tracking error (non-fatal, real trade path unaffected): {e}")
 
-        if drawdown_active and confidence == "LOW":
+        # Matches the prompt's own stated rule ("DRAWDOWN PROTECTION
+        # ACTIVE — only flag if genuinely HIGH confidence") -- previously
+        # this only blocked LOW confidence, silently letting MEDIUM
+        # trades straight through during an active drawdown streak, even
+        # when Claude's own analysis said to skip it.
+        if drawdown_active and confidence != "HIGH":
             log_to_csv(alert_type, data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
             return
 

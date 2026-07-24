@@ -2256,15 +2256,17 @@ Performance by killzone status:
 Recent trades (Score = Claude's confluence score out of 10, KZ = was it inside a killzone, DXY = DXY implication at entry, Zone = premium/discount zone):
 {trades_summary if trades_summary else "No trades logged yet"}
 
+IMPORTANT — small sample caveat: with only {len(wins) + len(losses)} closed trades total, most subgroup splits above (by type, by killzone, by zone) are based on somewhere between 2 and 10 trades each. At this size, a 0% or 100% win rate in any one bucket is exactly what normal variance looks like, not proof that setup does or doesn't work — 3 losses in a row happens by chance alone roughly 1 time in 8 even for a genuinely profitable setup. State the actual N for every claim you make. Do NOT recommend suspending, hard-gating, or otherwise permanently restricting a setup type based on a bucket with fewer than 15-20 resolved trades — flag it as "worth watching" instead, and say so explicitly. Before finalizing, double-check that no individual trade (by its timestamp) is cited as evidence for two different or contradictory conclusions elsewhere in the same report.
+
 Provide:
 **WHAT IS WORKING** — best performing setups, and which session/killzone/DXY/zone conditions correlate with wins
 **WHAT IS NOT WORKING** — consistently losing setups, and which conditions correlate with losses
 **KEY PATTERN** — single most important finding, ideally one that combines alert type with session/killzone/DXY/confluence score
-**RECOMMENDED RULE CHANGES** — specific improvements
+**RECOMMENDED RULE CHANGES** — specific improvements, each labeled with the sample size it's based on
 **UPDATED TRADING RULES** — 3-5 rules for next week
 **NEXT WEEK FOCUS** — one priority
 
-Be direct and data driven.
+Be direct and data driven, but calibrate confidence to sample size — a pattern from 3 trades is an early hint worth tracking, not a rule worth enforcing.
 """
 
         message = call_claude(
@@ -2330,6 +2332,23 @@ def reject_rules():
             f.write("No pending rules")
         send_telegram(f"❌ *Rule Update Rejected*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nProposed changes discarded. Live rules unchanged.")
         return jsonify({"status": "rules rejected — live rules unchanged"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/reset-learned-rules', methods=['GET'])
+def reset_learned_rules():
+    """
+    Clears the currently ACTIVE learned rules back to empty. Distinct
+    from /reject-rules, which only discards a pending proposal that
+    hasn't been approved yet -- there was previously no way to undo
+    a rule set that had already been approved and applied.
+    """
+    try:
+        with open(data_path('learned_rules.txt'), 'w') as f:
+            f.write("No learned rules yet — system will develop rules after first self-review.")
+        send_telegram(f"🔄 *Learned Rules Reset*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nActive learned rules cleared back to empty. The system will build up new rules from scratch at the next self-review.")
+        return jsonify({"status": "learned rules reset to empty"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 

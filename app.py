@@ -800,8 +800,14 @@ def check_risk_cap_before_trade():
 def apply_trade_pnl(trade, result):
     """
     Converts a closed paper trade's points result into account-level
-    PnL using a fixed 1% account risk per trade (PROP_FIRM_RULES),
-    and updates daily_pnl / total_pnl / current_balance / trading_days /
+    PnL using the trade's OWN stored risk percentage — normally the
+    standard 1% (PROP_FIRM_RULES), but a reduced-risk drawdown trade
+    stores half that at logging time. Using the trade's own stored
+    value (rather than always reading the current global rate) matters
+    because a trade can close well after it opened, potentially after
+    drawdown status has changed — PnL must reflect what THIS trade was
+    actually risked at, not whatever the rate happens to be now.
+    Updates daily_pnl / total_pnl / current_balance / trading_days /
     consecutive_losses so /prop-status and drawdown protection reflect
     real trade outcomes instead of requiring a manual /update-pnl call.
     """
@@ -809,7 +815,8 @@ def apply_trade_pnl(trade, result):
     global consecutive_losses, last_trading_day, last_pnl_reset_day
 
     account = PROP_FIRM_RULES["account_size"]
-    risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+    risk_pct = trade.get('risk_pct', PROP_FIRM_RULES["max_loss_per_trade_pct"])
+    risk_amount = account * (risk_pct / 100)
     stop_distance = abs(trade['entry'] - trade['stop'])
     dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
 
@@ -1425,7 +1432,7 @@ A live market alert has fired. Analyse it thoroughly and give a clear trading as
 {recent_context if recent_context else "No prior alerts this session"}
 
 ## DRAWDOWN STATUS
-{"⚠️ DRAWDOWN PROTECTION ACTIVE — only flag if genuinely HIGH confidence" if drawdown_active else "Normal mode — standard confidence thresholds apply"}
+{"⚠️ DRAWDOWN PROTECTION ACTIVE — HIGH confidence trades size normally; MEDIUM confidence trades are still taken but automatically sized at half risk; LOW confidence is skipped entirely" if drawdown_active else "Normal mode — standard confidence thresholds apply"}
 
 ## LEARNED RULES FROM PAST PERFORMANCE
 {get_learned_rules()}
@@ -1581,17 +1588,8 @@ def process_webhook_alert(data):
         try:
             shadow_entry_price = float(data.get('price', 0))
             shadow_decision = derive_trade_decision(analysis, alert_type, shadow_entry_price)
-            # derive_trade_decision() has no concept of drawdown state
-            # (it's also used for historical replay, where simulating a
-            # live, evolving drawdown streak wouldn't be meaningful) --
-            # so the drawdown rule is applied here instead, matching
-            # exactly what the live path enforces below.
-            blocked_by_drawdown = drawdown_active and shadow_decision["confidence"] != "HIGH"
-            would_actually_log = shadow_decision["would_log"] and not blocked_by_drawdown
-            if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not would_actually_log:
-                if blocked_by_drawdown:
-                    rejection_reason = "DRAWDOWN_PROTECTION"
-                elif shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
+            if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not shadow_decision["would_log"]:
+                if shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
                     rejection_reason = "LOW_CONFIDENCE"
                 elif not shadow_decision["entry_zone_reached"]:
                     rejection_reason = "ENTRY_ZONE_NOT_REACHED"
@@ -1615,14 +1613,18 @@ def process_webhook_alert(data):
         except Exception as e:
             print(f"Shadow tracking error (non-fatal, real trade path unaffected): {e}")
 
-        # Matches the prompt's own stated rule ("DRAWDOWN PROTECTION
-        # ACTIVE — only flag if genuinely HIGH confidence") -- previously
-        # this only blocked LOW confidence, silently letting MEDIUM
-        # trades straight through during an active drawdown streak, even
-        # when Claude's own analysis said to skip it.
-        if drawdown_active and confidence != "HIGH":
+        # LOW confidence is never traded, drawdown or not -- unchanged.
+        if drawdown_active and confidence == "LOW":
             log_to_csv(alert_type, data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
             return
+
+        # During an active drawdown streak, MEDIUM confidence trades are
+        # no longer blocked outright -- they're allowed through, but at
+        # HALF the normal risk size, rather than either fully blocking
+        # (which was stalling real data collection for days at a time)
+        # or fully exposing at normal size (the original bug). HIGH
+        # confidence is unaffected either way.
+        reduced_risk_trade = drawdown_active and confidence == "MEDIUM"
 
         if news_risk and confidence != "HIGH":
             send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
@@ -1716,6 +1718,13 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
             risk_ok, risk_msg = check_risk_cap_before_trade()
             if risk_ok:
                 alert_time = datetime.utcnow().strftime('%H:%M UTC')
+                # Reduced-risk drawdown trades use half the normal risk
+                # percentage. Stored on the trade itself (not just used
+                # in the moment) so that if it closes later, PnL is
+                # correctly computed from what this SPECIFIC trade was
+                # actually opened at — not whatever the risk percentage
+                # or drawdown status happens to be by the time it closes.
+                risk_pct_for_trade = (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 2) if reduced_risk_trade else PROP_FIRM_RULES["max_loss_per_trade_pct"]
                 trade_context = {
                     "session": session_name,
                     "killzone": is_killzone,
@@ -1727,10 +1736,13 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     "spread_risk": spread_risk,
                     "hour_quality": hour_quality,
                     "confluence_score": confluence_score,
+                    "risk_pct": risk_pct_for_trade,
                 }
                 if entry_zone:
                     trade_context["entry_zone_low"] = entry_zone[0]
                     trade_context["entry_zone_high"] = entry_zone[1]
+                if reduced_risk_trade:
+                    send_telegram(f"⚠️ *Reduced-size trade* — MEDIUM confidence during active drawdown protection, taking this at half normal risk ({risk_pct_for_trade}% instead of {PROP_FIRM_RULES['max_loss_per_trade_pct']}%).")
                 log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time, context=trade_context)
             else:
                 print(risk_msg)

@@ -3074,7 +3074,7 @@ def dashboard():
 </html>"""
 
 # ============================================================
-# COUNTERFACTUAL REPORT — "trades you didn't take"
+# COUNTERFACTUAL REPORT —  "trades you didn't take"
 # Compares real trade performance against shadow-tracked rejected
 # alerts, broken down by why each one was rejected. Only shadow
 # trades where Claude gave real, extractable levels are included —

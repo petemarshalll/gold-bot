@@ -2441,7 +2441,7 @@ Be direct and data driven, but calibrate confidence to sample size — a pattern
 
         message = call_claude(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1800
+            max_tokens=3000
         )
         review = message.content[0].text
 

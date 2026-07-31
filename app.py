@@ -29,6 +29,11 @@ app = Flask(__name__)
 claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Shared secret the MT5 bridge script must send (X-Bridge-Secret header)
+# to poll /mt5/pending or report back via /mt5/ack. Set this on Railway
+# and on the VPS bridge's own config -- without it, anyone with the
+# Railway URL could read pending trade instructions or post fake acks.
+MT5_BRIDGE_SECRET = os.getenv("MT5_BRIDGE_SECRET")
 
 # ============================================================
 # PERSISTENT DATA DIRECTORY
@@ -80,6 +85,20 @@ BOT_VERSION = "1.0.0"
 # ============================================================
 shadow_trades = []
 active_shadow_trades = {}
+
+# ============================================================
+# MT5 BRIDGE QUEUE
+# Every trade that passes the SAME would_log gate as a normal paper
+# trade also gets dropped here for the Windows-VPS bridge script to
+# pick up and place on a real MT5 terminal. This is deliberately
+# additive only -- it reuses the exact decision Claude already made
+# for the paper trade (same confidence gate, same entry/stop/target),
+# rather than introducing any new logic that could disagree with it.
+# Status flow: PENDING -> DISPATCHED (served via GET, not yet
+# confirmed) -> PLACED (bridge confirmed a real ticket) or FAILED
+# (bridge reported an error, e.g. market closed, invalid symbol).
+# ============================================================
+mt5_pending_trades = {}
 
 # ============================================================
 # PROP FIRM RULES
@@ -172,6 +191,7 @@ def load_state():
         print("No saved state found — starting fresh")
     except Exception as e:
         print(f"State load error: {e}")
+    load_mt5_queue()
 
 # ============================================================
 # MARKET HOURS CHECK
@@ -584,12 +604,61 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
         trade.update(context)
     paper_trades.append(trade)
     active_trades[trade_id] = trade
+    queue_mt5_trade(trade)
     try:
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
     except Exception as e:
         print(f"Paper trade log error: {e}")
     return trade_id
+
+
+def save_mt5_queue():
+    try:
+        with open(data_path('mt5_queue.json'), 'w') as f:
+            json.dump(mt5_pending_trades, f, indent=2)
+    except Exception as e:
+        print(f"MT5 queue save error: {e}")
+
+
+def load_mt5_queue():
+    global mt5_pending_trades
+    try:
+        with open(data_path('mt5_queue.json'), 'r') as f:
+            mt5_pending_trades = json.load(f)
+    except FileNotFoundError:
+        mt5_pending_trades = {}
+    except Exception as e:
+        print(f"MT5 queue load error: {e}")
+
+
+def queue_mt5_trade(trade):
+    """
+    Adds a trade that already passed the normal would_log gate to the
+    MT5 bridge queue. Deliberately does NOT re-derive or re-check
+    confidence/validity here -- it reuses whatever log_paper_trade was
+    just called with, so this can never disagree with the paper-trade
+    decision. risk_pct is read the same way apply_trade_pnl() reads it,
+    so a reduced-risk trade during drawdown queues at the correct
+    (already-halved) size automatically.
+    """
+    risk_pct = trade.get('risk_pct', PROP_FIRM_RULES["max_loss_per_trade_pct"])
+    mt5_pending_trades[trade['id']] = {
+        "trade_id": trade['id'],
+        "status": "PENDING",
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "alert_type": trade['type'],
+        "direction": trade['direction'],
+        "entry": trade['entry'],
+        "stop": trade['stop'],
+        "target": trade['target'],
+        "confidence": trade['confidence'],
+        "risk_pct": risk_pct,
+        "ticket": None,
+        "fill_price": None,
+        "error": None,
+    }
+    save_mt5_queue()
 
 
 def log_shadow_trade(alert_type, price, direction, entry, stop, target, confidence, rejection_reason, context=None):
@@ -2108,6 +2177,87 @@ def monitor_trades_endpoint():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
+# MT5 BRIDGE
+# Polled by a small Python script running on a Windows VPS alongside
+# the actual MT5 terminal. Deliberately dumb on this side -- Railway
+# never decides WHAT to trade here, only exposes decisions Claude
+# already made via the normal would_log gate. All position sizing,
+# order placement, and SL/TP execution happens on the bridge/broker
+# side, not here.
+# ============================================================
+def check_bridge_secret():
+    if not MT5_BRIDGE_SECRET:
+        return False, "MT5_BRIDGE_SECRET not configured on the server"
+    provided = request.headers.get('X-Bridge-Secret', '')
+    if provided != MT5_BRIDGE_SECRET:
+        return False, "invalid or missing X-Bridge-Secret header"
+    return True, ""
+
+
+@app.route('/mt5/pending', methods=['GET'])
+def mt5_pending():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    to_return = []
+    for trade_id, entry in mt5_pending_trades.items():
+        if entry["status"] == "PENDING":
+            to_return.append(entry)
+            # Mark as dispatched immediately on read, not on ack --
+            # avoids the same trade being handed to the bridge twice
+            # just because it's slow to report back. If the bridge
+            # genuinely never places it (crash mid-flight), it stays
+            # DISPATCHED rather than silently retrying with real
+            # money -- a stuck trade is safer than a duplicated one.
+            entry["status"] = "DISPATCHED"
+            entry["dispatched_at"] = datetime.now(timezone.utc).isoformat()
+    if to_return:
+        save_mt5_queue()
+    return jsonify({"status": "ok", "trades": to_return})
+
+
+@app.route('/mt5/ack', methods=['POST'])
+def mt5_ack():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.json
+        trade_id = data.get('trade_id')
+        entry = mt5_pending_trades.get(trade_id)
+        if not entry:
+            return jsonify({"status": "error", "message": f"unknown trade_id {trade_id}"}), 404
+        if data.get('success'):
+            entry["status"] = "PLACED"
+            entry["ticket"] = data.get('ticket')
+            entry["fill_price"] = data.get('fill_price')
+            # Tag the real MT5 ticket onto the matching paper trade too,
+            # so the paper record and the real execution can be
+            # reconciled later (predicted vs actual entry, slippage etc).
+            if trade_id in active_trades:
+                active_trades[trade_id]['mt5_ticket'] = data.get('ticket')
+                active_trades[trade_id]['mt5_fill_price'] = data.get('fill_price')
+            send_telegram(f"🔗 *MT5 order placed* — {entry['alert_type']} {entry['direction']} | ticket #{data.get('ticket')} @ {data.get('fill_price')}")
+        else:
+            entry["status"] = "FAILED"
+            entry["error"] = data.get('error', 'unknown error')
+            send_telegram(f"⚠️ *MT5 order failed* — {entry['alert_type']} {entry['direction']}: {entry['error']}")
+        save_mt5_queue()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/mt5/status', methods=['GET'])
+def mt5_status():
+    """Human-readable snapshot of the queue -- no secret required,
+    read-only, no trade details beyond counts."""
+    counts = {}
+    for entry in mt5_pending_trades.values():
+        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+    return jsonify({"status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades)})
+
+# ============================================================
 # SMART ENTRY TIMER
 # ============================================================
 @app.route('/check-entries', methods=['GET'])
@@ -3074,7 +3224,7 @@ def dashboard():
 </html>"""
 
 # ============================================================
-# COUNTERFACTUAL REPORT —  "trades you didn't take"
+# COUNTERFACTUAL REPORT — "trades you didn't take"
 # Compares real trade performance against shadow-tracked rejected
 # alerts, broken down by why each one was rejected. Only shadow
 # trades where Claude gave real, extractable levels are included —

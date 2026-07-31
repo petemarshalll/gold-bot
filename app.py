@@ -1014,26 +1014,34 @@ def monitor_active_trades(current_price):
             points = abs(target - entry)
             trade['result'] = 'WIN'
             pnl = apply_trade_pnl(trade, 'WIN')
+            # The 2-minute poll can catch price well past the target if it
+            # gapped between checks (most often around the settlement/
+            # rollover window or a redeploy) rather than moving smoothly.
+            # points/pnl already correctly use `target`, not current_price
+            # -- this only fixes the DISPLAYED price, which previously
+            # implied the overshoot price was the actual fill.
+            gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - target):.2f}pts past target, likely a feed gap, not a real move that far_" if abs(current_price - target) > (target * 0.001) else ""
             send_telegram(f"""
 ✅ *TRADE CLOSED — TARGET HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
-Target: {target} ← hit at {current_price}
-Result: WIN ✅ +{points:.2f} points (+${pnl:.2f}) | Balance: ${current_balance:,.2f}
+Target: {target} ✅ reached
+Result: WIN ✅ +{points:.2f} points (+${pnl:.2f}) | Balance: ${current_balance:,.2f}{gap_note}
 """)
             trades_to_close.append(trade_id)
         elif hit_sl:
             points = abs(stop - entry)
             trade['result'] = 'LOSS'
             pnl = apply_trade_pnl(trade, 'LOSS')
+            gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - stop):.2f}pts past stop, likely a feed gap, not a real move that far_" if abs(current_price - stop) > (stop * 0.001) else ""
             send_telegram(f"""
 ❌ *TRADE CLOSED — STOP HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
-Stop: {stop} ← hit at {current_price}
-Result: LOSS ❌ -{points:.2f} points (${pnl:.2f}) | Balance: ${current_balance:,.2f}
+Stop: {stop} ❌ hit
+Result: LOSS ❌ -{points:.2f} points (${pnl:.2f}) | Balance: ${current_balance:,.2f}{gap_note}
 """)
             trades_to_close.append(trade_id)
     for trade_id in trades_to_close:

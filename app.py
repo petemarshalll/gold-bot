@@ -874,7 +874,7 @@ def check_risk_cap_before_trade():
 # ============================================================
 # MONITOR ACTIVE TRADES
 # ============================================================
-def apply_trade_pnl(trade, result):
+def apply_trade_pnl(trade, result, real_pnl_override=None):
     """
     Converts a closed paper trade's points result into account-level
     PnL using the trade's OWN stored risk percentage — normally the
@@ -884,6 +884,15 @@ def apply_trade_pnl(trade, result):
     because a trade can close well after it opened, potentially after
     drawdown status has changed — PnL must reflect what THIS trade was
     actually risked at, not whatever the rate happens to be now.
+
+    real_pnl_override: when a trade was placed via the MT5 bridge and
+    MT5 itself reports the real closed profit (real execution, real
+    spread/swap included), pass that dollar figure here to use it
+    directly instead of recomputing from points — strictly more
+    accurate for that trade. Every existing caller (the Telegram-only
+    monitoring path) omits this and keeps the original points-based
+    behavior unchanged.
+
     Updates daily_pnl / total_pnl / current_balance / trading_days /
     consecutive_losses so /prop-status and drawdown protection reflect
     real trade outcomes instead of requiring a manual /update-pnl call.
@@ -894,16 +903,23 @@ def apply_trade_pnl(trade, result):
     account = PROP_FIRM_RULES["account_size"]
     risk_pct = trade.get('risk_pct', PROP_FIRM_RULES["max_loss_per_trade_pct"])
     risk_amount = account * (risk_pct / 100)
-    stop_distance = abs(trade['entry'] - trade['stop'])
-    dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
 
-    if result == 'WIN':
-        points = abs(trade['target'] - trade['entry'])
-        pnl = dollar_per_point * points
-        consecutive_losses = 0
+    if real_pnl_override is not None:
+        pnl = real_pnl_override
+        if result == 'WIN':
+            consecutive_losses = 0
+        else:
+            consecutive_losses += 1
     else:
-        pnl = -risk_amount
-        consecutive_losses += 1
+        stop_distance = abs(trade['entry'] - trade['stop'])
+        dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+        if result == 'WIN':
+            points = abs(trade['target'] - trade['entry'])
+            pnl = dollar_per_point * points
+            consecutive_losses = 0
+        else:
+            pnl = -risk_amount
+            consecutive_losses += 1
 
     # Store the actual outcome magnitude on the trade record itself —
     # not just result WIN/LOSS, but the real dollar pnl and R multiple
@@ -2264,6 +2280,118 @@ def mt5_status():
     for entry in mt5_pending_trades.values():
         counts[entry["status"]] = counts.get(entry["status"], 0) + 1
     return jsonify({"status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades)})
+
+
+@app.route('/mt5/trade-closed', methods=['POST'])
+def mt5_trade_closed():
+    """
+    Reports a real MT5-placed trade's closure back into the same
+    tracking self-review and counterfactual reporting already read from
+    (active_trades / paper_trades) -- without this, an MT5-placed trade
+    closes silently and is invisible to every report the rest of the
+    system relies on.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.json
+        trade_id = data.get('trade_id')
+        trade = active_trades.get(trade_id)
+        if not trade:
+            return jsonify({"status": "error", "message": f"unknown or already-closed trade_id {trade_id}"}), 404
+
+        result = data.get('result')
+        if result not in ("WIN", "LOSS"):
+            return jsonify({"status": "error", "message": "result must be WIN or LOSS"}), 400
+        real_pnl = data.get('real_pnl')
+
+        trade['result'] = result
+        trade['close_price'] = data.get('close_price')
+        trade['mt5_closed_via_bridge'] = True
+        pnl = apply_trade_pnl(trade, result, real_pnl_override=real_pnl)
+
+        del active_trades[trade_id]
+        try:
+            with open(data_path('paper_trades.json'), 'w') as f:
+                json.dump(paper_trades, f, indent=2)
+        except Exception as e:
+            print(f"Paper trade save error on MT5 close: {e}")
+
+        emoji = "✅" if result == "WIN" else "❌"
+        send_telegram(
+            f"{emoji} *MT5 trade closed* — {trade.get('type', '')} {trade.get('direction', '')} | "
+            f"{result} | ${pnl:.2f} | ticket #{trade.get('mt5_ticket')}"
+        )
+        return jsonify({"status": "ok", "pnl": round(pnl, 2)})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/admin/recent-trades', methods=['GET'])
+def admin_recent_trades():
+    """Read-only -- last 5 paper trades with enough detail to spot a
+    manually-injected test trade and get its exact trade_id."""
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    recent = paper_trades[-5:]
+    return jsonify({"status": "ok", "trades": [
+        {
+            "trade_id": t.get("id"), "type": t.get("type"), "direction": t.get("direction"),
+            "entry": t.get("entry"), "stop": t.get("stop"), "target": t.get("target"),
+            "result": t.get("result"), "pnl": t.get("pnl"), "time": t.get("time"),
+            "opened_at": t.get("opened_at"),
+        } for t in recent
+    ]})
+
+
+@app.route('/admin/remove-trade', methods=['POST'])
+def admin_remove_trade():
+    """
+    Removes one trade by exact trade_id -- for cleaning up a manually
+    injected test alert (e.g. a curl webhook test) that got logged
+    through the same pipeline as a real trade. If it was already
+    closed, precisely reverses its stored pnl from current_balance/
+    total_pnl/daily_pnl using the exact figure apply_trade_pnl() saved
+    on the trade record, rather than recomputing it.
+    NOTE: does not attempt to rewind trading_days or consecutive_losses
+    -- low-stakes fields for a rare manual cleanup, worth a manual
+    glance afterward rather than automated here.
+    """
+    global current_balance, total_pnl, daily_pnl
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        trade_id = request.json.get('trade_id')
+        trade = next((t for t in paper_trades if t.get('id') == trade_id), None)
+        if not trade:
+            return jsonify({"status": "error", "message": f"no trade found with id {trade_id}"}), 404
+
+        reversed_pnl = None
+        if trade.get('pnl') is not None:
+            reversed_pnl = trade['pnl']
+            current_balance -= reversed_pnl
+            total_pnl -= reversed_pnl
+            daily_pnl -= reversed_pnl
+
+        paper_trades.remove(trade)
+        active_trades.pop(trade_id, None)
+        mt5_pending_trades.pop(trade_id, None)
+
+        with open(data_path('paper_trades.json'), 'w') as f:
+            json.dump(paper_trades, f, indent=2)
+        save_mt5_queue()
+
+        return jsonify({
+            "status": "ok", "removed_trade_id": trade_id,
+            "reversed_pnl": reversed_pnl,
+            "current_balance": round(current_balance, 2),
+            "total_pnl": round(total_pnl, 2),
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # ============================================================
 # SMART ENTRY TIMER

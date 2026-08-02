@@ -2282,6 +2282,49 @@ def mt5_status():
     return jsonify({"status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades)})
 
 
+@app.route('/mt5/test-queue', methods=['POST'])
+def mt5_test_queue():
+    """
+    Queues a synthetic trade directly into mt5_pending_trades WITHOUT
+    going through log_paper_trade() -- never touches paper_trades,
+    active_trades, current_balance, or any real stats at all. Every
+    earlier bridge test used the real /webhook path instead, which
+    logged as a genuine trade each time and needed manual cleanup
+    afterward (see /admin/remove-trade). This tests the exact same
+    bridge round trip -- place, ack, close -- with nothing real to
+    clean up once it's done. Defaults to a deliberately tiny risk_pct
+    unless overridden.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.json or {}
+        trade_id = f"TESTONLY_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        mt5_pending_trades[trade_id] = {
+            "trade_id": trade_id,
+            "status": "PENDING",
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "alert_type": "TEST",
+            "direction": data.get("direction", "LONG"),
+            "entry": data.get("entry", 4070.0),
+            "stop": data.get("stop", 4059.0),
+            "target": data.get("target", 4080.0),
+            "risk_pct": data.get("risk_pct", 0.1),
+            "confidence": "TEST",
+            "ticket": None,
+            "fill_price": None,
+            "error": None,
+        }
+        save_mt5_queue()
+        return jsonify({
+            "status": "ok", "trade_id": trade_id,
+            "message": "Queued for the bridge -- never touches paper_trades or balance, nothing to clean up after"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route('/mt5/trade-closed', methods=['POST'])
 def mt5_trade_closed():
     """

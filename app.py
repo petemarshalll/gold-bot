@@ -105,10 +105,12 @@ mt5_pending_trades = {}
 # ============================================================
 PROP_FIRM_RULES = {
     "account_size": 10000,
-    "max_daily_loss_pct": 4.0,
-    "max_total_drawdown_pct": 8.0,
-    "min_trading_days": 4,
-    "max_loss_per_trade_pct": 1.0,
+    # FTMO 2-Step Challenge real published rules (verified 2 Aug 2026,
+    # previously rough placeholders from early in the project).
+    "max_daily_loss_pct": 5.0,
+    "max_total_drawdown_pct": 10.0,   # static/non-trailing on the 2-Step path
+    "min_trading_days": 4,             # per phase -- matches FTMO's number already
+    "max_loss_per_trade_pct": 1.0,     # Pete's own risk-per-trade convention, not an FTMO rule
 }
 
 current_balance = 10000

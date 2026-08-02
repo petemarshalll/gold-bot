@@ -199,14 +199,20 @@ def load_state():
 # MARKET HOURS CHECK
 # ============================================================
 def is_market_open():
+    # Real gold market schedule (confirmed 2 Aug 2026): opens Sunday
+    # 22:00 UTC, closes Friday 22:00 UTC -- was previously 21:00,
+    # quietly wrong by an hour, which is directly why tonight's
+    # 21:12 UTC check looked "past reopen" when the market was
+    # genuinely still closed. Note: 22:00 reflects current US/UK
+    # daylight saving -- may need revisiting once DST ends (~Nov).
     now = datetime.now(timezone.utc)
     hour = now.hour
     weekday = now.weekday()
     if weekday == 5:
         return False
-    if weekday == 6 and hour < 21:
+    if weekday == 6 and hour < 22:
         return False
-    if weekday == 4 and hour >= 21:
+    if weekday == 4 and hour >= 22:
         return False
     return True
 

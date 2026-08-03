@@ -2286,7 +2286,14 @@ def mt5_status():
     counts = {}
     for entry in mt5_pending_trades.values():
         counts[entry["status"]] = counts.get(entry["status"], 0) + 1
-    return jsonify({"status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades)})
+    heartbeat_info = {"last_heartbeat": None, "seconds_ago": None}
+    if last_bridge_heartbeat is not None:
+        heartbeat_info["last_heartbeat"] = last_bridge_heartbeat.isoformat()
+        heartbeat_info["seconds_ago"] = int((datetime.now(timezone.utc) - last_bridge_heartbeat).total_seconds())
+    return jsonify({
+        "status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades),
+        "bridge_heartbeat": heartbeat_info,
+    })
 
 
 @app.route('/mt5/test-queue', methods=['POST'])

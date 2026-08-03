@@ -114,6 +114,13 @@ PROP_FIRM_RULES = {
 }
 
 current_balance = 10000
+
+# Bridge watchdog state -- tracks whether the local MT5 bridge is
+# still alive and polling, so a silent crash/disconnect/PC sleep
+# during an open position doesn't go unnoticed.
+last_bridge_heartbeat = None
+bridge_watchdog_alerted = False
+BRIDGE_HEARTBEAT_TIMEOUT_MINUTES = 3
 daily_pnl = 0
 total_pnl = 0
 trading_days = 0
@@ -2325,6 +2332,45 @@ def mt5_test_queue():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/mt5/heartbeat', methods=['POST'])
+def mt5_heartbeat():
+    """
+    The bridge calls this every poll cycle while it's alive. A separate
+    scheduled check watches for this going stale -- see
+    check_bridge_watchdog() below.
+    """
+    global last_bridge_heartbeat, bridge_watchdog_alerted
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    last_bridge_heartbeat = datetime.now(timezone.utc)
+    bridge_watchdog_alerted = False  # a fresh heartbeat means it's back, if it had gone quiet before
+    return jsonify({"status": "ok"})
+
+
+def check_bridge_watchdog():
+    """
+    Runs on an interval (see scheduler setup). Alerts once via Telegram
+    if the bridge has gone quiet for longer than expected -- and only
+    once per outage, not repeatedly, so it doesn't spam. Says nothing
+    at all if the bridge simply hasn't been started yet (no heartbeat
+    ever received) -- that's not a failure, just not running.
+    """
+    global bridge_watchdog_alerted
+    if last_bridge_heartbeat is None:
+        return  # never started this session -- nothing to alert about
+
+    quiet_for = datetime.now(timezone.utc) - last_bridge_heartbeat
+    if quiet_for > timedelta(minutes=BRIDGE_HEARTBEAT_TIMEOUT_MINUTES) and not bridge_watchdog_alerted:
+        minutes = int(quiet_for.total_seconds() // 60)
+        send_telegram(
+            f"⚠️ *MT5 bridge watchdog* — no heartbeat for {minutes} min "
+            f"(last seen {last_bridge_heartbeat.strftime('%H:%M UTC')}). "
+            f"If a position is open, it may not be getting tracked right now."
+        )
+        bridge_watchdog_alerted = True
+
+
 @app.route('/mt5/trade-closed', methods=['POST'])
 def mt5_trade_closed():
     """
@@ -3605,6 +3651,7 @@ if __name__ == '__main__':
     scheduler.add_job(func=run_counterfactual_report, trigger='cron', day_of_week='sun', hour=19, minute=30, id='counterfactual_report')
     scheduler.add_job(func=run_in_context(check_entries), trigger='interval', minutes=5, id='entry_monitor')
     scheduler.add_job(func=run_in_context(monitor_trades_endpoint), trigger='interval', minutes=2, id='trade_monitor')
+    scheduler.add_job(func=check_bridge_watchdog, trigger='interval', minutes=2, id='bridge_watchdog')
     scheduler.add_job(func=run_in_context(cot_report), trigger='cron', day_of_week='fri', hour=16, minute=0, id='cot_report')
     scheduler.add_job(func=run_in_context(update_intraday), trigger='interval', minutes=30, id='intraday_updater')
     scheduler.add_job(func=lambda: save_state(), trigger='interval', minutes=10, id='state_saver')

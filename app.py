@@ -2519,6 +2519,67 @@ def admin_remove_trade():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+@app.route('/admin/restore-trade', methods=['POST'])
+def admin_restore_trade():
+    """
+    The inverse of /admin/remove-trade -- for putting back a real,
+    legitimate trade whose signal was genuine but got removed because
+    its recorded CLOSE was unreliable (e.g. the single-reading feed-gap
+    bug), once the actual outcome has been independently verified some
+    other way (e.g. checked directly against the real chart). Requires
+    every field explicitly rather than inferring anything, so a
+    restoration is always a deliberate, fully-specified action, not a
+    guess.
+    """
+    global current_balance, total_pnl, daily_pnl
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.json
+        trade_id = data['trade_id']
+        if any(t.get('id') == trade_id for t in paper_trades):
+            return jsonify({"status": "error", "message": f"trade_id {trade_id} already exists"}), 409
+
+        result = data['result']
+        if result not in ("WIN", "LOSS"):
+            return jsonify({"status": "error", "message": "result must be WIN or LOSS"}), 400
+        pnl = float(data['pnl'])
+
+        trade = {
+            "id": trade_id,
+            "time": data['time'],
+            "opened_at": data.get('opened_at', datetime.now(timezone.utc).isoformat()),
+            "type": data['type'],
+            "direction": data['direction'],
+            "entry": float(data['entry']),
+            "stop": float(data['stop']),
+            "target": float(data['target']),
+            "confidence": data.get('confidence', 'MEDIUM'),
+            "result": result,
+            "pnl": round(pnl, 2),
+            "bot_version": BOT_VERSION,
+            "restored_note": "Restored after independent verification -- original close was via the single-reading feed-gap bug, fixed 4 Aug",
+        }
+        paper_trades.append(trade)
+        current_balance += pnl
+        total_pnl += pnl
+        daily_pnl += pnl
+
+        with open(data_path('paper_trades.json'), 'w') as f:
+            json.dump(paper_trades, f, indent=2)
+
+        return jsonify({
+            "status": "ok", "restored_trade_id": trade_id,
+            "current_balance": round(current_balance, 2),
+            "total_pnl": round(total_pnl, 2),
+        })
+    except KeyError as e:
+        return jsonify({"status": "error", "message": f"missing required field: {e}"}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ============================================================
 # SMART ENTRY TIMER
 # ============================================================

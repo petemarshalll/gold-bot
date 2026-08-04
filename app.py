@@ -57,6 +57,12 @@ active_trades = {}
 daily_losses = 0
 consecutive_losses = 0
 drawdown_protection = False
+# Set False to re-enable drawdown protection's real effects (reduced
+# sizing, raised confidence bar) once past pure data-gathering and
+# real capital is actually at stake. consecutive_losses itself still
+# gets tracked normally either way -- this only controls whether that
+# count is allowed to actually change trade behavior.
+DRAWDOWN_PROTECTION_DISABLED = True
 last_trading_day = None
 last_pnl_reset_day = None
 daily_alert_count = 0
@@ -389,6 +395,9 @@ def check_hour_quality():
 # ============================================================
 def check_drawdown_protection():
     global consecutive_losses, drawdown_protection
+    if DRAWDOWN_PROTECTION_DISABLED:
+        drawdown_protection = False
+        return False, "Normal trading mode (drawdown protection disabled for data-gathering phase)"
     if consecutive_losses >= 3:
         drawdown_protection = True
         return True, f"⚠️ DRAWDOWN PROTECTION ACTIVE — {consecutive_losses} consecutive losses."

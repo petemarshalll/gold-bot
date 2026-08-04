@@ -2425,6 +2425,15 @@ def mt5_trade_closed():
         trade_id = data.get('trade_id')
         trade = active_trades.get(trade_id)
         if not trade:
+            # Fall back to paper_trades directly -- active_trades is a
+            # convenience view, not the real source of truth. A trade
+            # can end up open in paper_trades but missing here (e.g. if
+            # it was reopened via /admin/reopen-trade and this request
+            # landed on a different app instance than that one did).
+            trade = next((t for t in paper_trades if t.get('id') == trade_id), None)
+            if trade and trade.get('result') != 'OPEN':
+                trade = None  # exists, but genuinely already closed -- not a fallback case
+        if not trade:
             return jsonify({"status": "error", "message": f"unknown or already-closed trade_id {trade_id}"}), 404
 
         result = data.get('result')
@@ -2437,12 +2446,13 @@ def mt5_trade_closed():
         trade['mt5_closed_via_bridge'] = True
         pnl = apply_trade_pnl(trade, result, real_pnl_override=real_pnl)
 
-        del active_trades[trade_id]
+        active_trades.pop(trade_id, None)
         try:
             with open(data_path('paper_trades.json'), 'w') as f:
                 json.dump(paper_trades, f, indent=2)
         except Exception as e:
             print(f"Paper trade save error on MT5 close: {e}")
+        save_state()
 
         emoji = "✅" if result == "WIN" else "❌"
         send_telegram(

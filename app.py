@@ -2466,12 +2466,17 @@ def mt5_trade_closed():
 
 @app.route('/admin/recent-trades', methods=['GET'])
 def admin_recent_trades():
-    """Read-only -- last 5 paper trades with enough detail to spot a
-    manually-injected test trade and get its exact trade_id."""
+    """Read-only -- last N paper trades (default 5, override with
+    ?limit=20) with enough detail to spot a manually-injected test
+    trade and get its exact trade_id."""
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
-    recent = paper_trades[-5:]
+    try:
+        limit = int(request.args.get('limit', 5))
+    except ValueError:
+        limit = 5
+    recent = paper_trades[-limit:]
     return jsonify({"status": "ok", "trades": [
         {
             "trade_id": t.get("id"), "type": t.get("type"), "direction": t.get("direction"),

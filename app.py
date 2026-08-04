@@ -2509,6 +2509,7 @@ def admin_remove_trade():
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
         save_mt5_queue()
+        save_state()
 
         return jsonify({
             "status": "ok", "removed_trade_id": trade_id,
@@ -2569,6 +2570,7 @@ def admin_restore_trade():
 
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
+        save_state()
 
         return jsonify({
             "status": "ok", "restored_trade_id": trade_id,
@@ -2619,6 +2621,7 @@ def admin_reopen_trade():
 
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
+        save_state()
 
         return jsonify({
             "status": "ok", "reopened_trade_id": trade_id,

@@ -2580,6 +2580,55 @@ def admin_restore_trade():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+@app.route('/admin/reopen-trade', methods=['POST'])
+def admin_reopen_trade():
+    """
+    For a trade incorrectly marked closed (e.g. the simulated monitor
+    crediting a result off a bad price feed) while it's genuinely still
+    open on the real account. Reverses the incorrectly-applied pnl
+    (same exact math as /admin/remove-trade), resets the trade back to
+    OPEN, and puts it back in active_trades so it can be picked up and
+    correctly reported by the real MT5-bridge closure detection later
+    -- rather than deleting it outright, which would leave no record
+    at all of a trade that's genuinely still live.
+    """
+    global current_balance, total_pnl, daily_pnl
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        trade_id = request.json.get('trade_id')
+        trade = next((t for t in paper_trades if t.get('id') == trade_id), None)
+        if not trade:
+            return jsonify({"status": "error", "message": f"no trade found with id {trade_id}"}), 404
+        if trade.get('result') == 'OPEN':
+            return jsonify({"status": "error", "message": f"trade_id {trade_id} is already OPEN, nothing to reopen"}), 409
+
+        reversed_pnl = None
+        if trade.get('pnl') is not None:
+            reversed_pnl = trade['pnl']
+            current_balance -= reversed_pnl
+            total_pnl -= reversed_pnl
+            daily_pnl -= reversed_pnl
+
+        trade['result'] = 'OPEN'
+        trade.pop('pnl', None)
+        trade.pop('r_multiple', None)
+        active_trades[trade_id] = trade
+
+        with open(data_path('paper_trades.json'), 'w') as f:
+            json.dump(paper_trades, f, indent=2)
+
+        return jsonify({
+            "status": "ok", "reopened_trade_id": trade_id,
+            "reversed_pnl": reversed_pnl,
+            "current_balance": round(current_balance, 2),
+            "total_pnl": round(total_pnl, 2),
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ============================================================
 # SMART ENTRY TIMER
 # ============================================================

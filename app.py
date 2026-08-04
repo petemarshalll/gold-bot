@@ -1090,6 +1090,15 @@ Result: {hit_type} {emoji} {sign}{points:.2f} points ({pnl_sign}${pnl:.2f}) | Ba
 
 def monitor_active_trades(current_price):
     current_price = float(current_price)
+    # A single 2-minute price reading isn't trusted enough on its own to
+    # credit a WIN/LOSS anymore -- confirmed via two real cases (4 Aug)
+    # where a bad reading got credited as a real close. A fixed
+    # point-threshold turned out not to reliably tell a bad reading
+    # apart from a real fast move (tried it, one of the two real cases
+    # only overshot by 5pts despite the reading being clearly wrong).
+    # Instead: require the SAME crossing to show up on two consecutive
+    # polls before it's trusted. A genuinely bad, one-off reading won't
+    # repeat; a real move will still be past the level 2 minutes later.
     trades_to_close = []
     for trade_id, trade in active_trades.items():
         if trade['result'] != 'OPEN':
@@ -1111,17 +1120,16 @@ def monitor_active_trades(current_price):
             elif current_price >= stop:
                 hit_sl = True
         if hit_tp:
-            points = abs(target - entry)
-            trade['result'] = 'WIN'
-            pnl = apply_trade_pnl(trade, 'WIN')
-            # The 2-minute poll can catch price well past the target if it
-            # gapped between checks (most often around the settlement/
-            # rollover window or a redeploy) rather than moving smoothly.
-            # points/pnl already correctly use `target`, not current_price
-            # -- this only fixes the DISPLAYED price, which previously
-            # implied the overshoot price was the actual fill.
-            gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - target):.2f}pts past target, likely a feed gap, not a real move that far_" if abs(current_price - target) > (target * 0.001) else ""
-            send_telegram(f"""
+            if trade.get('_pending_close') == 'WIN':
+                points = abs(target - entry)
+                trade['result'] = 'WIN'
+                pnl = apply_trade_pnl(trade, 'WIN')
+                # points/pnl correctly use `target`, not current_price --
+                # this note only clarifies the DISPLAYED price, since a
+                # 2-minute poll can catch price a little past the exact
+                # level rather than landing on it precisely.
+                gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - target):.2f}pts past target_" if abs(current_price - target) > (target * 0.001) else ""
+                send_telegram(f"""
 ✅ *TRADE CLOSED — TARGET HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
@@ -1129,13 +1137,22 @@ Entry: {entry}
 Target: {target} ✅ reached
 Result: WIN ✅ +{points:.2f} points (+${pnl:.2f}) | Balance: ${current_balance:,.2f}{gap_note}
 """)
-            trades_to_close.append(trade_id)
+                trades_to_close.append(trade_id)
+            else:
+                trade['_pending_close'] = 'WIN'
+                send_telegram(f"""
+⏳ *Target level reached, confirming*
+Alert: {trade['type']} | {trade['time']}
+Direction: {direction}
+Target: {target} -- price check showed {current_price}. Holding off crediting until the next poll confirms this wasn't a one-off bad reading.
+""")
         elif hit_sl:
-            points = abs(stop - entry)
-            trade['result'] = 'LOSS'
-            pnl = apply_trade_pnl(trade, 'LOSS')
-            gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - stop):.2f}pts past stop, likely a feed gap, not a real move that far_" if abs(current_price - stop) > (stop * 0.001) else ""
-            send_telegram(f"""
+            if trade.get('_pending_close') == 'LOSS':
+                points = abs(stop - entry)
+                trade['result'] = 'LOSS'
+                pnl = apply_trade_pnl(trade, 'LOSS')
+                gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - stop):.2f}pts past stop_" if abs(current_price - stop) > (stop * 0.001) else ""
+                send_telegram(f"""
 ❌ *TRADE CLOSED — STOP HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
@@ -1143,7 +1160,20 @@ Entry: {entry}
 Stop: {stop} ❌ hit
 Result: LOSS ❌ -{points:.2f} points (${pnl:.2f}) | Balance: ${current_balance:,.2f}{gap_note}
 """)
-            trades_to_close.append(trade_id)
+                trades_to_close.append(trade_id)
+            else:
+                trade['_pending_close'] = 'LOSS'
+                send_telegram(f"""
+⏳ *Stop level reached, confirming*
+Alert: {trade['type']} | {trade['time']}
+Direction: {direction}
+Stop: {stop} -- price check showed {current_price}. Holding off crediting until the next poll confirms this wasn't a one-off bad reading.
+""")
+        else:
+            # Neither level hit this cycle -- if a prior poll had flagged
+            # a pending close, that reading didn't hold up. Clear it
+            # rather than let a stale flag silently linger.
+            trade.pop('_pending_close', None)
     for trade_id in trades_to_close:
         del active_trades[trade_id]
     try:

@@ -1112,6 +1112,17 @@ def monitor_active_trades(current_price):
     for trade_id, trade in active_trades.items():
         if trade['result'] != 'OPEN':
             continue
+        if trade.get('mt5_ticket'):
+            # A confirmed real MT5 order exists for this trade -- it
+            # belongs exclusively to the real bridge's closure detection
+            # now (get_trading_history_positions, real data). Confirmed
+            # real problem, not theoretical: this simulated monitor
+            # closed a still-genuinely-open real position (ticket
+            # #512156384, 5 Aug) off a bad reading, not once but twice
+            # in a row -- even undoing a manual correction within
+            # seconds. It has no business touching a trade with a real
+            # ticket at all.
+            continue
         entry = trade['entry']
         stop = trade['stop']
         target = trade['target']

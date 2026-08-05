@@ -127,6 +127,14 @@ current_balance = 10000
 last_bridge_heartbeat = None
 bridge_watchdog_alerted = False
 BRIDGE_HEARTBEAT_TIMEOUT_MINUTES = 3
+
+# Live price relayed from the bridge, preferred over yfinance for
+# trade monitoring whenever it's fresh enough to trust. Falls back to
+# yfinance if the bridge hasn't sent an update recently -- e.g. bridge
+# briefly down -- so monitoring never just stops working.
+mt5_live_price = {"bid": None, "ask": None, "updated_at": None}
+MT5_PRICE_STALENESS_SECONDS = 60
+
 daily_pnl = 0
 total_pnl = 0
 trading_days = 0
@@ -2253,7 +2261,9 @@ def monitor_trades_endpoint():
         if is_price_data_stale(gold):
             print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this monitor-trades cycle")
             return jsonify({"status": "price data stale, skipped"})
-        current_price = round(float(gold['Close'].iloc[-1]), 2)
+        current_price = get_mt5_price_if_fresh()
+        if current_price is None:
+            current_price = round(float(gold['Close'].iloc[-1]), 2)
         if active_trades:
             monitor_active_trades(current_price)
             # Catch anything the quick check above missed — a stop or
@@ -2348,9 +2358,15 @@ def mt5_status():
     if last_bridge_heartbeat is not None:
         heartbeat_info["last_heartbeat"] = last_bridge_heartbeat.isoformat()
         heartbeat_info["seconds_ago"] = int((datetime.now(timezone.utc) - last_bridge_heartbeat).total_seconds())
+    price_info = {"bid": mt5_live_price.get("bid"), "ask": mt5_live_price.get("ask"), "seconds_ago": None, "trusted_right_now": False}
+    if mt5_live_price.get("updated_at") is not None:
+        age = int((datetime.now(timezone.utc) - mt5_live_price["updated_at"]).total_seconds())
+        price_info["seconds_ago"] = age
+        price_info["trusted_right_now"] = age <= MT5_PRICE_STALENESS_SECONDS
     return jsonify({
         "status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades),
         "bridge_heartbeat": heartbeat_info,
+        "mt5_live_price": price_info,
     })
 
 
@@ -2411,6 +2427,56 @@ def mt5_heartbeat():
     last_bridge_heartbeat = datetime.now(timezone.utc)
     bridge_watchdog_alerted = False  # a fresh heartbeat means it's back, if it had gone quiet before
     return jsonify({"status": "ok"})
+
+
+@app.route('/mt5/price-update', methods=['POST'])
+def mt5_price_update():
+    """The bridge calls this every poll cycle alongside the heartbeat,
+    relaying MT5's own live bid/ask -- the real price, not a separate
+    third-party feed. See get_mt5_price_if_fresh() for how this gets
+    used and when it's trusted. Validates the values themselves, not
+    just that the fields are present -- a degenerate reading (e.g.
+    bid/ask of 0 during some transient glitch) must never get stored,
+    since a $0 gold price would make every open trade look like it hit
+    both its stop and target simultaneously."""
+    global mt5_live_price
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.json or {}
+        bid, ask = data.get('bid'), data.get('ask')
+        if bid is None or ask is None:
+            return jsonify({"status": "error", "message": "bid and ask are both required"}), 400
+        bid, ask = float(bid), float(ask)
+        if bid <= 0 or ask <= 0:
+            return jsonify({"status": "error", "message": "bid and ask must both be positive"}), 400
+        if ask < bid:
+            return jsonify({"status": "error", "message": "ask cannot be below bid"}), 400
+        mt5_live_price = {"bid": bid, "ask": ask, "updated_at": datetime.now(timezone.utc)}
+        return jsonify({"status": "ok"})
+    except (TypeError, ValueError) as e:
+        return jsonify({"status": "error", "message": f"bid/ask must be numeric: {e}"}), 400
+
+
+def get_mt5_price_if_fresh():
+    """Returns MT5's real mid price if the bridge has reported it
+    recently enough to trust, else None -- caller should fall back to
+    yfinance. Never raises; a malformed or missing value is treated
+    the same as no data at all."""
+    try:
+        updated_at = mt5_live_price.get("updated_at")
+        if updated_at is None:
+            return None
+        age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+        if age > MT5_PRICE_STALENESS_SECONDS:
+            return None
+        bid, ask = mt5_live_price.get("bid"), mt5_live_price.get("ask")
+        if bid is None or ask is None:
+            return None
+        return round((bid + ask) / 2, 2)
+    except Exception:
+        return None
 
 
 def check_bridge_watchdog():

@@ -142,10 +142,15 @@ INSTANCE_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # Bridge watchdog state -- tracks whether the local MT5 bridge is
 # still alive and polling, so a silent crash/disconnect/PC sleep
-# during an open position doesn't go unnoticed.
+# during an open position doesn't go unnoticed. Tightened from 3min to
+# 1min (5 Aug) -- while Task Scheduler auto-recovery is paused for
+# reliability testing, this alert is the entire recovery mechanism,
+# not just a backup notification, so the gap before it fires matters
+# much more than it used to. The bridge heartbeats every 20s, so 1min
+# still tolerates a couple of missed beats before firing.
 last_bridge_heartbeat = None
 bridge_watchdog_alerted = False
-BRIDGE_HEARTBEAT_TIMEOUT_MINUTES = 3
+BRIDGE_HEARTBEAT_TIMEOUT_MINUTES = 1
 
 # Live price relayed from the bridge, preferred over yfinance for
 # trade monitoring whenever it's fresh enough to trust. Falls back to

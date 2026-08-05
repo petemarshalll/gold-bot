@@ -64,6 +64,12 @@ drawdown_protection = False
 # gets tracked normally either way -- this only controls whether that
 # count is allowed to actually change trade behavior.
 DRAWDOWN_PROTECTION_DISABLED = True
+# Set False to re-enable the daily loss limit actually blocking new
+# trades from being logged once real capital is at stake. This is the
+# real enforcement (check_risk_cap_before_trade) -- separate from the
+# daily loss WARNING messages sent to Telegram, which are purely
+# informational either way and still fire regardless of this flag.
+DAILY_LOSS_LIMIT_DISABLED = True
 last_trading_day = None
 last_pnl_reset_day = None
 daily_alert_count = 0
@@ -893,6 +899,9 @@ def check_risk_cap_before_trade():
     """
     global daily_pnl, last_pnl_reset_day
     ensure_daily_reset()
+
+    if DAILY_LOSS_LIMIT_DISABLED:
+        return True, ""
 
     account = PROP_FIRM_RULES["account_size"]
     risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)

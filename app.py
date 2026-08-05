@@ -2217,10 +2217,12 @@ def auto_update_levels():
 def update_intraday():
     global KEY_LEVELS
     try:
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
-        if gold.empty:
-            return jsonify({"status": "no data"})
-        gold.columns = [col[0] for col in gold.columns]
+        gold = get_mt5_candles_if_fresh()
+        if gold is None:
+            gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
+            if gold.empty:
+                return jsonify({"status": "no data"})
+            gold.columns = [col[0] for col in gold.columns]
         todays_high = round(float(gold['High'].max()), 2)
         todays_low = round(float(gold['Low'].min()), 2)
         current_price = round(float(gold['Close'].iloc[-1]), 2)
@@ -2254,13 +2256,15 @@ def monitor_trades_endpoint():
     try:
         if not active_trades and not active_shadow_trades:
             return jsonify({"status": "no active trades"})
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
-        if gold.empty:
-            return jsonify({"status": "no price data"})
-        gold.columns = [col[0] for col in gold.columns]
-        if is_price_data_stale(gold):
-            print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this monitor-trades cycle")
-            return jsonify({"status": "price data stale, skipped"})
+        gold = get_mt5_candles_if_fresh()
+        if gold is None:
+            gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
+            if gold.empty:
+                return jsonify({"status": "no price data"})
+            gold.columns = [col[0] for col in gold.columns]
+            if is_price_data_stale(gold):
+                print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this monitor-trades cycle")
+                return jsonify({"status": "price data stale, skipped"})
         current_price = get_mt5_price_if_fresh()
         if current_price is None:
             current_price = round(float(gold['Close'].iloc[-1]), 2)
@@ -2363,10 +2367,19 @@ def mt5_status():
         age = int((datetime.now(timezone.utc) - mt5_live_price["updated_at"]).total_seconds())
         price_info["seconds_ago"] = age
         price_info["trusted_right_now"] = age <= MT5_PRICE_STALENESS_SECONDS
+    candle_info = {"count": 0, "seconds_ago": None, "trusted_right_now": False, "most_recent_candle_time": None}
+    if mt5_candle_history.get("updated_at") is not None:
+        age = int((datetime.now(timezone.utc) - mt5_candle_history["updated_at"]).total_seconds())
+        candle_info["seconds_ago"] = age
+        candle_info["trusted_right_now"] = age <= MT5_CANDLE_STALENESS_SECONDS
+        candle_info["count"] = len(mt5_candle_history.get("candles", []))
+        if candle_info["count"] > 0:
+            candle_info["most_recent_candle_time"] = mt5_candle_history["candles"][-1]["time"]
     return jsonify({
         "status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades),
         "bridge_heartbeat": heartbeat_info,
         "mt5_live_price": price_info,
+        "mt5_candles": candle_info,
     })
 
 
@@ -2457,6 +2470,69 @@ def mt5_price_update():
         return jsonify({"status": "ok"})
     except (TypeError, ValueError) as e:
         return jsonify({"status": "error", "message": f"bid/ask must be numeric: {e}"}), 400
+
+
+mt5_candle_history = {"candles": [], "updated_at": None}
+MT5_CANDLE_STALENESS_SECONDS = 300  # candles relay every 2 min; this gives real headroom
+
+
+@app.route('/mt5/candle-update', methods=['POST'])
+def mt5_candle_update():
+    """The bridge relays recent M5 candle history here, already
+    converted to genuine UTC on its side. Validated again here too --
+    same defense-in-depth principle as /mt5/price-update -- rather
+    than trust a single validation layer for data this consequential."""
+    global mt5_candle_history
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.json or {}
+        candles = data.get('candles')
+        if not candles or not isinstance(candles, list):
+            return jsonify({"status": "error", "message": "candles must be a non-empty list"}), 400
+        cleaned = []
+        for c in candles:
+            t, o, h, l, cl = c.get('time'), c.get('open'), c.get('high'), c.get('low'), c.get('close')
+            if None in (t, o, h, l, cl):
+                return jsonify({"status": "error", "message": f"candle missing a required field: {c}"}), 400
+            o, h, l, cl = float(o), float(h), float(l), float(cl)
+            if min(o, h, l, cl) <= 0:
+                return jsonify({"status": "error", "message": f"candle has a non-positive price: {c}"}), 400
+            if h < l:
+                return jsonify({"status": "error", "message": f"candle high is below its low: {c}"}), 400
+            try:
+                datetime.fromisoformat(t)
+            except ValueError:
+                return jsonify({"status": "error", "message": f"candle time isn't valid ISO format: {t!r}"}), 400
+            cleaned.append({"time": t, "Open": o, "High": h, "Low": l, "Close": cl})
+        mt5_candle_history = {"candles": cleaned, "updated_at": datetime.now(timezone.utc)}
+        return jsonify({"status": "ok", "count": len(cleaned)})
+    except (TypeError, ValueError) as e:
+        return jsonify({"status": "error", "message": f"invalid candle data: {e}"}), 400
+
+
+def get_mt5_candles_if_fresh():
+    """Returns MT5's real relayed candle history as a DataFrame in the
+    exact shape existing code already expects (DatetimeIndex, Open/
+    High/Low/Close columns) -- matching what yfinance produces after
+    its own column-flattening -- if fresh enough to trust, else None."""
+    try:
+        updated_at = mt5_candle_history.get("updated_at")
+        if updated_at is None:
+            return None
+        age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+        if age > MT5_CANDLE_STALENESS_SECONDS:
+            return None
+        candles = mt5_candle_history.get("candles")
+        if not candles:
+            return None
+        df = pd.DataFrame(candles)
+        df.index = pd.to_datetime(df['time'], utc=True)
+        df = df[['Open', 'High', 'Low', 'Close']]
+        return df
+    except Exception:
+        return None
 
 
 def get_mt5_price_if_fresh():
@@ -2751,13 +2827,15 @@ def check_entries():
             return jsonify({"status": "market closed — entry monitor paused"})
         if not active_trades:
             return jsonify({"status": "no active trades to monitor"})
-        gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
-        if gold.empty:
-            return jsonify({"status": "no price data"})
-        gold.columns = [col[0] for col in gold.columns]
-        if is_price_data_stale(gold):
-            print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this check-entries cycle")
-            return jsonify({"status": "price data stale, skipped"})
+        gold = get_mt5_candles_if_fresh()
+        if gold is None:
+            gold = yf.download('GC=F', period='1d', interval='5m', progress=False, timeout=10)
+            if gold.empty:
+                return jsonify({"status": "no price data"})
+            gold.columns = [col[0] for col in gold.columns]
+            if is_price_data_stale(gold):
+                print(f"Price data stale (last candle: {gold.index[-1]}) — skipping this check-entries cycle")
+                return jsonify({"status": "price data stale, skipped"})
         current_price = round(float(gold['Close'].iloc[-1]), 2)
         alerts_sent = 0
         notified_trades = []

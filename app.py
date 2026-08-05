@@ -1056,6 +1056,14 @@ def thorough_scan_active_trades(gold_df):
     for trade_id, trade in list(active_trades.items()):
         if trade.get('result') != 'OPEN':
             continue
+        if trade.get('mt5_ticket'):
+            # Same real-ticket exclusion as monitor_active_trades() --
+            # confirmed live (5 Aug) that this second, independent scan
+            # closed the exact same still-genuinely-open real position
+            # (ticket #512156384) via wick-detection, right after the
+            # first fix stopped the live-price check from doing it.
+            # Two separate closure paths both need this, not just one.
+            continue
         hit_type, hit_price, hit_time = scan_candles_for_hit(trade, gold_df)
         if hit_type is None:
             continue

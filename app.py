@@ -2676,7 +2676,8 @@ def admin_recent_trades():
             "entry": t.get("entry"), "stop": t.get("stop"), "target": t.get("target"),
             "result": t.get("result"), "pnl": t.get("pnl"), "time": t.get("time"),
             "opened_at": t.get("opened_at"), "risk_pct": t.get("risk_pct"),
-            "mt5_ticket": t.get("mt5_ticket"),
+            "mt5_ticket": t.get("mt5_ticket"), "confidence": t.get("confidence"),
+            "confluence_score": t.get("confluence_score"),
         } for t in recent
     ]})
 

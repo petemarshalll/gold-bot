@@ -2681,6 +2681,30 @@ def admin_recent_trades():
     ]})
 
 
+@app.route('/admin/recent-shadow-trades', methods=['GET'])
+def admin_recent_shadow_trades():
+    """Read-only -- last N shadow trades (default 20, override with
+    ?limit=N) with confidence/confluence data, for analysing whether
+    the scoring system is actually well-calibrated."""
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        limit = int(request.args.get('limit', 20))
+    except ValueError:
+        limit = 20
+    recent = shadow_trades[-limit:]
+    return jsonify({"status": "ok", "shadow_trades": [
+        {
+            "trade_id": t.get("id"), "type": t.get("type"), "direction": t.get("direction"),
+            "result": t.get("result"), "pnl": t.get("pnl"), "r_multiple": t.get("r_multiple"),
+            "confidence": t.get("confidence"), "confluence_score": t.get("confluence_score"),
+            "rejection_reason": t.get("rejection_reason"), "session": t.get("session"),
+            "opened_at": t.get("opened_at"),
+        } for t in recent
+    ]})
+
+
 @app.route('/admin/remove-trade', methods=['POST'])
 def admin_remove_trade():
     """

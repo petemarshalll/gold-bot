@@ -2403,6 +2403,10 @@ def mt5_status():
         "mt5_live_price": price_info,
         "mt5_candles": candle_info,
         "app_instance": {"id": INSTANCE_ID, "started_at": INSTANCE_STARTED_AT},
+        "safety_toggles": {
+            "drawdown_protection_disabled": DRAWDOWN_PROTECTION_DISABLED,
+            "daily_loss_limit_disabled": DAILY_LOSS_LIMIT_DISABLED,
+        },
     })
 
 

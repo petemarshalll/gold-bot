@@ -14,6 +14,7 @@ import zipfile
 import io
 import threading
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -120,6 +121,18 @@ PROP_FIRM_RULES = {
 }
 
 current_balance = 10000
+
+# Computed once, when this process starts -- the actual empirical test
+# for whether Railway is running more than one instance of this app.
+# A single process always returns the same ID; if repeated calls to
+# /mt5/status show different IDs, that's direct proof of more than
+# one process independently handling requests, each with its own
+# separate in-memory state (confirmed as the likely explanation for
+# a genuine, repeated symptom, 5 Aug -- admin/recent-trades showing
+# stale data even after a real closure had already been correctly
+# reported by the bridge).
+INSTANCE_ID = str(uuid.uuid4())[:8]
+INSTANCE_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # Bridge watchdog state -- tracks whether the local MT5 bridge is
 # still alive and polling, so a silent crash/disconnect/PC sleep
@@ -2380,6 +2393,7 @@ def mt5_status():
         "bridge_heartbeat": heartbeat_info,
         "mt5_live_price": price_info,
         "mt5_candles": candle_info,
+        "app_instance": {"id": INSTANCE_ID, "started_at": INSTANCE_STARTED_AT},
     })
 
 

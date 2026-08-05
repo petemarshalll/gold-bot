@@ -2652,7 +2652,8 @@ def admin_recent_trades():
             "trade_id": t.get("id"), "type": t.get("type"), "direction": t.get("direction"),
             "entry": t.get("entry"), "stop": t.get("stop"), "target": t.get("target"),
             "result": t.get("result"), "pnl": t.get("pnl"), "time": t.get("time"),
-            "opened_at": t.get("opened_at"),
+            "opened_at": t.get("opened_at"), "risk_pct": t.get("risk_pct"),
+            "mt5_ticket": t.get("mt5_ticket"),
         } for t in recent
     ]})
 

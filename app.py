@@ -64,12 +64,15 @@ drawdown_protection = False
 # gets tracked normally either way -- this only controls whether that
 # count is allowed to actually change trade behavior.
 DRAWDOWN_PROTECTION_DISABLED = True
-# Set False to re-enable the daily loss limit actually blocking new
-# trades from being logged once real capital is at stake. This is the
-# real enforcement (check_risk_cap_before_trade) -- separate from the
-# daily loss WARNING messages sent to Telegram, which are purely
-# informational either way and still fire regardless of this flag.
-DAILY_LOSS_LIMIT_DISABLED = True
+# Re-enabled (8 Aug) after its absence directly caused a real FTMO
+# breach: disabled during 5 Aug, 5 real losses totalled -$519.64
+# against the -$500 daily limit with nothing to stop new trades once
+# the day's losses got close -- account was auto-closed and locked
+# read-only as a direct result. This is the real enforcement
+# (check_risk_cap_before_trade) -- separate from the daily loss
+# WARNING messages sent to Telegram, which are purely informational
+# either way and fire regardless of this flag.
+DAILY_LOSS_LIMIT_DISABLED = False
 last_trading_day = None
 last_pnl_reset_day = None
 daily_alert_count = 0
@@ -123,7 +126,11 @@ PROP_FIRM_RULES = {
     "max_daily_loss_pct": 5.0,
     "max_total_drawdown_pct": 10.0,   # static/non-trailing on the 2-Step path
     "min_trading_days": 4,             # per phase -- matches FTMO's number already
-    "max_loss_per_trade_pct": 1.0,     # Pete's own risk-per-trade convention, not an FTMO rule
+    "max_loss_per_trade_pct": 0.5,     # halved from 1.0% (8 Aug), directly
+    # because of a real breach: 5 real losses on 5 Aug totalled -$519.64
+    # against FTMO's -$500 (5%) daily limit -- at 0.5% risk, the same
+    # 5-loss streak would only total ~-$260, comfortably inside the
+    # limit even with the daily-loss-limit enforcement re-disabled.
 }
 
 current_balance = 10000

@@ -53,11 +53,42 @@ def data_path(filename):
 # MEMORY
 # ============================================================
 recent_alerts = []
-paper_trades = []
-active_trades = {}
-daily_losses = 0
-consecutive_losses = 0
-drawdown_protection = False
+
+# ============================================================
+# A/B/C VARIANT TESTING (9 Aug)
+# Same incoming signal, same shared Claude analysis -- three
+# independent judgment calls on whether to act on it, each routed to
+# its own real MT5 account so every variant gets genuine, real
+# execution data, not a shadow approximation.
+#
+# A: current system exactly as-is (control).
+# B: same, but the FVG/SWEEP confidence-override rules never run --
+#    confidence stays at Claude's own raw, original value.
+# C: same as A (override included), but additionally requires a real
+#    confluence-score floor before taking the trade -- there isn't
+#    one today.
+#
+# Every one of the ten pieces of state below is keyed by variant, so
+# each account's trades, balance, and daily/consecutive-loss counters
+# are genuinely isolated from the other two -- a bad day on B can't
+# touch A or C's own limits, same as three separate real accounts.
+# ============================================================
+VARIANTS = ["A", "B", "C"]
+VARIANT_MIN_CONFLUENCE_SCORE = 6  # C's explicit floor -- A and B have none
+
+paper_trades = {v: [] for v in VARIANTS}
+active_trades = {v: {} for v in VARIANTS}
+consecutive_losses = {v: 0 for v in VARIANTS}
+shadow_trades = {v: [] for v in VARIANTS}
+active_shadow_trades = {v: {} for v in VARIANTS}
+mt5_pending_trades = {v: {} for v in VARIANTS}
+current_balance = {v: 10000 for v in VARIANTS}
+daily_pnl = {v: 0 for v in VARIANTS}
+total_pnl = {v: 0 for v in VARIANTS}
+trading_days = {v: 0 for v in VARIANTS}
+
+drawdown_protection = {v: False for v in VARIANTS}
+
 # Set False to re-enable drawdown protection's real effects (reduced
 # sizing, raised confidence bar) once past pure data-gathering and
 # real capital is actually at stake. consecutive_losses itself still
@@ -73,7 +104,7 @@ DRAWDOWN_PROTECTION_DISABLED = True
 # WARNING messages sent to Telegram, which are purely informational
 # either way and fire regardless of this flag.
 DAILY_LOSS_LIMIT_DISABLED = False
-last_trading_day = None
+last_trading_day = {v: None for v in VARIANTS}
 last_pnl_reset_day = None
 daily_alert_count = 0
 scheduler = None
@@ -99,8 +130,16 @@ BOT_VERSION = "1.0.0"
 # "No trade" / N/A response has nothing to test and is correctly
 # never tracked here.
 # ============================================================
-shadow_trades = []
-active_shadow_trades = {}
+# SHADOW TRACKING
+# Tracks the outcome of alerts that DIDN'T become real trades —
+# rejected for low confidence, or because price never reached the
+# stated entry zone — but where Claude gave real, extractable
+# stop/target numbers. Kept completely separate from real trades:
+# separate storage, separate monitoring, never touches daily_pnl,
+# total_pnl, current_balance, or drawdown_protection. An explicit
+# "No trade" / N/A response has nothing to test and is correctly
+# never tracked here. (Declared above, keyed by variant.)
+# ============================================================
 
 # ============================================================
 # MT5 BRIDGE QUEUE
@@ -113,8 +152,8 @@ active_shadow_trades = {}
 # Status flow: PENDING -> DISPATCHED (served via GET, not yet
 # confirmed) -> PLACED (bridge confirmed a real ticket) or FAILED
 # (bridge reported an error, e.g. market closed, invalid symbol).
+# (Declared above, keyed by variant.)
 # ============================================================
-mt5_pending_trades = {}
 
 # ============================================================
 # PROP FIRM RULES
@@ -132,8 +171,6 @@ PROP_FIRM_RULES = {
     # 5-loss streak would only total ~-$260, comfortably inside the
     # limit even with the daily-loss-limit enforcement re-disabled.
 }
-
-current_balance = 10000
 
 # Computed once, when this process starts -- the actual empirical test
 # for whether Railway is running more than one instance of this app.
@@ -155,20 +192,23 @@ INSTANCE_STARTED_AT = datetime.now(timezone.utc).isoformat()
 # not just a backup notification, so the gap before it fires matters
 # much more than it used to. The bridge heartbeats every 20s, so 1min
 # still tolerates a couple of missed beats before firing.
-last_bridge_heartbeat = None
-bridge_watchdog_alerted = False
+#
+# One watchdog entry PER VARIANT (9 Aug) -- three separate bridges now,
+# each needs its own liveness tracking; one going quiet shouldn't be
+# masked by the other two still heartbeating fine.
+last_bridge_heartbeat = {v: None for v in VARIANTS}
+bridge_watchdog_alerted = {v: False for v in VARIANTS}
 BRIDGE_HEARTBEAT_TIMEOUT_MINUTES = 1
 
-# Live price relayed from the bridge, preferred over yfinance for
-# trade monitoring whenever it's fresh enough to trust. Falls back to
-# yfinance if the bridge hasn't sent an update recently -- e.g. bridge
-# briefly down -- so monitoring never just stops working.
+# Live price/candles relayed from the bridge -- genuinely shared
+# across all three variants (gold's real price is the same number
+# regardless of which account it's viewed from), so only ONE bridge
+# needs to relay this (variant A's, by convention) rather than three
+# redundant copies of identical market data. Falls back to yfinance
+# if the bridge hasn't sent an update recently -- e.g. bridge briefly
+# down -- so monitoring never just stops working.
 mt5_live_price = {"bid": None, "ask": None, "updated_at": None}
 MT5_PRICE_STALENESS_SECONDS = 60
-
-daily_pnl = 0
-total_pnl = 0
-trading_days = 0
 
 # ============================================================
 # KEY LEVELS
@@ -219,15 +259,23 @@ def load_state():
         with open(data_path('bot_state.json'), 'r') as f:
             state = json.load(f)
         KEY_LEVELS.update(state.get('key_levels', {}))
-        paper_trades = state.get('paper_trades', [])
-        active_trades = state.get('active_trades', {})
-        shadow_trades = state.get('shadow_trades', [])
-        active_shadow_trades = state.get('active_shadow_trades', {})
-        daily_pnl = state.get('daily_pnl', 0)
-        total_pnl = state.get('total_pnl', 0)
-        current_balance = state.get('current_balance', 10000)
-        trading_days = state.get('trading_days', 0)
-        consecutive_losses = state.get('consecutive_losses', 0)
+        saved_paper_trades = state.get('paper_trades', {})
+        if isinstance(saved_paper_trades, list):
+            # Old, pre-variant flat format (from the now-ended FTMO
+            # account) -- deliberately NOT migrated into any one
+            # variant, since guessing which of A/B/C it "belongs" to
+            # would be arbitrary and misleading. Starts fresh instead.
+            print("Old flat-format state found (pre-A/B/C) -- starting fresh for the new variant structure, not migrating it")
+        else:
+            paper_trades = {v: saved_paper_trades.get(v, []) for v in VARIANTS}
+            active_trades = {v: state.get('active_trades', {}).get(v, {}) for v in VARIANTS}
+            shadow_trades = {v: state.get('shadow_trades', {}).get(v, []) for v in VARIANTS}
+            active_shadow_trades = {v: state.get('active_shadow_trades', {}).get(v, {}) for v in VARIANTS}
+            daily_pnl = {v: state.get('daily_pnl', {}).get(v, 0) for v in VARIANTS}
+            total_pnl = {v: state.get('total_pnl', {}).get(v, 0) for v in VARIANTS}
+            current_balance = {v: state.get('current_balance', {}).get(v, 10000) for v in VARIANTS}
+            trading_days = {v: state.get('trading_days', {}).get(v, 0) for v in VARIANTS}
+            consecutive_losses = {v: state.get('consecutive_losses', {}).get(v, 0) for v in VARIANTS}
         last_trading_day = state.get('last_trading_day', None)
         last_pnl_reset_day = state.get('last_pnl_reset_day', None)
         daily_alert_count = state.get('daily_alert_count', 0)
@@ -236,11 +284,13 @@ def load_state():
         # after any restart, e.g. after several idle days.
         ensure_daily_reset()
         # drawdown_protection itself isn't persisted (only the
-        # consecutive_losses count is) — recompute it here so a
-        # restart can't show a misleading "OFF" status when the
-        # underlying loss streak actually hasn't cleared.
-        check_drawdown_protection()
-        print(f"State loaded — {len(paper_trades)} trades, {len(shadow_trades)} shadow trades, balance ${current_balance}")
+        # consecutive_losses count is) — recompute it here, per
+        # variant, so a restart can't show a misleading "OFF" status
+        # when the underlying loss streak actually hasn't cleared.
+        for v in VARIANTS:
+            check_drawdown_protection(v)
+        counts = {v: len(paper_trades[v]) for v in VARIANTS}
+        print(f"State loaded — trades per variant: {counts}, balances: {current_balance}")
     except FileNotFoundError:
         print("No saved state found — starting fresh")
     except Exception as e:
@@ -432,15 +482,15 @@ def check_hour_quality():
 # ============================================================
 # DRAWDOWN PROTECTION
 # ============================================================
-def check_drawdown_protection():
+def check_drawdown_protection(variant):
     global consecutive_losses, drawdown_protection
     if DRAWDOWN_PROTECTION_DISABLED:
-        drawdown_protection = False
+        drawdown_protection[variant] = False
         return False, "Normal trading mode (drawdown protection disabled for data-gathering phase)"
-    if consecutive_losses >= 3:
-        drawdown_protection = True
-        return True, f"⚠️ DRAWDOWN PROTECTION ACTIVE — {consecutive_losses} consecutive losses."
-    drawdown_protection = False
+    if consecutive_losses[variant] >= 3:
+        drawdown_protection[variant] = True
+        return True, f"⚠️ DRAWDOWN PROTECTION ACTIVE — {consecutive_losses[variant]} consecutive losses."
+    drawdown_protection[variant] = False
     return False, "Normal trading mode"
 
 # ============================================================
@@ -643,10 +693,11 @@ def log_to_csv(alert_type, price, confidence, analysis):
 # ============================================================
 # PAPER TRADE TRACKER
 # ============================================================
-def log_paper_trade(alert_type, price, direction, entry, stop, target, confidence, alert_time, context=None):
-    trade_id = f"{alert_type}_{alert_time.replace(':', '').replace(' ', '_')}"
+def log_paper_trade(variant, alert_type, price, direction, entry, stop, target, confidence, alert_time, context=None):
+    trade_id = f"{variant}_{alert_type}_{alert_time.replace(':', '').replace(' ', '_')}"
     trade = {
         "id": trade_id,
+        "variant": variant,
         "time": alert_time,
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "type": alert_type,
@@ -665,9 +716,9 @@ def log_paper_trade(alert_type, price, direction, entry, stop, target, confidenc
     # e.g. "BEARISH_FVG wins 80% in a killzone but 35% outside one".
     if context:
         trade.update(context)
-    paper_trades.append(trade)
-    active_trades[trade_id] = trade
-    queue_mt5_trade(trade)
+    paper_trades[variant].append(trade)
+    active_trades[variant][trade_id] = trade
+    queue_mt5_trade(variant, trade)
     try:
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
@@ -688,25 +739,27 @@ def load_mt5_queue():
     global mt5_pending_trades
     try:
         with open(data_path('mt5_queue.json'), 'r') as f:
-            mt5_pending_trades = json.load(f)
+            loaded = json.load(f)
+        mt5_pending_trades = {v: loaded.get(v, {}) for v in VARIANTS} if isinstance(loaded, dict) and any(v in loaded for v in VARIANTS) else {v: {} for v in VARIANTS}
     except FileNotFoundError:
-        mt5_pending_trades = {}
+        mt5_pending_trades = {v: {} for v in VARIANTS}
     except Exception as e:
         print(f"MT5 queue load error: {e}")
+        mt5_pending_trades = {v: {} for v in VARIANTS}
 
 
-def queue_mt5_trade(trade):
+def queue_mt5_trade(variant, trade):
     """
     Adds a trade that already passed the normal would_log gate to the
-    MT5 bridge queue. Deliberately does NOT re-derive or re-check
-    confidence/validity here -- it reuses whatever log_paper_trade was
-    just called with, so this can never disagree with the paper-trade
-    decision. risk_pct is read the same way apply_trade_pnl() reads it,
-    so a reduced-risk trade during drawdown queues at the correct
-    (already-halved) size automatically.
+    MT5 bridge queue for that specific variant's account. Deliberately
+    does NOT re-derive or re-check confidence/validity here -- it
+    reuses whatever log_paper_trade was just called with, so this can
+    never disagree with the paper-trade decision. risk_pct is read the
+    same way apply_trade_pnl() reads it, so a reduced-risk trade during
+    drawdown queues at the correct (already-halved) size automatically.
     """
     risk_pct = trade.get('risk_pct', PROP_FIRM_RULES["max_loss_per_trade_pct"])
-    mt5_pending_trades[trade['id']] = {
+    mt5_pending_trades[variant][trade['id']] = {
         "trade_id": trade['id'],
         "status": "PENDING",
         "queued_at": datetime.now(timezone.utc).isoformat(),
@@ -724,17 +777,19 @@ def queue_mt5_trade(trade):
     save_mt5_queue()
 
 
-def log_shadow_trade(alert_type, price, direction, entry, stop, target, confidence, rejection_reason, context=None):
+def log_shadow_trade(variant, alert_type, price, direction, entry, stop, target, confidence, rejection_reason, context=None):
     """
-    Records an alert that did NOT become a real trade, but where
-    Claude gave real, extractable stop/target numbers — so its
-    outcome can still be tracked and learned from. Completely
-    separate storage from real trades; never touches daily_pnl,
-    total_pnl, current_balance, or drawdown_protection.
+    Records an alert that did NOT become a real trade for this
+    specific variant, but where Claude gave real, extractable
+    stop/target numbers — so its outcome can still be tracked and
+    learned from. Completely separate storage from real trades; never
+    touches daily_pnl, total_pnl, current_balance, or
+    drawdown_protection.
     """
-    trade_id = f"SHADOW_{alert_type}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+    trade_id = f"SHADOW_{variant}_{alert_type}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
     trade = {
         "id": trade_id,
+        "variant": variant,
         "time": datetime.utcnow().strftime('%H:%M UTC'),
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "type": alert_type,
@@ -750,8 +805,8 @@ def log_shadow_trade(alert_type, price, direction, entry, stop, target, confiden
     }
     if context:
         trade.update(context)
-    shadow_trades.append(trade)
-    active_shadow_trades[trade_id] = trade
+    shadow_trades[variant].append(trade)
+    active_shadow_trades[variant][trade_id] = trade
     try:
         with open(data_path('shadow_trades.json'), 'w') as f:
             json.dump(shadow_trades, f, indent=2)
@@ -760,7 +815,7 @@ def log_shadow_trade(alert_type, price, direction, entry, stop, target, confiden
     return trade_id
 
 
-def monitor_shadow_trades(gold_df):
+def monitor_shadow_trades(variant, gold_df):
     """
     Wick-aware monitoring for shadow trades, reusing the exact same
     scan_candles_for_hit() logic already validated for real trades —
@@ -772,7 +827,7 @@ def monitor_shadow_trades(gold_df):
     drawdown_protection.
     """
     trades_to_close = []
-    for trade_id, trade in list(active_shadow_trades.items()):
+    for trade_id, trade in list(active_shadow_trades[variant].items()):
         if trade.get('result') != 'OPEN':
             continue
         hit_type, hit_price, hit_time = scan_candles_for_hit(trade, gold_df)
@@ -792,7 +847,7 @@ def monitor_shadow_trades(gold_df):
         trade['r_multiple'] = round(pnl / risk_amount, 2) if risk_amount > 0 else 0
         trades_to_close.append(trade_id)
     for trade_id in trades_to_close:
-        del active_shadow_trades[trade_id]
+        del active_shadow_trades[variant][trade_id]
     if trades_to_close:
         try:
             with open(data_path('shadow_trades.json'), 'w') as f:
@@ -803,6 +858,17 @@ def monitor_shadow_trades(gold_df):
 # ============================================================
 # CONFLUENCE SCORE EXTRACTION
 # ============================================================
+def variant_confluence_ok(variant, confluence_score):
+    """Variant C's explicit confluence-score floor -- A and B have
+    none. The only piece of the A/B/C decision logic that isn't
+    already covered by derive_trade_decision's apply_override
+    parameter, kept as its own small function so the shadow-tracking
+    and real-trade paths can share it and never disagree."""
+    if variant != "C":
+        return True
+    return confluence_score is not None and confluence_score >= VARIANT_MIN_CONFLUENCE_SCORE
+
+
 def extract_confluence_score(analysis):
     """Pulls the numeric X/10 confluence score out of Claude's analysis
     text so it can be logged alongside the trade, instead of being
@@ -867,19 +933,23 @@ def extract_confidence(analysis):
 # reactively after trades close (which is what daily_pnl/
 # drawdown_protection already do via apply_trade_pnl).
 # ============================================================
-def get_open_risk_exposure():
+def get_open_risk_exposure(variant):
     account = PROP_FIRM_RULES["account_size"]
     risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
-    open_count = sum(1 for t in active_trades.values() if t.get('result') == 'OPEN')
+    open_count = sum(1 for t in active_trades[variant].values() if t.get('result') == 'OPEN')
     return open_count * risk_per_trade, open_count
 
 def ensure_daily_reset():
     """
-    Resets daily_pnl and daily_alert_count if the UTC day has rolled
-    over since the last reset. Centralised so every caller — the
-    scheduled midnight job, the pre-trade risk check, each incoming
-    webhook, and load_state on restart — shares one source of truth
-    for "is it a new day yet" instead of drifting out of sync.
+    Resets daily_pnl (for every variant) and daily_alert_count if the
+    UTC day has rolled over since the last reset. Centralised so every
+    caller — the scheduled midnight job, the pre-trade risk check,
+    each incoming webhook, and load_state on restart — shares one
+    source of truth for "is it a new day yet" instead of drifting out
+    of sync. last_pnl_reset_day and daily_alert_count stay shared
+    across variants deliberately — they're about incoming signals,
+    which are identical for all three variants (one signal triggers
+    all three at once), not about any one variant's own trading.
     Called from multiple places deliberately: if any one of them
     fails to run for some reason, the others still guarantee this
     can't silently get stuck the way the old single-path reset did.
@@ -887,17 +957,20 @@ def ensure_daily_reset():
     global daily_pnl, last_pnl_reset_day, daily_alert_count
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     if last_pnl_reset_day != today_str:
-        daily_pnl = 0
+        for v in VARIANTS:
+            daily_pnl[v] = 0
         daily_alert_count = 0
         last_pnl_reset_day = today_str
         print(f"Daily counters reset for new UTC day: {today_str}")
 
 
-def check_risk_cap_before_trade():
-    """Returns (allowed: bool, message: str). Disallows opening a new
-    paper trade if doing so — combined with the worst case of all
-    currently open trades hitting stop loss — would exceed the
-    account's daily loss limit.
+def check_risk_cap_before_trade(variant):
+    """Returns (allowed: bool, message: str) for a specific variant.
+    Disallows opening a new paper trade if doing so — combined with
+    the worst case of all that variant's currently open trades hitting
+    stop loss — would exceed that variant's own account's daily loss
+    limit. Entirely independent per variant: a bad day on one account
+    can't block or be blocked by the other two.
 
     Checks and self-heals the daily reset on every single call,
     independent of the scheduled midnight job or a trade closing.
@@ -918,11 +991,11 @@ def check_risk_cap_before_trade():
     account = PROP_FIRM_RULES["account_size"]
     risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
     daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
-    existing_risk, open_count = get_open_risk_exposure()
-    already_lost_today = abs(min(daily_pnl, 0))
+    existing_risk, open_count = get_open_risk_exposure(variant)
+    already_lost_today = abs(min(daily_pnl[variant], 0))
     projected_worst_case = already_lost_today + existing_risk + risk_per_trade
     if projected_worst_case > daily_loss_limit:
-        return False, (f"⚠️ Trade NOT logged — opening it would risk a worst-case "
+        return False, (f"⚠️ [{variant}] Trade NOT logged — opening it would risk a worst-case "
                         f"${projected_worst_case:,.2f} today (across {open_count} open "
                         f"trade(s) + today's losses already taken), beyond the "
                         f"{PROP_FIRM_RULES['max_daily_loss_pct']}% daily limit "
@@ -932,16 +1005,17 @@ def check_risk_cap_before_trade():
 # ============================================================
 # MONITOR ACTIVE TRADES
 # ============================================================
-def apply_trade_pnl(trade, result, real_pnl_override=None):
+def apply_trade_pnl(variant, trade, result, real_pnl_override=None):
     """
     Converts a closed paper trade's points result into account-level
-    PnL using the trade's OWN stored risk percentage — normally the
-    standard 1% (PROP_FIRM_RULES), but a reduced-risk drawdown trade
-    stores half that at logging time. Using the trade's own stored
-    value (rather than always reading the current global rate) matters
-    because a trade can close well after it opened, potentially after
-    drawdown status has changed — PnL must reflect what THIS trade was
-    actually risked at, not whatever the rate happens to be now.
+    PnL for a specific variant's own account, using the trade's OWN
+    stored risk percentage — normally the standard 0.5% (PROP_FIRM_
+    RULES), but a reduced-risk drawdown trade stores half that at
+    logging time. Using the trade's own stored value (rather than
+    always reading the current global rate) matters because a trade
+    can close well after it opened, potentially after drawdown status
+    has changed — PnL must reflect what THIS trade was actually risked
+    at, not whatever the rate happens to be now.
 
     real_pnl_override: when a trade was placed via the MT5 bridge and
     MT5 itself reports the real closed profit (real execution, real
@@ -952,8 +1026,9 @@ def apply_trade_pnl(trade, result, real_pnl_override=None):
     behavior unchanged.
 
     Updates daily_pnl / total_pnl / current_balance / trading_days /
-    consecutive_losses so /prop-status and drawdown protection reflect
-    real trade outcomes instead of requiring a manual /update-pnl call.
+    consecutive_losses for THIS variant only so /prop-status and
+    drawdown protection reflect real trade outcomes on that specific
+    account — completely isolated from the other two variants.
     """
     global daily_pnl, total_pnl, current_balance, trading_days
     global consecutive_losses, last_trading_day, last_pnl_reset_day
@@ -965,19 +1040,19 @@ def apply_trade_pnl(trade, result, real_pnl_override=None):
     if real_pnl_override is not None:
         pnl = real_pnl_override
         if result == 'WIN':
-            consecutive_losses = 0
+            consecutive_losses[variant] = 0
         else:
-            consecutive_losses += 1
+            consecutive_losses[variant] += 1
     else:
         stop_distance = abs(trade['entry'] - trade['stop'])
         dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
         if result == 'WIN':
             points = abs(trade['target'] - trade['entry'])
             pnl = dollar_per_point * points
-            consecutive_losses = 0
+            consecutive_losses[variant] = 0
         else:
             pnl = -risk_amount
-            consecutive_losses += 1
+            consecutive_losses[variant] += 1
 
     # Store the actual outcome magnitude on the trade record itself —
     # not just result WIN/LOSS, but the real dollar pnl and R multiple
@@ -989,27 +1064,27 @@ def apply_trade_pnl(trade, result, real_pnl_override=None):
 
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     ensure_daily_reset()
-    if last_trading_day != today_str:
-        trading_days += 1
-        last_trading_day = today_str
+    if last_trading_day[variant] != today_str:
+        trading_days[variant] += 1
+        last_trading_day[variant] = today_str
 
-    daily_pnl += pnl
-    total_pnl += pnl
-    current_balance += pnl
+    daily_pnl[variant] += pnl
+    total_pnl[variant] += pnl
+    current_balance[variant] += pnl
 
-    check_drawdown_protection()
+    check_drawdown_protection(variant)
 
     daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
     total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
     warnings = []
-    if abs(min(daily_pnl, 0)) >= daily_loss_limit:
-        warnings.append("🚨 DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
-    elif abs(min(daily_pnl, 0)) >= daily_loss_limit * 0.8:
-        warnings.append(f"⚠️ DAILY LOSS WARNING — at {(abs(min(daily_pnl, 0)) / account) * 100:.1f}% of limit")
-    if abs(min(total_pnl, 0)) >= total_drawdown_limit:
-        warnings.append("🚨 TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
-    if consecutive_losses == 3:
-        warnings.append(f"⚠️ DRAWDOWN PROTECTION ACTIVE — {consecutive_losses} consecutive losses, confidence threshold raised")
+    if abs(min(daily_pnl[variant], 0)) >= daily_loss_limit:
+        warnings.append(f"🚨 [{variant}] DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
+    elif abs(min(daily_pnl[variant], 0)) >= daily_loss_limit * 0.8:
+        warnings.append(f"⚠️ [{variant}] DAILY LOSS WARNING — at {(abs(min(daily_pnl[variant], 0)) / account) * 100:.1f}% of limit")
+    if abs(min(total_pnl[variant], 0)) >= total_drawdown_limit:
+        warnings.append(f"🚨 [{variant}] TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
+    if consecutive_losses[variant] == 3:
+        warnings.append(f"⚠️ [{variant}] DRAWDOWN PROTECTION ACTIVE — {consecutive_losses[variant]} consecutive losses, confidence threshold raised")
     if warnings:
         send_telegram("\n".join(warnings))
 
@@ -1088,14 +1163,15 @@ def scan_candles_for_hit(trade, gold_df):
     return None, None, None
 
 
-def thorough_scan_active_trades(gold_df):
+def thorough_scan_active_trades(variant, gold_df):
     """
-    Runs after the normal quick check in /monitor-trades. Only looks
-    at trades still OPEN after that check, and catches any that were
-    actually hit via a wick the latest-close check missed.
+    Runs after the normal quick check in /monitor-trades, for one
+    specific variant's own account. Only looks at trades still OPEN
+    after that check, and catches any that were actually hit via a
+    wick the latest-close check missed.
     """
     trades_to_close = []
-    for trade_id, trade in list(active_trades.items()):
+    for trade_id, trade in list(active_trades[variant].items()):
         if trade.get('result') != 'OPEN':
             continue
         if trade.get('mt5_ticket'):
@@ -1113,7 +1189,7 @@ def thorough_scan_active_trades(gold_df):
         direction = trade['direction']
         points = abs(hit_price - entry)
         trade['result'] = hit_type
-        pnl = apply_trade_pnl(trade, hit_type)
+        pnl = apply_trade_pnl(variant, trade, hit_type)
         emoji = "✅" if hit_type == "WIN" else "❌"
         label = "TARGET HIT" if hit_type == "WIN" else "STOP HIT"
         level_label = "Target" if hit_type == "WIN" else "Stop"
@@ -1127,18 +1203,18 @@ def thorough_scan_active_trades(gold_df):
         sign = "+" if hit_type == "WIN" else "-"
         pnl_sign = "+" if pnl >= 0 else ""
         send_telegram(f"""
-{emoji} *TRADE CLOSED — {label} (wick-detected)*
+{emoji} *[{variant}] TRADE CLOSED — {label} (wick-detected)*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
 {level_label}: {hit_price} ← touched around {hit_time_str}
-Result: {hit_type} {emoji} {sign}{points:.2f} points ({pnl_sign}${pnl:.2f}) | Balance: ${current_balance:,.2f}
+Result: {hit_type} {emoji} {sign}{points:.2f} points ({pnl_sign}${pnl:.2f}) | Balance: ${current_balance[variant]:,.2f}
 
 ℹ️ Caught via candle high/low scan, not the live 2-minute price check — price touched this level and may have moved elsewhere since. A real resting stop/limit order would have filled here regardless.
 """)
         trades_to_close.append(trade_id)
     for trade_id in trades_to_close:
-        del active_trades[trade_id]
+        del active_trades[variant][trade_id]
     if trades_to_close:
         try:
             with open(data_path('paper_trades.json'), 'w') as f:
@@ -1147,7 +1223,7 @@ Result: {hit_type} {emoji} {sign}{points:.2f} points ({pnl_sign}${pnl:.2f}) | Ba
             print(f"Paper trade update error: {e}")
 
 
-def monitor_active_trades(current_price):
+def monitor_active_trades(variant, current_price):
     current_price = float(current_price)
     # A single 2-minute price reading isn't trusted enough on its own to
     # credit a WIN/LOSS anymore -- confirmed via two real cases (4 Aug)
@@ -1159,7 +1235,7 @@ def monitor_active_trades(current_price):
     # polls before it's trusted. A genuinely bad, one-off reading won't
     # repeat; a real move will still be past the level 2 minutes later.
     trades_to_close = []
-    for trade_id, trade in active_trades.items():
+    for trade_id, trade in active_trades[variant].items():
         if trade['result'] != 'OPEN':
             continue
         if trade.get('mt5_ticket'):
@@ -1193,25 +1269,25 @@ def monitor_active_trades(current_price):
             if trade.get('_pending_close') == 'WIN':
                 points = abs(target - entry)
                 trade['result'] = 'WIN'
-                pnl = apply_trade_pnl(trade, 'WIN')
+                pnl = apply_trade_pnl(variant, trade, 'WIN')
                 # points/pnl correctly use `target`, not current_price --
                 # this note only clarifies the DISPLAYED price, since a
                 # 2-minute poll can catch price a little past the exact
                 # level rather than landing on it precisely.
                 gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - target):.2f}pts past target_" if abs(current_price - target) > (target * 0.001) else ""
                 send_telegram(f"""
-✅ *TRADE CLOSED — TARGET HIT*
+✅ *[{variant}] TRADE CLOSED — TARGET HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
 Target: {target} ✅ reached
-Result: WIN ✅ +{points:.2f} points (+${pnl:.2f}) | Balance: ${current_balance:,.2f}{gap_note}
+Result: WIN ✅ +{points:.2f} points (+${pnl:.2f}) | Balance: ${current_balance[variant]:,.2f}{gap_note}
 """)
                 trades_to_close.append(trade_id)
             else:
                 trade['_pending_close'] = 'WIN'
                 send_telegram(f"""
-⏳ *Target level reached, confirming*
+⏳ *[{variant}] Target level reached, confirming*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Target: {target} -- price check showed {current_price}. Holding off crediting until the next poll confirms this wasn't a one-off bad reading.
@@ -1220,21 +1296,21 @@ Target: {target} -- price check showed {current_price}. Holding off crediting un
             if trade.get('_pending_close') == 'LOSS':
                 points = abs(stop - entry)
                 trade['result'] = 'LOSS'
-                pnl = apply_trade_pnl(trade, 'LOSS')
+                pnl = apply_trade_pnl(variant, trade, 'LOSS')
                 gap_note = f"\n_Price check ran at {current_price} -- {abs(current_price - stop):.2f}pts past stop_" if abs(current_price - stop) > (stop * 0.001) else ""
                 send_telegram(f"""
-❌ *TRADE CLOSED — STOP HIT*
+❌ *[{variant}] TRADE CLOSED — STOP HIT*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Entry: {entry}
 Stop: {stop} ❌ hit
-Result: LOSS ❌ -{points:.2f} points (${pnl:.2f}) | Balance: ${current_balance:,.2f}{gap_note}
+Result: LOSS ❌ -{points:.2f} points (${pnl:.2f}) | Balance: ${current_balance[variant]:,.2f}{gap_note}
 """)
                 trades_to_close.append(trade_id)
             else:
                 trade['_pending_close'] = 'LOSS'
                 send_telegram(f"""
-⏳ *Stop level reached, confirming*
+⏳ *[{variant}] Stop level reached, confirming*
 Alert: {trade['type']} | {trade['time']}
 Direction: {direction}
 Stop: {stop} -- price check showed {current_price}. Holding off crediting until the next poll confirms this wasn't a one-off bad reading.
@@ -1245,7 +1321,7 @@ Stop: {stop} -- price check showed {current_price}. Holding off crediting until 
             # rather than let a stale flag silently linger.
             trade.pop('_pending_close', None)
     for trade_id in trades_to_close:
-        del active_trades[trade_id]
+        del active_trades[variant][trade_id]
     try:
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
@@ -1463,14 +1539,21 @@ Total response must be under 200 words. Every section one line maximum.
 """
 
 
-def derive_trade_decision(analysis, alert_type, entry_price):
+def derive_trade_decision(analysis, alert_type, entry_price, apply_override=True):
     """
     Exact copy of the live decision logic from process_webhook_alert
     (SL/TP extraction, direction-from-SL/TP, valid_trade check,
     entry-zone-actionability check) — deliberately duplicated rather
-    than refactored out of the live webhook path tonight, to avoid
-    touching live-critical code again this late in the session. If
-    the live logic changes later, this copy needs updating to match.
+    than refactored out of the live webhook path, to avoid touching
+    live-critical code unnecessarily. If the live logic changes later,
+    this copy needs updating to match.
+
+    apply_override: True (default, existing behavior unchanged for the
+    backtest-replay caller) applies the FVG/SWEEP confidence-override
+    rules. False skips them, returning Claude's raw confidence as-is —
+    this is what variant B (the A/B/C test's override-removed variant)
+    needs for its own shadow-tracking to correctly reflect its own
+    judgment, not variant A/C's.
     """
     direction = "SHORT" if "BEARISH" in alert_type else "LONG"
     stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
@@ -1506,10 +1589,11 @@ def derive_trade_decision(analysis, alert_type, entry_price):
         direction = "LONG"
 
     confidence = extract_confidence(analysis)
-    if "FVG" in alert_type and confidence == "LOW":
-        confidence = "MEDIUM"
-    if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
-        confidence = "MEDIUM"
+    if apply_override:
+        if "FVG" in alert_type and confidence == "LOW":
+            confidence = "MEDIUM"
+        if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
+            confidence = "MEDIUM"
 
     valid_trade = False
     if direction == "LONG" and target_price > entry_price > stop_price:
@@ -1701,7 +1785,9 @@ Total response must be under 200 words. Every section one line maximum.
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.json
+        data = request.get_json(silent=True)
+        if data is None:
+            return jsonify({"status": "error", "message": "request body must be valid JSON with Content-Type: application/json"}), 400
         print(f"Alert received: {data}")
         alert_type = data.get('type', '')
 
@@ -1730,7 +1816,13 @@ def process_webhook_alert(data):
         session_name, session_desc, is_killzone = get_session()
         zone, zone_pct, zone_advice = get_premium_discount(data.get('price', 0))
         news_risk, news_msg = check_news_risk()
-        drawdown_active, drawdown_msg = check_drawdown_protection()
+        # Variant A's drawdown status specifically feeds the shared
+        # analysis prompt -- Claude needs SOME single representative
+        # value to reason about, and the underlying signal/analysis
+        # itself is genuinely shared across all three variants. Each
+        # variant's OWN drawdown status still independently governs
+        # its own sizing/filtering decision later in this function.
+        drawdown_active_a, drawdown_msg = check_drawdown_protection("A")
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
         hour_quality, hour_msg = check_hour_quality()
         spread_risk, spread_msg = check_spread(
@@ -1771,79 +1863,25 @@ def process_webhook_alert(data):
             context_lines.append(f"- {a['time']}: {a['type']} at {a['price']} ({a['timeframe']}){moved_str}")
         context = "\n".join(context_lines)
 
+        # ============================================================
+        # SHARED, ONCE PER SIGNAL: one Claude analysis, one Telegram
+        # alert -- identical to before A/B/C existed. Everything below
+        # this point is where the three variants' judgment diverges.
+        # ============================================================
         analysis = analyse_with_claude(
             data, context, session_name, session_desc,
             is_killzone, zone, zone_pct, zone_advice,
-            news_risk, news_msg, drawdown_active,
+            news_risk, news_msg, drawdown_active_a,
             dxy_direction, dxy_desc
         )
 
-        confidence = extract_confidence(analysis)
+        raw_confidence = extract_confidence(analysis)
+        overridden_confidence = raw_confidence
+        if "FVG" in alert_type and overridden_confidence == "LOW":
+            overridden_confidence = "MEDIUM"
+        if "BEARISH_SWEEP" in alert_type and overridden_confidence == "HIGH":
+            overridden_confidence = "MEDIUM"
 
-        if "FVG" in alert_type and confidence == "LOW":
-            confidence = "MEDIUM"
-        if "BEARISH_SWEEP" in alert_type and confidence == "HIGH":
-            confidence = "MEDIUM"
-
-        # Shadow tracking: record what WOULD have happened for every
-        # alert that does NOT become a real trade — including the two
-        # early-exit cases right below (drawdown-skip, news-suppress)
-        # — as long as Claude gave real, extractable stop/target
-        # numbers. An explicit "No trade"/N/A response has nothing to
-        # test and is correctly left untracked, not force-fit with
-        # fabricated levels. Wrapped defensively so a bug here can
-        # never block or alter the real trade path below.
-        try:
-            shadow_entry_price = float(data.get('price', 0))
-            shadow_decision = derive_trade_decision(analysis, alert_type, shadow_entry_price)
-            if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not shadow_decision["would_log"]:
-                if shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
-                    rejection_reason = "LOW_CONFIDENCE"
-                elif not shadow_decision["entry_zone_reached"]:
-                    rejection_reason = "ENTRY_ZONE_NOT_REACHED"
-                else:
-                    rejection_reason = "OTHER"
-                shadow_context = {
-                    "session": session_name,
-                    "killzone": is_killzone,
-                    "zone": zone,
-                    "zone_pct": zone_pct,
-                    "dxy_direction": dxy_direction,
-                    "dxy_implication": dxy_implication,
-                    "news_risk": news_risk,
-                    "spread_risk": spread_risk,
-                    "hour_quality": hour_quality,
-                    "confluence_score": extract_confluence_score(analysis),
-                }
-                log_shadow_trade(alert_type, data.get('price'), shadow_decision["direction"], shadow_entry_price,
-                                  shadow_decision["stop_price"], shadow_decision["target_price"],
-                                  shadow_decision["confidence"], rejection_reason, context=shadow_context)
-        except Exception as e:
-            print(f"Shadow tracking error (non-fatal, real trade path unaffected): {e}")
-
-        # LOW confidence is never traded, drawdown or not -- unchanged.
-        if drawdown_active and confidence == "LOW":
-            log_to_csv(alert_type, data.get('price'), "SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
-            return
-
-        # During an active drawdown streak, MEDIUM confidence trades are
-        # no longer blocked outright -- they're allowed through, but at
-        # HALF the normal risk size, rather than either fully blocking
-        # (which was stalling real data collection for days at a time)
-        # or fully exposing at normal size (the original bug). HIGH
-        # confidence is unaffected either way.
-        reduced_risk_trade = drawdown_active and confidence == "MEDIUM"
-
-        if news_risk and confidence != "HIGH":
-            send_telegram(f"⚠️ *Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
-            return
-
-        # Determine the ACTUAL trade direction (from Claude's stated
-        # SL/TP, not the raw alert_type label) BEFORE building the
-        # emoji or DXY confluence line, so both reflect the real
-        # proposed trade rather than the Pine Script alert keyword —
-        # sweep-type alerts are frequently reversal signals where
-        # these disagree.
         entry_price = float(data.get('price', 0))
         direction = "SHORT" if "BEARISH" in alert_type else "LONG"
         stop_price = entry_price * 1.005 if direction == "SHORT" else entry_price * 0.995
@@ -1898,7 +1936,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
 """
 
         send_telegram(telegram_message)
-        log_to_csv(alert_type, data.get('price'), confidence, analysis)
+        log_to_csv(alert_type, data.get('price'), overridden_confidence, analysis)
 
         valid_trade = False
         if direction == "LONG" and target_price > entry_price > stop_price:
@@ -1922,59 +1960,136 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
             if not (zone_low - buffer <= entry_price <= zone_high + buffer):
                 entry_zone_reached = False
 
-        if confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and sl_found and tp_found:
-            risk_ok, risk_msg = check_risk_cap_before_trade()
-            if risk_ok:
-                alert_time = datetime.utcnow().strftime('%H:%M UTC')
-                # Reduced-risk drawdown trades use half the normal risk
-                # percentage. Stored on the trade itself (not just used
-                # in the moment) so that if it closes later, PnL is
-                # correctly computed from what this SPECIFIC trade was
-                # actually opened at — not whatever the risk percentage
-                # or drawdown status happens to be by the time it closes.
-                risk_pct_for_trade = (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 2) if reduced_risk_trade else PROP_FIRM_RULES["max_loss_per_trade_pct"]
-                trade_context = {
-                    "session": session_name,
-                    "killzone": is_killzone,
-                    "zone": zone,
-                    "zone_pct": zone_pct,
-                    "dxy_direction": dxy_direction,
-                    "dxy_implication": dxy_implication,
-                    "news_risk": news_risk,
-                    "spread_risk": spread_risk,
-                    "hour_quality": hour_quality,
-                    "confluence_score": confluence_score,
-                    "risk_pct": risk_pct_for_trade,
-                }
-                if entry_zone:
-                    trade_context["entry_zone_low"] = entry_zone[0]
-                    trade_context["entry_zone_high"] = entry_zone[1]
-                if reduced_risk_trade:
-                    send_telegram(f"⚠️ *Reduced-size trade* — MEDIUM confidence during active drawdown protection, taking this at half normal risk ({risk_pct_for_trade}% instead of {PROP_FIRM_RULES['max_loss_per_trade_pct']}%).")
-                log_paper_trade(alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence, alert_time, context=trade_context)
-            else:
-                print(risk_msg)
-                send_telegram(risk_msg)
-        elif confidence in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and not (sl_found and tp_found):
-            # Claude didn't give a real, extractable stop AND target —
-            # most often an explicit "No trade" / N/A response. Without
-            # this check, the fallback percentage defaults above would
-            # get logged as if Claude had recommended them, which it
-            # didn't. The "No trade" reasoning is already visible in the
-            # main analysis message sent earlier, so no separate alert
-            # is needed here — just don't fabricate a trade from it.
-            print(f"Skipped logging paper trade — Claude did not provide a real extractable stop/target (likely an explicit 'No trade' response). Alert:{alert_type}")
-        elif confidence in ["HIGH", "MEDIUM"] and valid_trade and not entry_zone_reached:
-            msg = (f"⏳ *Setup noted — not logged as a trade*\n"
-                   f"Current price (${entry_price:,.2f}) hasn't reached the proposed "
-                   f"entry zone (${entry_zone[0]:,.2f}–${entry_zone[1]:,.2f}) yet. "
-                   f"This is a level to watch, not a live trade.")
-            print(msg)
-            send_telegram(msg)
-        elif confidence in ["HIGH", "MEDIUM"] and not valid_trade:
-            print(f"Skipped logging paper trade — SL/TP inconsistent. Dir:{direction} Entry:{entry_price} SL:{stop_price} TP:{target_price}")
+        # ============================================================
+        # PER VARIANT: same shared analysis above, three independent
+        # judgment calls on whether to act on it. Each wrapped in its
+        # own try/except so one variant's failure can't block the
+        # other two from processing the same signal.
+        # ============================================================
+        for variant in VARIANTS:
+            try:
+                confidence_used = raw_confidence if variant == "B" else overridden_confidence
+                drawdown_active, drawdown_reason = check_drawdown_protection(variant)
 
-        monitor_active_trades(data.get('price', 0))
+                # Shadow tracking for this variant specifically -- what
+                # WOULD have happened had it not been taken, using this
+                # variant's own confidence (raw for B, overridden for
+                # A/C) and its own confluence requirement (C only).
+                # Wrapped defensively so a bug here can never block or
+                # alter this variant's real trade path below.
+                try:
+                    shadow_decision = derive_trade_decision(
+                        analysis, alert_type, entry_price,
+                        apply_override=(variant != "B")
+                    )
+                    score_ok = variant_confluence_ok(variant, confluence_score)
+                    variant_would_log = shadow_decision["would_log"] and score_ok
+                    if shadow_decision["has_real_trade_params"] and shadow_decision["valid_trade"] and not variant_would_log:
+                        if shadow_decision["confidence"] not in ["HIGH", "MEDIUM"]:
+                            rejection_reason = "LOW_CONFIDENCE"
+                        elif not shadow_decision["entry_zone_reached"]:
+                            rejection_reason = "ENTRY_ZONE_NOT_REACHED"
+                        elif not score_ok:
+                            rejection_reason = "BELOW_CONFLUENCE_THRESHOLD"
+                        else:
+                            rejection_reason = "OTHER"
+                        shadow_context = {
+                            "session": session_name,
+                            "killzone": is_killzone,
+                            "zone": zone,
+                            "zone_pct": zone_pct,
+                            "dxy_direction": dxy_direction,
+                            "dxy_implication": dxy_implication,
+                            "news_risk": news_risk,
+                            "spread_risk": spread_risk,
+                            "hour_quality": hour_quality,
+                            "confluence_score": confluence_score,
+                        }
+                        log_shadow_trade(variant, alert_type, data.get('price'), shadow_decision["direction"], entry_price,
+                                          shadow_decision["stop_price"], shadow_decision["target_price"],
+                                          shadow_decision["confidence"], rejection_reason, context=shadow_context)
+                except Exception as e:
+                    print(f"[{variant}] Shadow tracking error (non-fatal, real trade path unaffected): {e}")
+
+                # LOW confidence is never traded, drawdown or not -- unchanged.
+                if drawdown_active and confidence_used == "LOW":
+                    log_to_csv(alert_type, data.get('price'), f"[{variant}] SKIPPED-DRAWDOWN", "Skipped due to drawdown protection")
+                    monitor_active_trades(variant, data.get('price', 0))
+                    continue
+
+                # During an active drawdown streak, MEDIUM confidence trades
+                # are no longer blocked outright -- they're allowed through,
+                # but at HALF the normal risk size. HIGH confidence is
+                # unaffected either way.
+                reduced_risk_trade = drawdown_active and confidence_used == "MEDIUM"
+
+                if news_risk and confidence_used != "HIGH":
+                    send_telegram(f"⚠️ *[{variant}] Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
+                    monitor_active_trades(variant, data.get('price', 0))
+                    continue
+
+                if confidence_used in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and sl_found and tp_found:
+                    if not variant_confluence_ok(variant, confluence_score):
+                        # Already correctly shadow-logged above with
+                        # BELOW_CONFLUENCE_THRESHOLD -- nothing further
+                        # to do for this variant on this signal.
+                        monitor_active_trades(variant, data.get('price', 0))
+                        continue
+                    risk_ok, risk_msg = check_risk_cap_before_trade(variant)
+                    if risk_ok:
+                        alert_time = datetime.utcnow().strftime('%H:%M UTC')
+                        # Reduced-risk drawdown trades use half the normal risk
+                        # percentage. Stored on the trade itself (not just used
+                        # in the moment) so that if it closes later, PnL is
+                        # correctly computed from what this SPECIFIC trade was
+                        # actually opened at — not whatever the risk percentage
+                        # or drawdown status happens to be by the time it closes.
+                        risk_pct_for_trade = (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 2) if reduced_risk_trade else PROP_FIRM_RULES["max_loss_per_trade_pct"]
+                        trade_context = {
+                            "session": session_name,
+                            "killzone": is_killzone,
+                            "zone": zone,
+                            "zone_pct": zone_pct,
+                            "dxy_direction": dxy_direction,
+                            "dxy_implication": dxy_implication,
+                            "news_risk": news_risk,
+                            "spread_risk": spread_risk,
+                            "hour_quality": hour_quality,
+                            "confluence_score": confluence_score,
+                            "risk_pct": risk_pct_for_trade,
+                        }
+                        if entry_zone:
+                            trade_context["entry_zone_low"] = entry_zone[0]
+                            trade_context["entry_zone_high"] = entry_zone[1]
+                        if reduced_risk_trade:
+                            send_telegram(f"⚠️ *[{variant}] Reduced-size trade* — MEDIUM confidence during active drawdown protection, taking this at half normal risk ({risk_pct_for_trade}% instead of {PROP_FIRM_RULES['max_loss_per_trade_pct']}%).")
+                        log_paper_trade(variant, alert_type, data.get('price'), direction, entry_price, stop_price, target_price, confidence_used, alert_time, context=trade_context)
+                    else:
+                        print(f"[{variant}] {risk_msg}")
+                        send_telegram(risk_msg)
+                elif confidence_used in ["HIGH", "MEDIUM"] and valid_trade and entry_zone_reached and not (sl_found and tp_found):
+                    # Claude didn't give a real, extractable stop AND target —
+                    # most often an explicit "No trade" / N/A response. The
+                    # "No trade" reasoning is already visible in the main
+                    # analysis message sent earlier, so no separate alert
+                    # is needed here — just don't fabricate a trade from it.
+                    print(f"[{variant}] Skipped logging paper trade — Claude did not provide a real extractable stop/target (likely an explicit 'No trade' response). Alert:{alert_type}")
+                elif confidence_used in ["HIGH", "MEDIUM"] and valid_trade and not entry_zone_reached:
+                    msg = (f"⏳ *[{variant}] Setup noted — not logged as a trade*\n"
+                           f"Current price (${entry_price:,.2f}) hasn't reached the proposed "
+                           f"entry zone (${entry_zone[0]:,.2f}–${entry_zone[1]:,.2f}) yet. "
+                           f"This is a level to watch, not a live trade.")
+                    print(msg)
+                    send_telegram(msg)
+                elif confidence_used in ["HIGH", "MEDIUM"] and not valid_trade:
+                    print(f"[{variant}] Skipped logging paper trade — SL/TP inconsistent. Dir:{direction} Entry:{entry_price} SL:{stop_price} TP:{target_price}")
+
+                monitor_active_trades(variant, data.get('price', 0))
+            except Exception as e:
+                error_msg = f"⚠️ [{variant}] SYSTEM ERROR (other variants unaffected): {str(e)}"
+                print(error_msg)
+                send_telegram(error_msg)
+
         save_state()
 
     except Exception as e:
@@ -2143,31 +2258,29 @@ def prop_status():
         account = PROP_FIRM_RULES["account_size"]
         daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
         total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
-        daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
-        total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
-        daily_remaining = daily_loss_limit - abs(min(daily_pnl, 0))
-        total_remaining = total_drawdown_limit - abs(min(total_pnl, 0))
-        daily_status = "🔴 DANGER" if daily_used_pct >= 80 else "🟡 CAUTION" if daily_used_pct >= 50 else "🟢 SAFE"
-        total_status = "🔴 DANGER" if total_used_pct >= 80 else "🟡 CAUTION" if total_used_pct >= 50 else "🟢 SAFE"
+        sections = []
+        statuses = {}
+        for v in VARIANTS:
+            daily_used_pct = (abs(min(daily_pnl[v], 0)) / account) * 100
+            total_used_pct = (abs(min(total_pnl[v], 0)) / account) * 100
+            daily_remaining = daily_loss_limit - abs(min(daily_pnl[v], 0))
+            total_remaining = total_drawdown_limit - abs(min(total_pnl[v], 0))
+            daily_status = "🔴 DANGER" if daily_used_pct >= 80 else "🟡 CAUTION" if daily_used_pct >= 50 else "🟢 SAFE"
+            total_status = "🔴 DANGER" if total_used_pct >= 80 else "🟡 CAUTION" if total_used_pct >= 50 else "🟢 SAFE"
+            statuses[v] = {"daily_status": daily_status, "total_status": total_status}
+            sections.append(f"""
+*[{v}]* Balance: ${current_balance[v]:,.2f} | Today: ${daily_pnl[v]:,.2f} | Total: ${total_pnl[v]:,.2f} | Days: {trading_days[v]}/{PROP_FIRM_RULES['min_trading_days']}
+Daily Loss: {daily_status} ({daily_used_pct:.1f}% used, ${daily_remaining:,.2f} left)
+Drawdown: {total_status} ({total_used_pct:.1f}% used, ${total_remaining:,.2f} left)""")
         message = f"""
-📊 *Prop Firm Status Report*
+📊 *Prop Firm Status Report — A/B/C*
 
-*Account Size:* ${account:,.2f}
-*Current Balance:* ${current_balance:,.2f}
-*Today's P&L:* ${daily_pnl:,.2f}
-*Total P&L:* ${total_pnl:,.2f}
-*Trading Days:* {trading_days}/{PROP_FIRM_RULES['min_trading_days']} minimum
-
-*Daily Loss Limit:* {daily_status}
-Used: {daily_used_pct:.1f}% | Remaining: ${daily_remaining:,.2f}
-
-*Total Drawdown:* {total_status}
-Used: {total_used_pct:.1f}% | Remaining: ${total_remaining:,.2f}
-
+*Account Size (each):* ${account:,.2f}
 *Max Risk Per Trade:* {PROP_FIRM_RULES['max_loss_per_trade_pct']}% (${account * PROP_FIRM_RULES['max_loss_per_trade_pct'] / 100:,.2f})
+{"".join(sections)}
 """
         send_telegram(message)
-        return jsonify({"status": "ok", "daily_status": daily_status, "total_status": total_status})
+        return jsonify({"status": "ok", "variants": statuses})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2181,24 +2294,27 @@ Used: {total_used_pct:.1f}% | Remaining: ${total_remaining:,.2f}
 def update_pnl():
     global daily_pnl, total_pnl, current_balance, trading_days
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
         trade_pnl = float(data.get('pnl', 0))
-        daily_pnl += trade_pnl
-        total_pnl += trade_pnl
-        current_balance += trade_pnl
+        daily_pnl[variant] += trade_pnl
+        total_pnl[variant] += trade_pnl
+        current_balance[variant] += trade_pnl
         account = PROP_FIRM_RULES["account_size"]
         daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
         total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
         warnings = []
-        if abs(min(daily_pnl, 0)) >= daily_loss_limit * 0.8:
-            warnings.append(f"⚠️ DAILY LOSS WARNING — at {(abs(min(daily_pnl,0))/account)*100:.1f}% of limit")
-        if abs(min(daily_pnl, 0)) >= daily_loss_limit:
-            warnings.append(f"🚨 DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
-        if abs(min(total_pnl, 0)) >= total_drawdown_limit:
-            warnings.append(f"🚨 TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
+        if abs(min(daily_pnl[variant], 0)) >= daily_loss_limit * 0.8:
+            warnings.append(f"⚠️ [{variant}] DAILY LOSS WARNING — at {(abs(min(daily_pnl[variant],0))/account)*100:.1f}% of limit")
+        if abs(min(daily_pnl[variant], 0)) >= daily_loss_limit:
+            warnings.append(f"🚨 [{variant}] DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
+        if abs(min(total_pnl[variant], 0)) >= total_drawdown_limit:
+            warnings.append(f"🚨 [{variant}] TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
         if warnings:
             send_telegram("\n".join(warnings))
-        return jsonify({"status": "updated", "daily_pnl": daily_pnl, "total_pnl": total_pnl})
+        return jsonify({"status": "updated", "variant": variant, "daily_pnl": daily_pnl[variant], "total_pnl": total_pnl[variant]})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2275,7 +2391,9 @@ def update_intraday():
 def update_levels():
     global KEY_LEVELS
     try:
-        new_levels = request.json
+        new_levels = request.get_json(silent=True)
+        if new_levels is None:
+            return jsonify({"status": "error", "message": "request body must be valid JSON with Content-Type: application/json"}), 400
         KEY_LEVELS.update(new_levels)
         send_telegram(f"📊 *Key Levels Updated*\n" + "\n".join([f"- {k}: {v}" for k, v in KEY_LEVELS.items()]))
         return jsonify({"status": "levels updated", "levels": KEY_LEVELS})
@@ -2288,7 +2406,9 @@ def update_levels():
 @app.route('/monitor-trades', methods=['GET'])
 def monitor_trades_endpoint():
     try:
-        if not active_trades and not active_shadow_trades:
+        any_active = any(active_trades[v] for v in VARIANTS)
+        any_shadow = any(active_shadow_trades[v] for v in VARIANTS)
+        if not any_active and not any_shadow:
             return jsonify({"status": "no active trades"})
         gold = get_mt5_candles_if_fresh()
         if gold is None:
@@ -2302,14 +2422,16 @@ def monitor_trades_endpoint():
         current_price = get_mt5_price_if_fresh()
         if current_price is None:
             current_price = round(float(gold['Close'].iloc[-1]), 2)
-        if active_trades:
-            monitor_active_trades(current_price)
-            # Catch anything the quick check above missed — a stop or
-            # target briefly touched (wicked through) between polls.
-            thorough_scan_active_trades(gold)
-        if active_shadow_trades:
-            monitor_shadow_trades(gold)
-        return jsonify({"status": "checked", "current_price": current_price, "shadow_trades_open": len(active_shadow_trades)})
+        for variant in VARIANTS:
+            if active_trades[variant]:
+                monitor_active_trades(variant, current_price)
+                # Catch anything the quick check above missed — a stop or
+                # target briefly touched (wicked through) between polls.
+                thorough_scan_active_trades(variant, gold)
+            if active_shadow_trades[variant]:
+                monitor_shadow_trades(variant, gold)
+        shadow_open = {v: len(active_shadow_trades[v]) for v in VARIANTS}
+        return jsonify({"status": "checked", "current_price": current_price, "shadow_trades_open": shadow_open})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2336,8 +2458,11 @@ def mt5_pending():
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
+    variant = request.args.get('variant', '')
+    if variant not in VARIANTS:
+        return jsonify({"status": "error", "message": f"variant query param required, must be one of {VARIANTS}"}), 400
     to_return = []
-    for trade_id, entry in mt5_pending_trades.items():
+    for trade_id, entry in mt5_pending_trades[variant].items():
         if entry["status"] == "PENDING":
             to_return.append(entry)
             # Mark as dispatched immediately on read, not on ack --
@@ -2359,11 +2484,14 @@ def mt5_ack():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
         trade_id = data.get('trade_id')
-        entry = mt5_pending_trades.get(trade_id)
+        entry = mt5_pending_trades[variant].get(trade_id)
         if not entry:
-            return jsonify({"status": "error", "message": f"unknown trade_id {trade_id}"}), 404
+            return jsonify({"status": "error", "message": f"unknown trade_id {trade_id} for variant {variant}"}), 404
         if data.get('success'):
             entry["status"] = "PLACED"
             entry["ticket"] = data.get('ticket')
@@ -2371,14 +2499,14 @@ def mt5_ack():
             # Tag the real MT5 ticket onto the matching paper trade too,
             # so the paper record and the real execution can be
             # reconciled later (predicted vs actual entry, slippage etc).
-            if trade_id in active_trades:
-                active_trades[trade_id]['mt5_ticket'] = data.get('ticket')
-                active_trades[trade_id]['mt5_fill_price'] = data.get('fill_price')
-            send_telegram(f"🔗 *MT5 order placed* — {entry['alert_type']} {entry['direction']} | ticket #{data.get('ticket')} @ {data.get('fill_price')}")
+            if trade_id in active_trades[variant]:
+                active_trades[variant][trade_id]['mt5_ticket'] = data.get('ticket')
+                active_trades[variant][trade_id]['mt5_fill_price'] = data.get('fill_price')
+            send_telegram(f"🔗 *[{variant}] MT5 order placed* — {entry['alert_type']} {entry['direction']} | ticket #{data.get('ticket')} @ {data.get('fill_price')}")
         else:
             entry["status"] = "FAILED"
             entry["error"] = data.get('error', 'unknown error')
-            send_telegram(f"⚠️ *MT5 order failed* — {entry['alert_type']} {entry['direction']}: {entry['error']}")
+            send_telegram(f"⚠️ *[{variant}] MT5 order failed* — {entry['alert_type']} {entry['direction']}: {entry['error']}")
         save_mt5_queue()
         return jsonify({"status": "ok"})
     except Exception as e:
@@ -2387,15 +2515,25 @@ def mt5_ack():
 
 @app.route('/mt5/status', methods=['GET'])
 def mt5_status():
-    """Human-readable snapshot of the queue -- no secret required,
-    read-only, no trade details beyond counts."""
-    counts = {}
-    for entry in mt5_pending_trades.values():
-        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
-    heartbeat_info = {"last_heartbeat": None, "seconds_ago": None}
-    if last_bridge_heartbeat is not None:
-        heartbeat_info["last_heartbeat"] = last_bridge_heartbeat.isoformat()
-        heartbeat_info["seconds_ago"] = int((datetime.now(timezone.utc) - last_bridge_heartbeat).total_seconds())
+    """Human-readable snapshot of all three variants' bridge status
+    at a glance -- no secret required, read-only, no trade details
+    beyond counts. Price/candle data is genuinely shared market data
+    (only variant A's bridge relays it), so that part stays a single
+    value rather than duplicated three ways."""
+    per_variant = {}
+    for v in VARIANTS:
+        counts = {}
+        for entry in mt5_pending_trades[v].values():
+            counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+        heartbeat_info = {"last_heartbeat": None, "seconds_ago": None}
+        if last_bridge_heartbeat[v] is not None:
+            heartbeat_info["last_heartbeat"] = last_bridge_heartbeat[v].isoformat()
+            heartbeat_info["seconds_ago"] = int((datetime.now(timezone.utc) - last_bridge_heartbeat[v]).total_seconds())
+        per_variant[v] = {
+            "queue_counts": counts, "total_queued": len(mt5_pending_trades[v]),
+            "bridge_heartbeat": heartbeat_info,
+            "current_balance": current_balance[v],
+        }
     price_info = {"bid": mt5_live_price.get("bid"), "ask": mt5_live_price.get("ask"), "seconds_ago": None, "trusted_right_now": False}
     if mt5_live_price.get("updated_at") is not None:
         age = int((datetime.now(timezone.utc) - mt5_live_price["updated_at"]).total_seconds())
@@ -2410,8 +2548,8 @@ def mt5_status():
         if candle_info["count"] > 0:
             candle_info["most_recent_candle_time"] = mt5_candle_history["candles"][-1]["time"]
     return jsonify({
-        "status": "ok", "queue_counts": counts, "total_queued": len(mt5_pending_trades),
-        "bridge_heartbeat": heartbeat_info,
+        "status": "ok",
+        "variants": per_variant,
         "mt5_live_price": price_info,
         "mt5_candles": candle_info,
         "app_instance": {"id": INSTANCE_ID, "started_at": INSTANCE_STARTED_AT},
@@ -2439,9 +2577,12 @@ def mt5_test_queue():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        data = request.json or {}
-        trade_id = f"TESTONLY_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
-        mt5_pending_trades[trade_id] = {
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        trade_id = f"TESTONLY_{variant}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        mt5_pending_trades[variant][trade_id] = {
             "trade_id": trade_id,
             "status": "PENDING",
             "queued_at": datetime.now(timezone.utc).isoformat(),
@@ -2458,7 +2599,7 @@ def mt5_test_queue():
         }
         save_mt5_queue()
         return jsonify({
-            "status": "ok", "trade_id": trade_id,
+            "status": "ok", "variant": variant, "trade_id": trade_id,
             "message": "Queued for the bridge -- never touches paper_trades or balance, nothing to clean up after"
         })
     except Exception as e:
@@ -2468,17 +2609,25 @@ def mt5_test_queue():
 @app.route('/mt5/heartbeat', methods=['POST'])
 def mt5_heartbeat():
     """
-    The bridge calls this every poll cycle while it's alive. A separate
-    scheduled check watches for this going stale -- see
-    check_bridge_watchdog() below.
+    Each of the three bridges calls this every poll cycle while it's
+    alive, tagged with its own variant. A separate scheduled check
+    watches each variant's heartbeat independently for going stale --
+    see check_bridge_watchdog() below.
     """
     global last_bridge_heartbeat, bridge_watchdog_alerted
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
-    last_bridge_heartbeat = datetime.now(timezone.utc)
-    bridge_watchdog_alerted = False  # a fresh heartbeat means it's back, if it had gone quiet before
-    return jsonify({"status": "ok"})
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        last_bridge_heartbeat[variant] = datetime.now(timezone.utc)
+        bridge_watchdog_alerted[variant] = False  # a fresh heartbeat means it's back, if it had gone quiet before
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/mt5/price-update', methods=['POST'])
@@ -2496,7 +2645,7 @@ def mt5_price_update():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         bid, ask = data.get('bid'), data.get('ask')
         if bid is None or ask is None:
             return jsonify({"status": "error", "message": "bid and ask are both required"}), 400
@@ -2526,7 +2675,7 @@ def mt5_candle_update():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        data = request.json or {}
+        data = request.get_json(silent=True) or {}
         candles = data.get('candles')
         if not candles or not isinstance(candles, list):
             return jsonify({"status": "error", "message": "candles must be a non-empty list"}), 400
@@ -2596,25 +2745,28 @@ def get_mt5_price_if_fresh():
 
 def check_bridge_watchdog():
     """
-    Runs on an interval (see scheduler setup). Alerts once via Telegram
-    if the bridge has gone quiet for longer than expected -- and only
-    once per outage, not repeatedly, so it doesn't spam. Says nothing
-    at all if the bridge simply hasn't been started yet (no heartbeat
-    ever received) -- that's not a failure, just not running.
+    Runs on an interval (see scheduler setup). Checks each of the three
+    variants' bridges independently, alerting once per outage per
+    variant via Telegram -- not repeatedly, so it doesn't spam, and not
+    masked by the other two bridges still checking in fine. Says
+    nothing at all for a variant whose bridge simply hasn't been
+    started yet (no heartbeat ever received) -- that's not a failure,
+    just not running.
     """
     global bridge_watchdog_alerted
-    if last_bridge_heartbeat is None:
-        return  # never started this session -- nothing to alert about
+    for variant in VARIANTS:
+        if last_bridge_heartbeat[variant] is None:
+            continue  # never started this session -- nothing to alert about
 
-    quiet_for = datetime.now(timezone.utc) - last_bridge_heartbeat
-    if quiet_for > timedelta(minutes=BRIDGE_HEARTBEAT_TIMEOUT_MINUTES) and not bridge_watchdog_alerted:
-        minutes = int(quiet_for.total_seconds() // 60)
-        send_telegram(
-            f"⚠️ *MT5 bridge watchdog* — no heartbeat for {minutes} min "
-            f"(last seen {last_bridge_heartbeat.strftime('%H:%M UTC')}). "
-            f"If a position is open, it may not be getting tracked right now."
-        )
-        bridge_watchdog_alerted = True
+        quiet_for = datetime.now(timezone.utc) - last_bridge_heartbeat[variant]
+        if quiet_for > timedelta(minutes=BRIDGE_HEARTBEAT_TIMEOUT_MINUTES) and not bridge_watchdog_alerted[variant]:
+            minutes = int(quiet_for.total_seconds() // 60)
+            send_telegram(
+                f"⚠️ *[{variant}] MT5 bridge watchdog* — no heartbeat for {minutes} min "
+                f"(last seen {last_bridge_heartbeat[variant].strftime('%H:%M UTC')}). "
+                f"If a position is open, it may not be getting tracked right now."
+            )
+            bridge_watchdog_alerted[variant] = True
 
 
 @app.route('/mt5/trade-closed', methods=['POST'])
@@ -2630,20 +2782,24 @@ def mt5_trade_closed():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
         trade_id = data.get('trade_id')
-        trade = active_trades.get(trade_id)
+        trade = active_trades[variant].get(trade_id)
         if not trade:
-            # Fall back to paper_trades directly -- active_trades is a
-            # convenience view, not the real source of truth. A trade
-            # can end up open in paper_trades but missing here (e.g. if
-            # it was reopened via /admin/reopen-trade and this request
-            # landed on a different app instance than that one did).
-            trade = next((t for t in paper_trades if t.get('id') == trade_id), None)
+            # Fall back to this variant's own paper_trades directly --
+            # active_trades is a convenience view, not the real source
+            # of truth. A trade can end up open in paper_trades but
+            # missing here (e.g. if it was reopened via
+            # /admin/reopen-trade and this request landed on a
+            # different app instance than that one did).
+            trade = next((t for t in paper_trades[variant] if t.get('id') == trade_id), None)
             if trade and trade.get('result') != 'OPEN':
                 trade = None  # exists, but genuinely already closed -- not a fallback case
         if not trade:
-            return jsonify({"status": "error", "message": f"unknown or already-closed trade_id {trade_id}"}), 404
+            return jsonify({"status": "error", "message": f"unknown or already-closed trade_id {trade_id} for variant {variant}"}), 404
 
         result = data.get('result')
         if result not in ("WIN", "LOSS"):
@@ -2653,9 +2809,9 @@ def mt5_trade_closed():
         trade['result'] = result
         trade['close_price'] = data.get('close_price')
         trade['mt5_closed_via_bridge'] = True
-        pnl = apply_trade_pnl(trade, result, real_pnl_override=real_pnl)
+        pnl = apply_trade_pnl(variant, trade, result, real_pnl_override=real_pnl)
 
-        active_trades.pop(trade_id, None)
+        active_trades[variant].pop(trade_id, None)
         try:
             with open(data_path('paper_trades.json'), 'w') as f:
                 json.dump(paper_trades, f, indent=2)
@@ -2665,7 +2821,7 @@ def mt5_trade_closed():
 
         emoji = "✅" if result == "WIN" else "❌"
         send_telegram(
-            f"{emoji} *MT5 trade closed* — {trade.get('type', '')} {trade.get('direction', '')} | "
+            f"{emoji} *[{variant}] MT5 trade closed* — {trade.get('type', '')} {trade.get('direction', '')} | "
             f"{result} | ${pnl:.2f} | ticket #{trade.get('mt5_ticket')}"
         )
         return jsonify({"status": "ok", "pnl": round(pnl, 2)})
@@ -2676,17 +2832,21 @@ def mt5_trade_closed():
 @app.route('/admin/recent-trades', methods=['GET'])
 def admin_recent_trades():
     """Read-only -- last N paper trades (default 5, override with
-    ?limit=20) with enough detail to spot a manually-injected test
-    trade and get its exact trade_id."""
+    ?limit=20) for one specific variant (?variant=A/B/C, required) with
+    enough detail to spot a manually-injected test trade and get its
+    exact trade_id."""
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
+    variant = request.args.get('variant', '')
+    if variant not in VARIANTS:
+        return jsonify({"status": "error", "message": f"variant query param required, must be one of {VARIANTS}"}), 400
     try:
         limit = int(request.args.get('limit', 5))
     except ValueError:
         limit = 5
-    recent = paper_trades[-limit:]
-    return jsonify({"status": "ok", "trades": [
+    recent = paper_trades[variant][-limit:]
+    return jsonify({"status": "ok", "variant": variant, "trades": [
         {
             "trade_id": t.get("id"), "type": t.get("type"), "direction": t.get("direction"),
             "entry": t.get("entry"), "stop": t.get("stop"), "target": t.get("target"),
@@ -2701,17 +2861,21 @@ def admin_recent_trades():
 @app.route('/admin/recent-shadow-trades', methods=['GET'])
 def admin_recent_shadow_trades():
     """Read-only -- last N shadow trades (default 20, override with
-    ?limit=N) with confidence/confluence data, for analysing whether
-    the scoring system is actually well-calibrated."""
+    ?limit=N) for one specific variant (?variant=A/B/C, required) with
+    confidence/confluence data, for analysing whether the scoring
+    system is actually well-calibrated."""
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
+    variant = request.args.get('variant', '')
+    if variant not in VARIANTS:
+        return jsonify({"status": "error", "message": f"variant query param required, must be one of {VARIANTS}"}), 400
     try:
         limit = int(request.args.get('limit', 20))
     except ValueError:
         limit = 20
-    recent = shadow_trades[-limit:]
-    return jsonify({"status": "ok", "shadow_trades": [
+    recent = shadow_trades[variant][-limit:]
+    return jsonify({"status": "ok", "variant": variant, "shadow_trades": [
         {
             "trade_id": t.get("id"), "type": t.get("type"), "direction": t.get("direction"),
             "result": t.get("result"), "pnl": t.get("pnl"), "r_multiple": t.get("r_multiple"),
@@ -2725,12 +2889,13 @@ def admin_recent_shadow_trades():
 @app.route('/admin/remove-trade', methods=['POST'])
 def admin_remove_trade():
     """
-    Removes one trade by exact trade_id -- for cleaning up a manually
-    injected test alert (e.g. a curl webhook test) that got logged
-    through the same pipeline as a real trade. If it was already
-    closed, precisely reverses its stored pnl from current_balance/
-    total_pnl/daily_pnl using the exact figure apply_trade_pnl() saved
-    on the trade record, rather than recomputing it.
+    Removes one trade by exact trade_id, for a specific variant -- for
+    cleaning up a manually injected test alert (e.g. a curl webhook
+    test) that got logged through the same pipeline as a real trade.
+    If it was already closed, precisely reverses its stored pnl from
+    that variant's own current_balance/total_pnl/daily_pnl using the
+    exact figure apply_trade_pnl() saved on the trade record, rather
+    than recomputing it.
     NOTE: does not attempt to rewind trading_days or consecutive_losses
     -- low-stakes fields for a rare manual cleanup, worth a manual
     glance afterward rather than automated here.
@@ -2740,21 +2905,25 @@ def admin_remove_trade():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        trade_id = request.json.get('trade_id')
-        trade = next((t for t in paper_trades if t.get('id') == trade_id), None)
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        trade_id = data.get('trade_id')
+        trade = next((t for t in paper_trades[variant] if t.get('id') == trade_id), None)
         if not trade:
-            return jsonify({"status": "error", "message": f"no trade found with id {trade_id}"}), 404
+            return jsonify({"status": "error", "message": f"no trade found with id {trade_id} for variant {variant}"}), 404
 
         reversed_pnl = None
         if trade.get('pnl') is not None:
             reversed_pnl = trade['pnl']
-            current_balance -= reversed_pnl
-            total_pnl -= reversed_pnl
-            daily_pnl -= reversed_pnl
+            current_balance[variant] -= reversed_pnl
+            total_pnl[variant] -= reversed_pnl
+            daily_pnl[variant] -= reversed_pnl
 
-        paper_trades.remove(trade)
-        active_trades.pop(trade_id, None)
-        mt5_pending_trades.pop(trade_id, None)
+        paper_trades[variant].remove(trade)
+        active_trades[variant].pop(trade_id, None)
+        mt5_pending_trades[variant].pop(trade_id, None)
 
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
@@ -2762,10 +2931,10 @@ def admin_remove_trade():
         save_state()
 
         return jsonify({
-            "status": "ok", "removed_trade_id": trade_id,
+            "status": "ok", "variant": variant, "removed_trade_id": trade_id,
             "reversed_pnl": reversed_pnl,
-            "current_balance": round(current_balance, 2),
-            "total_pnl": round(total_pnl, 2),
+            "current_balance": round(current_balance[variant], 2),
+            "total_pnl": round(total_pnl[variant], 2),
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2775,23 +2944,26 @@ def admin_remove_trade():
 def admin_restore_trade():
     """
     The inverse of /admin/remove-trade -- for putting back a real,
-    legitimate trade whose signal was genuine but got removed because
-    its recorded CLOSE was unreliable (e.g. the single-reading feed-gap
-    bug), once the actual outcome has been independently verified some
-    other way (e.g. checked directly against the real chart). Requires
-    every field explicitly rather than inferring anything, so a
-    restoration is always a deliberate, fully-specified action, not a
-    guess.
+    legitimate trade (on a specific variant's own account) whose
+    signal was genuine but got removed because its recorded CLOSE was
+    unreliable (e.g. the single-reading feed-gap bug), once the actual
+    outcome has been independently verified some other way (e.g.
+    checked directly against the real chart). Requires every field
+    explicitly rather than inferring anything, so a restoration is
+    always a deliberate, fully-specified action, not a guess.
     """
     global current_balance, total_pnl, daily_pnl
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
         trade_id = data['trade_id']
-        if any(t.get('id') == trade_id for t in paper_trades):
-            return jsonify({"status": "error", "message": f"trade_id {trade_id} already exists"}), 409
+        if any(t.get('id') == trade_id for t in paper_trades[variant]):
+            return jsonify({"status": "error", "message": f"trade_id {trade_id} already exists for variant {variant}"}), 409
 
         result = data['result']
         if result not in ("WIN", "LOSS"):
@@ -2800,6 +2972,7 @@ def admin_restore_trade():
 
         trade = {
             "id": trade_id,
+            "variant": variant,
             "time": data['time'],
             "opened_at": data.get('opened_at', datetime.now(timezone.utc).isoformat()),
             "type": data['type'],
@@ -2813,19 +2986,19 @@ def admin_restore_trade():
             "bot_version": BOT_VERSION,
             "restored_note": "Restored after independent verification -- original close was via the single-reading feed-gap bug, fixed 4 Aug",
         }
-        paper_trades.append(trade)
-        current_balance += pnl
-        total_pnl += pnl
-        daily_pnl += pnl
+        paper_trades[variant].append(trade)
+        current_balance[variant] += pnl
+        total_pnl[variant] += pnl
+        daily_pnl[variant] += pnl
 
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
         save_state()
 
         return jsonify({
-            "status": "ok", "restored_trade_id": trade_id,
-            "current_balance": round(current_balance, 2),
-            "total_pnl": round(total_pnl, 2),
+            "status": "ok", "variant": variant, "restored_trade_id": trade_id,
+            "current_balance": round(current_balance[variant], 2),
+            "total_pnl": round(total_pnl[variant], 2),
         })
     except KeyError as e:
         return jsonify({"status": "error", "message": f"missing required field: {e}"}), 400
@@ -2836,11 +3009,12 @@ def admin_restore_trade():
 @app.route('/admin/reopen-trade', methods=['POST'])
 def admin_reopen_trade():
     """
-    For a trade incorrectly marked closed (e.g. the simulated monitor
-    crediting a result off a bad price feed) while it's genuinely still
-    open on the real account. Reverses the incorrectly-applied pnl
-    (same exact math as /admin/remove-trade), resets the trade back to
-    OPEN, and puts it back in active_trades so it can be picked up and
+    For a trade (on a specific variant's own account) incorrectly
+    marked closed (e.g. the simulated monitor crediting a result off a
+    bad price feed) while it's genuinely still open on the real
+    account. Reverses the incorrectly-applied pnl (same exact math as
+    /admin/remove-trade), resets the trade back to OPEN, and puts it
+    back in that variant's active_trades so it can be picked up and
     correctly reported by the real MT5-bridge closure detection later
     -- rather than deleting it outright, which would leave no record
     at all of a trade that's genuinely still live.
@@ -2850,34 +3024,38 @@ def admin_reopen_trade():
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
     try:
-        trade_id = request.json.get('trade_id')
-        trade = next((t for t in paper_trades if t.get('id') == trade_id), None)
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        trade_id = data.get('trade_id')
+        trade = next((t for t in paper_trades[variant] if t.get('id') == trade_id), None)
         if not trade:
-            return jsonify({"status": "error", "message": f"no trade found with id {trade_id}"}), 404
+            return jsonify({"status": "error", "message": f"no trade found with id {trade_id} for variant {variant}"}), 404
         if trade.get('result') == 'OPEN':
             return jsonify({"status": "error", "message": f"trade_id {trade_id} is already OPEN, nothing to reopen"}), 409
 
         reversed_pnl = None
         if trade.get('pnl') is not None:
             reversed_pnl = trade['pnl']
-            current_balance -= reversed_pnl
-            total_pnl -= reversed_pnl
-            daily_pnl -= reversed_pnl
+            current_balance[variant] -= reversed_pnl
+            total_pnl[variant] -= reversed_pnl
+            daily_pnl[variant] -= reversed_pnl
 
         trade['result'] = 'OPEN'
         trade.pop('pnl', None)
         trade.pop('r_multiple', None)
-        active_trades[trade_id] = trade
+        active_trades[variant][trade_id] = trade
 
         with open(data_path('paper_trades.json'), 'w') as f:
             json.dump(paper_trades, f, indent=2)
         save_state()
 
         return jsonify({
-            "status": "ok", "reopened_trade_id": trade_id,
+            "status": "ok", "variant": variant, "reopened_trade_id": trade_id,
             "reversed_pnl": reversed_pnl,
-            "current_balance": round(current_balance, 2),
-            "total_pnl": round(total_pnl, 2),
+            "current_balance": round(current_balance[variant], 2),
+            "total_pnl": round(total_pnl[variant], 2),
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2890,7 +3068,7 @@ def check_entries():
     try:
         if not is_market_open():
             return jsonify({"status": "market closed — entry monitor paused"})
-        if not active_trades:
+        if not any(active_trades[v] for v in VARIANTS):
             return jsonify({"status": "no active trades to monitor"})
         gold = get_mt5_candles_if_fresh()
         if gold is None:
@@ -2903,33 +3081,35 @@ def check_entries():
                 return jsonify({"status": "price data stale, skipped"})
         current_price = round(float(gold['Close'].iloc[-1]), 2)
         alerts_sent = 0
-        notified_trades = []
-        for trade_id, trade in active_trades.items():
-            if trade.get('result') != 'OPEN':
-                continue
-            entry = trade.get('entry', 0)
-            stop = trade.get('stop', 0)
-            target = trade.get('target', 0)
-            direction = trade.get('direction', '')
-            # Prefer Claude's actual stated entry zone (stored on trades
-            # logged after the entry-zone fix) over a synthetic ±0.1%
-            # band around the recorded entry price — that band could
-            # reference a price level that was never really the
-            # intended entry in the first place.
-            if trade.get('entry_zone_low') is not None and trade.get('entry_zone_high') is not None:
-                entry_zone_low = trade['entry_zone_low']
-                entry_zone_high = trade['entry_zone_high']
-            else:
-                entry_zone_high = entry * 1.001
-                entry_zone_low = entry * 0.999
-            in_entry_zone = entry_zone_low <= current_price <= entry_zone_high
-            already_notified = trade.get('entry_notified', False)
-            if in_entry_zone and not already_notified:
-                risk = abs(entry - stop)
-                reward = abs(target - entry)
-                rr = round(reward / risk, 1) if risk > 0 else 0
-                send_telegram(f"""
-⏰ *ENTRY ZONE ALERT*
+        active_counts = {}
+        for variant in VARIANTS:
+            active_counts[variant] = len(active_trades[variant])
+            for trade_id, trade in active_trades[variant].items():
+                if trade.get('result') != 'OPEN':
+                    continue
+                entry = trade.get('entry', 0)
+                stop = trade.get('stop', 0)
+                target = trade.get('target', 0)
+                direction = trade.get('direction', '')
+                # Prefer Claude's actual stated entry zone (stored on trades
+                # logged after the entry-zone fix) over a synthetic ±0.1%
+                # band around the recorded entry price — that band could
+                # reference a price level that was never really the
+                # intended entry in the first place.
+                if trade.get('entry_zone_low') is not None and trade.get('entry_zone_high') is not None:
+                    entry_zone_low = trade['entry_zone_low']
+                    entry_zone_high = trade['entry_zone_high']
+                else:
+                    entry_zone_high = entry * 1.001
+                    entry_zone_low = entry * 0.999
+                in_entry_zone = entry_zone_low <= current_price <= entry_zone_high
+                already_notified = trade.get('entry_notified', False)
+                if in_entry_zone and not already_notified:
+                    risk = abs(entry - stop)
+                    reward = abs(target - entry)
+                    rr = round(reward / risk, 1) if risk > 0 else 0
+                    send_telegram(f"""
+⏰ *[{variant}] ENTRY ZONE ALERT*
 _{trade['type']} | {trade['time']}_
 
 Price is NOW in your entry zone!
@@ -2944,10 +3124,9 @@ R:R = 1:{rr}
 
 _Act now or wait for next candle close confirmation_
 """)
-                alerts_sent += 1
-                trade['entry_notified'] = True
-                notified_trades.append(trade_id)
-        return jsonify({"status": "checked", "current_price": current_price, "active_trades": len(active_trades), "entry_alerts_sent": alerts_sent})
+                    alerts_sent += 1
+                    trade['entry_notified'] = True
+        return jsonify({"status": "checked", "current_price": current_price, "active_trades": active_counts, "entry_alerts_sent": alerts_sent})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -2957,6 +3136,10 @@ _Act now or wait for next candle close confirmation_
 @app.route('/self-review', methods=['GET'])
 def self_review():
     try:
+        variant = request.args.get('variant', 'A')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
+
         trades = []
         try:
             with open(data_path('trade_log.csv'), 'r') as f:
@@ -2970,12 +3153,13 @@ def self_review():
         paper = []
         try:
             with open(data_path('paper_trades.json'), 'r') as f:
-                paper = json.load(f)
+                loaded = json.load(f)
+            paper = loaded.get(variant, []) if isinstance(loaded, dict) else []
         except FileNotFoundError:
             paper = []
 
         if len(trades) < 5:
-            send_telegram("⚠️ Self review skipped — not enough trade data yet. Need at least 5 alerts logged.")
+            send_telegram(f"⚠️ [{variant}] Self review skipped — not enough trade data yet. Need at least 5 alerts logged.")
             return jsonify({"status": "insufficient data"})
 
         wins = [t for t in paper if t.get('result') == 'WIN']
@@ -3073,14 +3257,14 @@ Be direct and data driven, but calibrate confidence to sample size — a pattern
         review = message.content[0].text
 
         try:
-            with open(data_path('pending_rules.txt'), 'w') as f:
+            with open(data_path(f'pending_rules_{variant}.txt'), 'w') as f:
                 f.write(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
                 f.write(review)
         except Exception as e:
             print(f"Rules save error: {e}")
 
         send_telegram(f"""
-🧠 *Gold Bot Self-Review Report*
+🧠 *[{variant}] Gold Bot Self-Review Report*
 _{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
 
 📊 Stats: {len(trades)} alerts | {len(wins)}W {len(losses)}L | {win_rate:.1f}% win rate
@@ -3090,11 +3274,11 @@ _{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_
 ---
 ⚠️ *These rules are PENDING YOUR APPROVAL*
 
-Approve: https://web-production-387c47.up.railway.app/approve-rules
-Reject: https://web-production-387c47.up.railway.app/reject-rules
+Approve: https://web-production-387c47.up.railway.app/approve-rules?variant={variant}
+Reject: https://web-production-387c47.up.railway.app/reject-rules?variant={variant}
 """)
 
-        return jsonify({"status": "self review complete", "win_rate": win_rate, "total_trades": len(trades)})
+        return jsonify({"status": "self review complete", "variant": variant, "win_rate": win_rate, "total_trades": len(trades)})
 
     except Exception as e:
         error_msg = f"⚠️ Self review error: {str(e)}"
@@ -3107,15 +3291,18 @@ Reject: https://web-production-387c47.up.railway.app/reject-rules
 @app.route('/approve-rules', methods=['GET'])
 def approve_rules():
     try:
-        with open(data_path('pending_rules.txt'), 'r') as f:
+        variant = request.args.get('variant', 'A')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
+        with open(data_path(f'pending_rules_{variant}.txt'), 'r') as f:
             pending = f.read()
-        with open(data_path('learned_rules.txt'), 'w') as f:
+        with open(data_path(f'learned_rules_{variant}.txt'), 'w') as f:
             f.write(f"Approved: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n")
             f.write(pending)
-        with open(data_path('pending_rules.txt'), 'w') as f:
+        with open(data_path(f'pending_rules_{variant}.txt'), 'w') as f:
             f.write("No pending rules")
-        send_telegram(f"✅ *Rule Update Approved*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nNew learned rules applied to live system.")
-        return jsonify({"status": "rules approved and applied"})
+        send_telegram(f"✅ *[{variant}] Rule Update Approved*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nNew learned rules applied.")
+        return jsonify({"status": "rules approved and applied", "variant": variant})
     except FileNotFoundError:
         return jsonify({"status": "no pending rules to approve"})
     except Exception as e:
@@ -3125,10 +3312,13 @@ def approve_rules():
 @app.route('/reject-rules', methods=['GET'])
 def reject_rules():
     try:
-        with open(data_path('pending_rules.txt'), 'w') as f:
+        variant = request.args.get('variant', 'A')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
+        with open(data_path(f'pending_rules_{variant}.txt'), 'w') as f:
             f.write("No pending rules")
-        send_telegram(f"❌ *Rule Update Rejected*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nProposed changes discarded. Live rules unchanged.")
-        return jsonify({"status": "rules rejected — live rules unchanged"})
+        send_telegram(f"❌ *[{variant}] Rule Update Rejected*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nProposed changes discarded. Live rules unchanged.")
+        return jsonify({"status": "rules rejected — live rules unchanged", "variant": variant})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -3136,16 +3326,19 @@ def reject_rules():
 @app.route('/reset-learned-rules', methods=['GET'])
 def reset_learned_rules():
     """
-    Clears the currently ACTIVE learned rules back to empty. Distinct
-    from /reject-rules, which only discards a pending proposal that
-    hasn't been approved yet -- there was previously no way to undo
-    a rule set that had already been approved and applied.
+    Clears one variant's currently ACTIVE learned rules back to empty.
+    Distinct from /reject-rules, which only discards a pending proposal
+    that hasn't been approved yet -- there was previously no way to
+    undo a rule set that had already been approved and applied.
     """
     try:
-        with open(data_path('learned_rules.txt'), 'w') as f:
+        variant = request.args.get('variant', 'A')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
+        with open(data_path(f'learned_rules_{variant}.txt'), 'w') as f:
             f.write("No learned rules yet — system will develop rules after first self-review.")
-        send_telegram(f"🔄 *Learned Rules Reset*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nActive learned rules cleared back to empty. The system will build up new rules from scratch at the next self-review.")
-        return jsonify({"status": "learned rules reset to empty"})
+        send_telegram(f"🔄 *[{variant}] Learned Rules Reset*\n_{datetime.utcnow().strftime('%d %b %Y — %H:%M UTC')}_\n\nActive learned rules cleared back to empty.")
+        return jsonify({"status": "learned rules reset to empty", "variant": variant})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -3153,30 +3346,33 @@ def reset_learned_rules():
 @app.route('/view-rules', methods=['GET'])
 def view_rules():
     try:
+        variant = request.args.get('variant', 'A')
+        if variant not in VARIANTS:
+            return f"variant must be one of {VARIANTS}", 400
         active = ""
         pending = ""
         try:
-            with open(data_path('learned_rules.txt'), 'r') as f:
+            with open(data_path(f'learned_rules_{variant}.txt'), 'r') as f:
                 active = f.read()
         except FileNotFoundError:
             active = "No approved rules yet"
         try:
-            with open(data_path('pending_rules.txt'), 'r') as f:
+            with open(data_path(f'pending_rules_{variant}.txt'), 'r') as f:
                 pending = f.read()
         except FileNotFoundError:
             pending = "No pending rules"
         return f"""
 <html>
-<head><title>Gold Bot Rules</title></head>
+<head><title>Gold Bot Rules — {variant}</title></head>
 <body style="background:#0a0a1a;color:#eee;font-family:monospace;padding:30px;max-width:800px;margin:0 auto;">
-<h1 style="color:#ffd700">🧠 Gold Bot — Rule Manager</h1>
+<h1 style="color:#ffd700">🧠 Gold Bot — Rule Manager [{variant}]</h1>
 <h2 style="color:#44ff88">✅ Active Rules (live)</h2>
 <pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{active}</pre>
 <h2 style="color:#ffaa00">⏳ Pending Rules (awaiting approval)</h2>
 <pre style="background:#111;padding:20px;border-radius:8px;white-space:pre-wrap;">{pending}</pre>
 <div style="margin-top:30px;display:flex;gap:20px;">
-    <a href="/approve-rules" style="background:#44ff88;color:#000;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">✅ Approve Pending Rules</a>
-    <a href="/reject-rules" style="background:#ff4444;color:#fff;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">❌ Reject Pending Rules</a>
+    <a href="/approve-rules?variant={variant}" style="background:#44ff88;color:#000;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">✅ Approve Pending Rules</a>
+    <a href="/reject-rules?variant={variant}" style="background:#ff4444;color:#fff;padding:15px 30px;border-radius:8px;text-decoration:none;font-weight:bold;">❌ Reject Pending Rules</a>
 </div>
 </body>
 </html>
@@ -3743,6 +3939,9 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 # ============================================================
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
+    variant = request.args.get('variant', 'A')
+    if variant not in VARIANTS:
+        return f"variant must be one of {VARIANTS}", 400
     session_name, session_desc, is_killzone = get_session()
     zone, zone_pct, zone_advice = get_premium_discount((KEY_LEVELS['dealing_range_high'] + KEY_LEVELS['dealing_range_low']) / 2)
     dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
@@ -3757,7 +3956,7 @@ def dashboard():
     if not alerts_html:
         alerts_html = "<div class='no-data'>No alerts this session yet</div>"
     trades_html = ""
-    for trade_id, trade in active_trades.items():
+    for trade_id, trade in active_trades[variant].items():
         direction = trade.get('direction', '')
         color = "#44ff88" if direction == "LONG" else "#ff4444"
         trades_html += f'<div class="trade-row"><span style="color:{color}">{"▲" if direction == "LONG" else "▼"} {direction}</span><span>Entry: {trade.get("entry", 0):.2f}</span><span>SL: {trade.get("stop", 0):.2f}</span><span>TP: {trade.get("target", 0):.2f}</span><span class="trade-open">OPEN</span></div>'
@@ -3765,14 +3964,15 @@ def dashboard():
         trades_html = "<div class='no-data'>No active paper trades</div>"
     levels_html = "".join([f'<div class="level-row"><span class="level-label">{k.replace("_", " ").title()}</span><span class="level-value">{v}</span></div>' for k, v in KEY_LEVELS.items()])
     account = PROP_FIRM_RULES["account_size"]
-    daily_used_pct = (abs(min(daily_pnl, 0)) / account) * 100
-    total_used_pct = (abs(min(total_pnl, 0)) / account) * 100
+    daily_used_pct = (abs(min(daily_pnl[variant], 0)) / account) * 100
+    total_used_pct = (abs(min(total_pnl[variant], 0)) / account) * 100
     daily_status_color = "#ff4444" if daily_used_pct >= 80 else "#ffaa00" if daily_used_pct >= 50 else "#44ff88"
     total_status_color = "#ff4444" if total_used_pct >= 80 else "#ffaa00" if total_used_pct >= 50 else "#44ff88"
+    variant_tabs = "".join([f'<a href="/dashboard?variant={v}" style="color:{"#ffd700" if v == variant else "#888"};text-decoration:none;padding:4px 12px;border:1px solid {"#ffd700" if v == variant else "#333"};border-radius:6px;margin-right:8px;">{v}</a>' for v in VARIANTS])
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Gold Bot Dashboard</title>
+    <title>Gold Bot Dashboard [{variant}]</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="refresh" content="30">
     <style>
@@ -3812,8 +4012,9 @@ def dashboard():
 </head>
 <body>
     <div class="header">
-        <h1>🥇 GOLD BOT</h1>
+        <h1>🥇 GOLD BOT [{variant}]</h1>
         <div class="subtitle">Auto-refreshes every 30 seconds | {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</div>
+        <div style="margin-top:10px;">{variant_tabs}</div>
     </div>
     <div class="status-bar">
         <div class="status-item"><span class="status-label">System</span><span class="status-value">🟢 LIVE</span></div>
@@ -3827,11 +4028,11 @@ def dashboard():
     <div class="grid">
         <div class="card"><h3>📊 Key Levels</h3>{levels_html}</div>
         <div class="card">
-            <h3>🏦 Prop Firm Status</h3>
+            <h3>🏦 Prop Firm Status [{variant}]</h3>
             <div class="prop-row"><span class="prop-label">Account Size</span><span style="color:#ffd700">${account:,.2f}</span></div>
-            <div class="prop-row"><span class="prop-label">Balance</span><span style="color:#44ff88">${current_balance:,.2f}</span></div>
-            <div class="prop-row"><span class="prop-label">Today P&L</span><span style="color:{'#44ff88' if daily_pnl >= 0 else '#ff4444'}">${daily_pnl:,.2f}</span></div>
-            <div class="prop-row"><span class="prop-label">Total P&L</span><span style="color:{'#44ff88' if total_pnl >= 0 else '#ff4444'}">${total_pnl:,.2f}</span></div>
+            <div class="prop-row"><span class="prop-label">Balance</span><span style="color:#44ff88">${current_balance[variant]:,.2f}</span></div>
+            <div class="prop-row"><span class="prop-label">Today P&L</span><span style="color:{'#44ff88' if daily_pnl[variant] >= 0 else '#ff4444'}">${daily_pnl[variant]:,.2f}</span></div>
+            <div class="prop-row"><span class="prop-label">Total P&L</span><span style="color:{'#44ff88' if total_pnl[variant] >= 0 else '#ff4444'}">${total_pnl[variant]:,.2f}</span></div>
             <div style="margin-top:10px;">
                 <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Daily Loss Used</span><span style="color:{daily_status_color}">{daily_used_pct:.1f}% of {PROP_FIRM_RULES['max_daily_loss_pct']}%</span></div>
                 <div class="progress-bar"><div class="progress-fill" style="width:{min(daily_used_pct, 100)}%;background:{daily_status_color}"></div></div>
@@ -3840,11 +4041,11 @@ def dashboard():
                 <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Total Drawdown Used</span><span style="color:{total_status_color}">{total_used_pct:.1f}% of {PROP_FIRM_RULES['max_total_drawdown_pct']}%</span></div>
                 <div class="progress-bar"><div class="progress-fill" style="width:{min(total_used_pct, 100)}%;background:{total_status_color}"></div></div>
             </div>
-            <div class="prop-row" style="margin-top:10px;"><span class="prop-label">Trading Days</span><span style="color:#ffd700">{trading_days}/{PROP_FIRM_RULES['min_trading_days']}</span></div>
-            <div class="prop-row"><span class="prop-label">Drawdown Protection</span><span style="color:{'#ff4444' if drawdown_protection else '#44ff88'}">{'ACTIVE' if drawdown_protection else 'OFF'}</span></div>
+            <div class="prop-row" style="margin-top:10px;"><span class="prop-label">Trading Days</span><span style="color:#ffd700">{trading_days[variant]}/{PROP_FIRM_RULES['min_trading_days']}</span></div>
+            <div class="prop-row"><span class="prop-label">Drawdown Protection</span><span style="color:{'#ff4444' if drawdown_protection[variant] else '#44ff88'}">{'ACTIVE' if drawdown_protection[variant] else 'OFF'}</span></div>
         </div>
-        <div class="card full-width"><h3>📡 Today's Alerts ({len(recent_alerts)} this session)</h3>{alerts_html}</div>
-        <div class="card full-width"><h3>📈 Active Paper Trades ({len(active_trades)} open)</h3>{trades_html}</div>
+        <div class="card full-width"><h3>📡 Today's Alerts ({len(recent_alerts)} this session, shared across all variants)</h3>{alerts_html}</div>
+        <div class="card full-width"><h3>📈 Active Paper Trades [{variant}] ({len(active_trades[variant])} open)</h3>{trades_html}</div>
     </div>
     <div class="footer">Gold Bot v2.0 | Railway | Auto-refreshes every 30s | Last updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}</div>
 </body>
@@ -3866,62 +4067,79 @@ def counterfactual_report_endpoint():
 
 
 def run_counterfactual_report():
+    """
+    The actual A/B/C comparison -- computes each variant's own taken-
+    vs-rejected performance independently (same real, extractable-
+    levels-only methodology as before), then shows all three side by
+    side. This is the direct answer to the whole project's question:
+    which filter set actually performed best.
+    """
     try:
         try:
             with open(data_path('shadow_trades.json'), 'r') as f:
-                shadow = json.load(f)
+                all_shadow = json.load(f)
+            if not isinstance(all_shadow, dict):
+                all_shadow = {v: [] for v in VARIANTS}
         except FileNotFoundError:
-            shadow = []
-
-        closed_shadow = [t for t in shadow if t.get('result') in ('WIN', 'LOSS')]
-        open_shadow_count = len([t for t in shadow if t.get('result') == 'OPEN'])
-
-        if len(closed_shadow) < 5:
-            send_telegram(f"⚠️ Counterfactual report skipped — only {len(closed_shadow)} resolved shadow trades so far ({open_shadow_count} still tracking). Need at least 5.")
-            return
-
-        shadow_wins = len([t for t in closed_shadow if t['result'] == 'WIN'])
-        shadow_wr = round(shadow_wins / len(closed_shadow) * 100, 1)
-        shadow_avg_r = round(sum(t.get('r_multiple', 0) for t in closed_shadow) / len(closed_shadow), 2)
-
-        by_reason = {}
-        for t in closed_shadow:
-            reason = t.get('rejection_reason', 'UNKNOWN')
-            if reason not in by_reason:
-                by_reason[reason] = {"wins": 0, "losses": 0, "total_r": 0.0}
-            if t['result'] == 'WIN':
-                by_reason[reason]['wins'] += 1
-            else:
-                by_reason[reason]['losses'] += 1
-            by_reason[reason]['total_r'] += t.get('r_multiple', 0)
-
-        reason_summary = "\n".join([
-            f"- {reason}: {v['wins']}W/{v['losses']}L ({round(v['wins']/(v['wins']+v['losses'])*100)}% win rate) | Avg R: {round(v['total_r']/(v['wins']+v['losses']), 2)}"
-            for reason, v in by_reason.items()
-        ])
+            all_shadow = {v: [] for v in VARIANTS}
 
         try:
             with open(data_path('paper_trades.json'), 'r') as f:
-                real_trades = json.load(f)
+                all_real = json.load(f)
+            if not isinstance(all_real, dict):
+                all_real = {v: [] for v in VARIANTS}
         except FileNotFoundError:
-            real_trades = []
-        real_closed = [t for t in real_trades if t.get('result') in ('WIN', 'LOSS')]
-        real_wr = round(len([t for t in real_closed if t['result'] == 'WIN']) / len(real_closed) * 100, 1) if real_closed else None
-        real_avg_r = round(sum(t.get('r_multiple', 0) for t in real_closed) / len(real_closed), 2) if real_closed else None
+            all_real = {v: [] for v in VARIANTS}
+
+        total_closed_shadow = sum(len([t for t in all_shadow.get(v, []) if t.get('result') in ('WIN', 'LOSS')]) for v in VARIANTS)
+        if total_closed_shadow < 5:
+            send_telegram(f"⚠️ Counterfactual report skipped — only {total_closed_shadow} resolved shadow trades across all variants so far. Need at least 5.")
+            return
+
+        variant_sections = []
+        for v in VARIANTS:
+            shadow = all_shadow.get(v, [])
+            real_trades = all_real.get(v, [])
+
+            closed_shadow = [t for t in shadow if t.get('result') in ('WIN', 'LOSS')]
+            open_shadow_count = len([t for t in shadow if t.get('result') == 'OPEN'])
+            real_closed = [t for t in real_trades if t.get('result') in ('WIN', 'LOSS')]
+            real_wr = round(len([t for t in real_closed if t['result'] == 'WIN']) / len(real_closed) * 100, 1) if real_closed else None
+            real_avg_r = round(sum(t.get('r_multiple', 0) for t in real_closed) / len(real_closed), 2) if real_closed else None
+
+            if closed_shadow:
+                shadow_wins = len([t for t in closed_shadow if t['result'] == 'WIN'])
+                shadow_wr = round(shadow_wins / len(closed_shadow) * 100, 1)
+                shadow_avg_r = round(sum(t.get('r_multiple', 0) for t in closed_shadow) / len(closed_shadow), 2)
+            else:
+                shadow_wr = shadow_avg_r = None
+
+            by_reason = {}
+            for t in closed_shadow:
+                reason = t.get('rejection_reason', 'UNKNOWN')
+                if reason not in by_reason:
+                    by_reason[reason] = {"wins": 0, "losses": 0, "total_r": 0.0}
+                if t['result'] == 'WIN':
+                    by_reason[reason]['wins'] += 1
+                else:
+                    by_reason[reason]['losses'] += 1
+                by_reason[reason]['total_r'] += t.get('r_multiple', 0)
+            reason_summary = "\n".join([
+                f"  - {reason}: {v2['wins']}W/{v2['losses']}L ({round(v2['wins']/(v2['wins']+v2['losses'])*100)}% win rate) | Avg R: {round(v2['total_r']/(v2['wins']+v2['losses']), 2)}"
+                for reason, v2 in by_reason.items()
+            ]) or "  (no rejected signals yet)"
+
+            variant_sections.append(f"""
+*[{v}]* Taken: {len(real_closed)} resolved | WR: {f"{real_wr}%" if real_wr is not None else "n/a"} | Avg R: {real_avg_r if real_avg_r is not None else "n/a"}
+Rejected: {len(closed_shadow)} resolved ({open_shadow_count} still tracking) | WR: {f"{shadow_wr}%" if shadow_wr is not None else "n/a"} | Avg R: {shadow_avg_r if shadow_avg_r is not None else "n/a"}
+{reason_summary}""")
 
         report = f"""
-🔮 *Counterfactual Report — Trades You Didn't Take*
+🔮 *Counterfactual Report — A/B/C Comparison*
 _{datetime.utcnow().strftime('%d %b %Y')}_
+{"".join(variant_sections)}
 
-*Trades Taken:* {len(real_closed)} resolved | Win rate: {f"{real_wr}%" if real_wr is not None else "n/a"} | Avg R: {real_avg_r if real_avg_r is not None else "n/a"}
-
-*Trades Rejected — testable* (Claude gave real levels): {len(closed_shadow)} resolved | {open_shadow_count} still tracking
-Win rate: {shadow_wr}% | Avg R: {shadow_avg_r}
-
-*By rejection reason:*
-{reason_summary}
-
-_Only alerts where Claude gave a real, extractable stop and target are tracked here — an explicit "No trade" response has nothing to test and is correctly excluded, not force-fit with fabricated levels. Small samples per reason bucket limit how much confidence to place in any one row — read this as an early signal, not a verdict._
+_Only alerts where Claude gave a real, extractable stop and target are tracked as "rejected" — an explicit "No trade" response has nothing to test and is correctly excluded, not force-fit with fabricated levels. Small samples per bucket limit how much confidence to place in any one row — read this as an early signal, not a verdict._
 """
         send_telegram(report)
     except Exception as e:
@@ -3940,17 +4158,20 @@ _Only alerts where Claude gave a real, extractable stop and target are tracked h
 def send_heartbeat():
     try:
         ensure_daily_reset()
-        open_trades = sum(1 for t in active_trades.values() if t.get('result') == 'OPEN')
+        sections = []
+        for v in VARIANTS:
+            open_trades = sum(1 for t in active_trades[v].values() if t.get('result') == 'OPEN')
+            sections.append(
+                f"*[{v}]* Active: {open_trades} | Balance: ${current_balance[v]:,.2f} | "
+                f"Total P&L: ${total_pnl[v]:,.2f} | Days: {trading_days[v]}/{PROP_FIRM_RULES['min_trading_days']} | "
+                f"Drawdown: {'ACTIVE ⚠️' if drawdown_protection[v] else 'OFF ✅'}"
+            )
         msg = f"""
 💓 *Daily Heartbeat — system running normally*
 {datetime.now(timezone.utc).strftime('%d %b %Y — %H:%M UTC')}
 
 Alerts today: {daily_alert_count}
-Active trades: {open_trades}
-Balance: ${current_balance:,.2f}
-Total P&L: ${total_pnl:,.2f}
-Trading days: {trading_days}/{PROP_FIRM_RULES['min_trading_days']}
-Drawdown protection: {'ACTIVE ⚠️' if drawdown_protection else 'OFF ✅'}
+{chr(10).join(sections)}
 """
         send_telegram(msg)
     except Exception as e:
@@ -3972,8 +4193,8 @@ def health():
     return jsonify({
         "status": "✅ running",
         "alerts_this_session": daily_alert_count,
-        "active_trades": len(active_trades),
-        "paper_trades_logged": len(paper_trades),
+        "active_trades": {v: len(active_trades[v]) for v in VARIANTS},
+        "paper_trades_logged": {v: len(paper_trades[v]) for v in VARIANTS},
         "drawdown_protection": drawdown_protection,
         "time_utc": datetime.utcnow().strftime('%H:%M:%S UTC')
     })

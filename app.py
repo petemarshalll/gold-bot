@@ -1656,15 +1656,24 @@ def detect_raw_signals(gold_df):
     return detected_signals
 
 
-def stratified_sample_signals(gold_df, per_type=50, seed=42):
+def stratified_sample_signals(gold_df, per_type=50, seed=42, exclude_indices=None):
     """
     Detects every signal across the full dataset, then samples
     `per_type` of each signal type, evenly spaced across the whole
     time range (not clustered at the start, end, or wherever signals
     happen to be densest) — so the sample represents the full 2
     years, not just one period of it.
+
+    exclude_indices (14 Aug): optional set of signal indices to skip
+    entirely before sampling -- lets run_replay_generate top up an
+    existing saved batch with genuinely new signals across multiple
+    sessions/days, never wasting real API cost re-analyzing one
+    that's already in it. Defaults to None (nothing excluded), so
+    every existing caller of this function is unaffected.
     """
     all_signals = detect_raw_signals(gold_df)
+    if exclude_indices:
+        all_signals = [s for s in all_signals if s["index"] not in exclude_indices]
     by_type = {}
     for s in all_signals:
         by_type.setdefault(s["type"], []).append(s)
@@ -3434,6 +3443,247 @@ def replay_sample_endpoint():
     })
 
 
+@app.route('/replay-generate', methods=['GET'])
+def replay_generate_endpoint():
+    """
+    Step 1 of 2 for multi-filter comparison (14 Aug). Generates real
+    Claude analysis for a large historical sample ONCE and saves the
+    full structured result of each -- NOT filtered by any one
+    decision rule yet. Step 2 (/replay-filters) reads this saved
+    batch and checks it against as many different filter definitions
+    as wanted, entirely free of further API cost, since it's just
+    reading data that already exists.
+
+    This is the expensive, slow step -- the one that makes real,
+    billed Claude calls. Only needs running once per desired sample
+    size; re-run only to grow the sample, never to test a new filter.
+    """
+    per_type = request.args.get('per_type', default=25, type=int)
+    thread = threading.Thread(target=run_replay_generate, args=(per_type,))
+    thread.start()
+    est_calls = per_type * 4
+    return jsonify({
+        "status": "generation started",
+        "sample_size": est_calls,
+        "note": f"makes ~{est_calls} REAL Claude API calls (real cost — see Telegram for a running estimate and the final real cost). Roughly {(est_calls * 8 + est_calls * 1.5) // 60:.0f}-{(est_calls * 15 + est_calls * 1.5) // 60:.0f} minutes. Once done, /replay-filters can be run against this saved batch as many times as wanted at zero further cost."
+    })
+
+
+def run_replay_generate(per_type=25):
+    """
+    Same historical sampling and point-in-time context as
+    run_live_judgment_replay, but saves the FULL structured result of
+    each signal -- both raw and override-applied confidence, the
+    confluence score, killzone/zone/DXY context, the derived trade
+    parameters, and the single real backtest outcome for those
+    parameters -- rather than checking it against one fixed filter
+    inline. Every one of the 12+ filter definitions in
+    run_replay_filters() only differs in WHICH signals they'd have
+    accepted; none of them change the underlying entry/stop/target,
+    so one saved outcome per signal is enough to evaluate all of them
+    -- this is what makes step 2 free.
+    """
+    try:
+        est_calls = per_type * 4
+        send_telegram(f"🧪 *Replay generation started (step 1/2)*\nSampling ~{est_calls} signals spread across 2 years, running each through the real live Claude analysis with point-in-time historical context. This makes real API calls — expect roughly {est_calls * 8 // 60}-{est_calls * 15 // 60} minutes and a real charge to your Anthropic account. Once this finishes, /replay-filters can check the saved result against any number of filter definitions for free. Progress updates every 25 signals.")
+
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        if gold.empty:
+            send_telegram("⚠️ Replay generation error: no gold price data returned")
+            return
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+
+        dxy = yf.download('DX-Y.NYB', period='2y', interval='1h', progress=False, timeout=20)
+        if not dxy.empty:
+            if isinstance(dxy.columns, pd.MultiIndex):
+                dxy.columns = [col[0] for col in dxy.columns]
+            dxy = dxy.dropna(subset=['Close'])
+
+        all_raw_signals = detect_raw_signals(gold)
+
+        # Load any existing saved batch FIRST -- if this is a top-up
+        # run (e.g. a smaller amount today, more added tomorrow), the
+        # new sample must skip everything already analyzed, both to
+        # avoid wasting real API cost re-analyzing the same signal
+        # twice and to avoid silently double-counting it in the
+        # eventual filter report.
+        existing_batch = None
+        existing_indices = set()
+        try:
+            with open(data_path('replay_batch.json'), 'r') as f:
+                existing_batch = json.load(f)
+            existing_indices = {r["index"] for r in existing_batch.get("records", [])}
+        except FileNotFoundError:
+            pass
+
+        sample = stratified_sample_signals(gold, per_type=per_type, exclude_indices=existing_indices)
+        if existing_indices:
+            send_telegram(f"📎 Found an existing saved batch with {len(existing_indices)} signals already analyzed — this run will only add genuinely new ones on top of it, nothing gets re-paid for or duplicated.")
+        send_telegram(f"📊 {len(gold)} candles loaded, {len(all_raw_signals)} total signals detected, sampled {len(sample)} new signals spread across the full period. Starting analysis...")
+
+        records = []
+        errors = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        account = PROP_FIRM_RULES["account_size"]
+        risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+
+        for n, sig in enumerate(sample):
+            i = sig["index"]
+            sig_type = sig["type"]
+            price = sig["price"]
+            high = sig["high"]
+            low = sig["low"]
+            timestamp = gold.index[i]
+
+            try:
+                session_name, session_desc, is_killzone = get_session_at(timestamp.hour)
+                news_risk, news_msg = get_news_risk_at(timestamp.hour, timestamp.minute, timestamp.weekday())
+                zone, zone_pct, zone_advice, _, _ = get_premium_discount_at(gold, i, price)
+                historical_key_levels = get_key_levels_at(gold, i)
+                if not dxy.empty:
+                    dxy_direction, dxy_desc, dxy_implication = get_dxy_bias_at(dxy, timestamp)
+                else:
+                    dxy_direction, dxy_desc, dxy_implication = "UNKNOWN", "DXY data unavailable", "NEUTRAL"
+
+                prior = [s for s in all_raw_signals if s["index"] < i][-5:]
+                context_lines = []
+                for p in prior:
+                    moved = price - p["price"]
+                    context_lines.append(f"- {gold.index[p['index']].strftime('%H:%M UTC')}: {p['type']} at {round(p['price'],2)} — price has since moved {abs(moved):.1f}pts {'up' if moved>0 else 'down' if moved<0 else 'flat'}")
+                recent_context = "\n".join(context_lines)
+
+                alert_data = {"type": sig_type, "price": price, "high": high, "low": low, "timeframe": "15"}
+                prompt = build_historical_prompt(
+                    alert_data, recent_context, session_name, session_desc, is_killzone,
+                    zone, zone_pct, zone_advice, news_risk, news_msg, historical_key_levels,
+                    timestamp.strftime('%H:%M UTC %d %b %Y'), dxy_direction, dxy_desc
+                )
+
+                message = call_claude(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=16000,
+                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    retries=4,
+                    base_delay=5,
+                )
+                analysis = None
+                for block in message.content:
+                    if block.type == "text":
+                        analysis = block.text
+                        break
+                if analysis is None:
+                    errors += 1
+                    continue
+
+                usage = getattr(message, 'usage', None)
+                if usage:
+                    total_input_tokens += getattr(usage, 'input_tokens', 0)
+                    total_output_tokens += getattr(usage, 'output_tokens', 0)
+
+                # apply_override=False -- only the confidence value differs
+                # between the two modes, so one call gives everything else
+                # (direction/stop/target/valid_trade/entry_zone_reached/
+                # has_real_trade_params) while raw_confidence and
+                # overridden_confidence are both derived from it below,
+                # exactly matching the live webhook's own override rule.
+                decision = derive_trade_decision(analysis, sig_type, price, apply_override=False)
+                raw_confidence = decision["confidence"]
+                overridden_confidence = raw_confidence
+                if "FVG" in sig_type and overridden_confidence == "LOW":
+                    overridden_confidence = "MEDIUM"
+                if "BEARISH_SWEEP" in sig_type and overridden_confidence == "HIGH":
+                    overridden_confidence = "MEDIUM"
+
+                confluence_score = extract_confluence_score(analysis)
+
+                outcome = None
+                r_multiple = None
+                if decision["has_real_trade_params"] and decision["valid_trade"]:
+                    outcome = simulate_backtest_trade(gold, i, decision["direction"], price, decision["stop_price"], decision["target_price"])
+                    if outcome is not None:
+                        stop_distance = abs(price - decision["stop_price"])
+                        if outcome == 'WIN':
+                            points = abs(decision["target_price"] - price)
+                            dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+                            trade_pnl = dollar_per_point * points
+                        else:
+                            trade_pnl = -risk_amount
+                        r_multiple = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
+
+                records.append({
+                    "index": i,
+                    "timestamp": timestamp.isoformat(),
+                    "type": sig_type,
+                    "direction": decision["direction"],
+                    "entry": price,
+                    "stop": decision["stop_price"],
+                    "target": decision["target_price"],
+                    "raw_confidence": raw_confidence,
+                    "overridden_confidence": overridden_confidence,
+                    "confluence_score": confluence_score,
+                    "is_killzone": is_killzone,
+                    "zone": zone,
+                    "dxy_implication": dxy_implication,
+                    "valid_trade": decision["valid_trade"],
+                    "entry_zone_reached": decision["entry_zone_reached"],
+                    "has_real_trade_params": decision["has_real_trade_params"],
+                    "outcome": outcome,
+                    "r_multiple": r_multiple,
+                    "analysis_text": analysis,
+                })
+
+            except Exception as e:
+                errors += 1
+                print(f"Replay generate signal {n} error: {e}")
+
+            time.sleep(1.5)
+
+            if (n + 1) % 25 == 0:
+                est_cost_so_far = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)
+                send_telegram(f"⏳ {n + 1}/{len(sample)} processed | est. cost so far: ${est_cost_so_far:.2f}")
+
+        total_cost = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)
+
+        # Merge into any existing batch rather than overwrite it --
+        # every top-up run (any day, any budget) adds to the same
+        # growing, cumulative sample instead of discarding whatever
+        # was already paid for.
+        if existing_batch:
+            combined_records = existing_batch.get("records", []) + records
+            combined_cost = round(existing_batch.get("total_cost", 0) + total_cost, 2)
+            combined_errors = existing_batch.get("errors", 0) + errors
+        else:
+            combined_records = records
+            combined_cost = round(total_cost, 2)
+            combined_errors = errors
+
+        batch = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "sample_size": len(combined_records),
+            "records": combined_records,
+            "errors": combined_errors,
+            "total_cost": combined_cost,
+        }
+        with open(data_path('replay_batch.json'), 'w') as f:
+            json.dump(batch, f, indent=2)
+
+        resolved = len([r for r in records if r["outcome"] is not None])
+        total_resolved = len([r for r in combined_records if r["outcome"] is not None])
+        send_telegram(f"""
+✅ *Replay generation complete (step 1/2)*
+This run: {len(records)} new signals analysed | {resolved} resolved | {errors} errors | real cost this run: ${total_cost:.2f}
+Cumulative batch: {len(combined_records)} total signals | {total_resolved} total resolved | total real cost so far: ${combined_cost:.2f}
+
+Saved to replay_batch.json — run /replay-filters any time to check this batch against any set of filters, at zero further cost. Run /replay-generate again any time (today, tomorrow, whenever) to add more on top, at zero risk of paying twice for the same signal.
+""")
+    except Exception as e:
+        error_msg = f"⚠️ Replay generation error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
+
+
 # Sonnet pricing used for the live cost estimate shown in Telegram.
 # Verify against current rates at https://claude.com/pricing before
 # relying on this for budgeting — pricing can change.
@@ -3633,6 +3883,206 @@ def backtest_validate_endpoint():
     thread = threading.Thread(target=run_backtest_validation)
     thread.start()
     return jsonify({"status": "validation started", "note": "runs in the background — results will be sent to Telegram in roughly 30-90 seconds"})
+
+
+# ============================================================
+# MULTI-FILTER COMPARISON (14 Aug) -- step 2 of 2
+# Every function here takes one saved record from replay_batch.json
+# and returns True/False: would this specific filter have taken this
+# trade? None of them touch the API, the saved analysis, or each
+# other -- pure, fast, free functions over data that already exists.
+# Add a new filter by writing one more function in this shape and
+# adding it to FILTER_DEFINITIONS below -- no need to regenerate the
+# batch to test it.
+# ============================================================
+def _passes_base_gate(r, confidence_field):
+    return (r[confidence_field] in ("HIGH", "MEDIUM") and r["valid_trade"]
+            and r["entry_zone_reached"] and r["has_real_trade_params"])
+
+
+def filter_A_control(r):
+    """Current live system, unchanged -- override applied, no
+    confluence floor. The reference point everything else is judged
+    against."""
+    return _passes_base_gate(r, "overridden_confidence")
+
+
+def filter_B_exact(r):
+    """Variant B's real, live logic exactly -- FVG/SWEEP override
+    never applied, Claude's own raw confidence used as-is."""
+    return _passes_base_gate(r, "raw_confidence")
+
+
+def filter_C_exact(r):
+    """Variant C's real, live logic exactly -- A's gate plus a hard
+    6/10 minimum confluence score."""
+    return filter_A_control(r) and r["confluence_score"] is not None and r["confluence_score"] >= 6
+
+
+def filter_dxy_strict(r):
+    """A's gate, plus reject outright if DXY actively conflicts with
+    the trade direction -- neutral DXY still passes."""
+    if not filter_A_control(r):
+        return False
+    conflict = ((r["direction"] == "LONG" and r["dxy_implication"] == "BEARISH")
+                or (r["direction"] == "SHORT" and r["dxy_implication"] == "BULLISH"))
+    return not conflict
+
+
+def filter_confluence_only(r):
+    """Ignores Claude's stated confidence label entirely -- takes
+    anything with a real, valid trade and a confluence score of 7+,
+    testing whether the structured score alone is more reliable than
+    the subjective HIGH/MEDIUM/LOW label."""
+    return (r["confluence_score"] is not None and r["confluence_score"] >= 7
+            and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"])
+
+
+def filter_zone_strict(r):
+    """A's gate, plus textbook SMC positioning only -- longs strictly
+    in discount, shorts strictly in premium, no exceptions."""
+    if not filter_A_control(r):
+        return False
+    return ((r["direction"] == "LONG" and r["zone"] == "DISCOUNT")
+            or (r["direction"] == "SHORT" and r["zone"] == "PREMIUM"))
+
+
+def filter_fvg_only(r):
+    """A's gate, restricted to FVG signals -- SWEEP excluded
+    entirely."""
+    return filter_A_control(r) and "FVG" in r["type"]
+
+
+def filter_sweep_only_no_override(r):
+    """B's raw-confidence gate, restricted to SWEEP signals only --
+    isolates this type cleanly, given how much confusion it caused
+    this week (the accidental blanket filter, the override debate)."""
+    return _passes_base_gate(r, "raw_confidence") and "SWEEP" in r["type"]
+
+
+def filter_stacked(r):
+    """Maximally selective -- raw HIGH confidence AND confluence 7+
+    AND inside a killzone AND no DXY conflict. Fewer trades by
+    design; tests whether quality beats quantity."""
+    if r["raw_confidence"] != "HIGH":
+        return False
+    if r["confluence_score"] is None or r["confluence_score"] < 7:
+        return False
+    if not r["is_killzone"]:
+        return False
+    conflict = ((r["direction"] == "LONG" and r["dxy_implication"] == "BEARISH")
+                or (r["direction"] == "SHORT" and r["dxy_implication"] == "BULLISH"))
+    if conflict:
+        return False
+    return r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
+
+
+def filter_inverse_confidence(r):
+    """Deliberately EXCLUDES HIGH confidence -- MEDIUM only. Tests
+    whether Claude's own "HIGH" label is actually earning its name,
+    or whether MEDIUM-labeled signals perform just as well or
+    better."""
+    return (r["overridden_confidence"] == "MEDIUM" and r["valid_trade"]
+            and r["entry_zone_reached"] and r["has_real_trade_params"])
+
+
+def filter_entry_zone_only(r):
+    """No confidence or confluence requirement at all -- takes
+    anything with a real, valid trade where price genuinely reached
+    the stated entry zone. Isolates just that one check's value on
+    its own."""
+    return r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
+
+
+def filter_killzone_only(r):
+    """No confidence or confluence requirement -- pure timing filter,
+    inside a killzone or not."""
+    return r["is_killzone"] and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
+
+
+FILTER_DEFINITIONS = [
+    ("A (control)", filter_A_control),
+    ("B-exact (no override)", filter_B_exact),
+    ("C-exact (confluence floor)", filter_C_exact),
+    ("DXY-strict", filter_dxy_strict),
+    ("Confluence-only (7+)", filter_confluence_only),
+    ("Zone-strict", filter_zone_strict),
+    ("FVG-only", filter_fvg_only),
+    ("SWEEP-only, no override", filter_sweep_only_no_override),
+    ("Everything stacked", filter_stacked),
+    ("Inverse-confidence (MEDIUM only)", filter_inverse_confidence),
+    ("Entry-zone-only", filter_entry_zone_only),
+    ("Killzone-only", filter_killzone_only),
+]
+
+
+@app.route('/replay-filters', methods=['GET'])
+def replay_filters_endpoint():
+    """
+    Step 2 of 2. Reads replay_batch.json (produced by /replay-generate)
+    and reports every filter in FILTER_DEFINITIONS against it -- no
+    API calls, no cost, safe to run as many times as wanted, including
+    right after adding a brand new filter function above.
+    """
+    try:
+        with open(data_path('replay_batch.json'), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    thread = threading.Thread(target=run_replay_filters_report, args=(batch,))
+    thread.start()
+    return jsonify({
+        "status": "report started",
+        "batch_generated_at": batch.get("generated_at"),
+        "batch_size": len(records),
+        "resolved": len(resolved),
+        "note": "no API calls, no cost — results in Telegram shortly."
+    })
+
+
+def run_replay_filters_report(batch):
+    try:
+        records = batch.get("records", [])
+        resolved = [r for r in records if r["outcome"] is not None]
+
+        sections = []
+        for name, filter_fn in FILTER_DEFINITIONS:
+            taken = [r for r in resolved if filter_fn(r)]
+            n = len(taken)
+            if n == 0:
+                sections.append(f"*{name}*\nNo signals in this batch matched — 0 trades")
+                continue
+            wins = len([r for r in taken if r["outcome"] == "WIN"])
+            wr = round(wins / n * 100, 1)
+            avg_r = round(sum(r["r_multiple"] for r in taken) / n, 2)
+            longs = len([r for r in taken if r["direction"] == "LONG"])
+            shorts = n - longs
+            sections.append(
+                f"*{name}*\n"
+                f"n={n} | WR: {wr}% | Avg R: {avg_r} | Long/Short: {longs}/{shorts}"
+            )
+
+        report = f"""
+📊 *Multi-Filter Comparison Report*
+_{datetime.utcnow().strftime('%d %b %Y')}_
+
+Batch: {len(records)} signals analysed {batch.get('generated_at', '')[:10]} | {len(resolved)} resolved | real cost when generated: ${batch.get('total_cost', 0):.2f}
+
+{chr(10).join(sections)}
+
+_Every filter above was checked against the exact same {len(resolved)} resolved signals and the exact same Claude analysis of each — the only thing that differs between rows is which ones each filter would have accepted. Small per-filter sample sizes (especially the more selective ones) limit how much confidence to place in any single row — read this as a comparative first look, not a final verdict on any one filter._
+"""
+        send_telegram(report)
+    except Exception as e:
+        error_msg = f"⚠️ Filter report error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
 
 
 def run_backtest_validation():

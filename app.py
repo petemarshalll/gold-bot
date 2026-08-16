@@ -4122,26 +4122,32 @@ _Every filter above was checked against the exact same {len(resolved)} resolved 
 
 
 # ============================================================
-# HALF-TP VARIANT (15 Aug) -- same saved batch, same filters,
-# stop left completely untouched, target moved to exactly halfway
-# between entry and Claude's original target. Directly tests the
-# "the direction call looks right, the target's just too far" idea --
-# entirely free, since it reuses the same already-paid-for Claude
-# analysis and just re-derives the outcome against a different level
-# using the same real candle data.
+# SCALED-TP VARIANT (15-16 Aug) -- same saved batch, same filters,
+# stop left completely untouched, target moved to any chosen
+# fraction of the way between entry and Claude's original target.
+# Generalizes the original half-TP idea (which tested exactly 50%)
+# after that result came back genuinely mixed, not a clean win --
+# entirely free either way, since it reuses the same already-paid-for
+# Claude analysis and just re-derives the outcome against a different
+# level using the same real candle data.
 # ============================================================
-def recompute_outcomes_half_tp(records, gold_df):
+def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction):
     """
-    For each record with a real outcome, halves the distance from
-    entry to target (stop unchanged) and re-runs the exact same
-    simulate_backtest_trade logic already proven throughout this
-    project, against the same real price data. Looks up each
-    signal's position by its saved TIMESTAMP, not its saved
+    For each record with a real outcome, moves the target to
+    tp_fraction of the distance from entry to Claude's original
+    target (stop unchanged) and re-runs the exact same
+    simulate_backtest_trade/_score_trade logic already proven
+    throughout this project, against the same real price data. Looks
+    up each signal's position by its saved TIMESTAMP, not its saved
     positional index -- yfinance's "2y" window rolls forward every
     day, so a positional index from an earlier download can silently
     point at the wrong candle by the time this runs later. A signal
     whose timestamp can't be found in the freshly-downloaded data
     (should be rare) is left with outcome=None rather than guessed at.
+    tp_fraction=0.5 reproduces the original half-TP test exactly;
+    0.75 moves it most of the way back out toward the original;
+    values above 1.0 would extend past the original target instead
+    of shrinking it, if that's ever worth testing too.
     """
     account = PROP_FIRM_RULES["account_size"]
     risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
@@ -4162,24 +4168,21 @@ def recompute_outcomes_half_tp(records, gold_df):
 
         entry = r["entry"]
         stop = r["stop"]  # deliberately unchanged
-        half_target = round(entry + (r["target"] - entry) / 2, 2)
+        scaled_target = round(entry + (r["target"] - entry) * tp_fraction, 2)
 
-        outcome = simulate_backtest_trade(gold_df, real_index, r["direction"], entry, stop, half_target)
-        new_r["target"] = half_target
+        outcome, r_multiple = _score_trade(gold_df, real_index, r["direction"], entry, stop, scaled_target, risk_amount)
+        new_r["target"] = scaled_target
         new_r["outcome"] = outcome
-        if outcome is not None:
-            stop_distance = abs(entry - stop)
-            if outcome == "WIN":
-                points = abs(half_target - entry)
-                dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
-                trade_pnl = dollar_per_point * points
-            else:
-                trade_pnl = -risk_amount
-            new_r["r_multiple"] = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
-        else:
-            new_r["r_multiple"] = None
+        new_r["r_multiple"] = r_multiple
         new_records.append(new_r)
     return new_records
+
+
+def recompute_outcomes_half_tp(records, gold_df):
+    """Thin wrapper -- the original, exact-50% test. Kept unchanged
+    so the existing /replay-filters-half-tp endpoint (already run for
+    real, already documented) keeps working exactly as before."""
+    return recompute_outcomes_scaled_tp(records, gold_df, 0.5)
 
 
 @app.route('/replay-filters-half-tp', methods=['GET'])
@@ -4239,6 +4242,82 @@ def run_replay_filters_half_tp_report(batch):
         )
     except Exception as e:
         error_msg = f"⚠️ Half-TP report error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
+
+
+@app.route('/replay-filters-scaled-tp', methods=['GET'])
+def replay_filters_scaled_tp_endpoint():
+    """
+    Generalized version of /replay-filters-half-tp -- any target
+    distance, not just exactly half. ?fraction=0.75 moves the target
+    75% of the way from entry to Claude's original target; stop
+    always left completely untouched. Same free, zero-Claude-cost
+    design as the half-TP variant -- reuses the same saved batch, one
+    free price re-download to re-check against.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        fraction = float(request.args.get('fraction', 0.5))
+    except ValueError:
+        return jsonify({"status": "error", "message": "fraction must be a number, e.g. ?fraction=0.75"}), 400
+    if not (0 < fraction <= 2.0):
+        return jsonify({"status": "error", "message": "fraction should be between 0 and 2.0 (above 1.0 extends past the original target rather than shrinking it)"}), 400
+
+    try:
+        with open(data_path('replay_batch.json'), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    thread = threading.Thread(target=run_replay_filters_scaled_tp_report, args=(batch, fraction))
+    thread.start()
+    return jsonify({
+        "status": "report started",
+        "fraction": fraction,
+        "batch_generated_at": batch.get("generated_at"),
+        "batch_size": len(records),
+        "resolved": len(resolved),
+        "note": "no API calls, no cost — one free price re-download, results in Telegram shortly."
+    })
+
+
+def run_replay_filters_scaled_tp_report(batch, fraction):
+    try:
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        if gold.empty:
+            send_telegram("⚠️ Scaled-TP report error: no price data returned")
+            return
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+
+        records = batch.get("records", [])
+        scaled_records = recompute_outcomes_scaled_tp(records, gold, fraction)
+
+        original_resolved = len([r for r in records if r["outcome"] is not None])
+        scaled_resolved = len([r for r in scaled_records if r["outcome"] is not None])
+        pct_label = f"{fraction * 100:.0f}%"
+        note = (f"\n_Stop left completely unchanged — only the target moved, to {pct_label} of the way "
+                f"from entry to Claude's original target. {scaled_resolved} of {original_resolved} "
+                f"originally-resolved signals still resolved under this target "
+                f"(a signal can end up unresolved here if price never reached either level within "
+                f"the same lookahead window once the target moved)._\n")
+
+        run_replay_filters_report(
+            batch,
+            records_override=scaled_records,
+            title=f"Multi-Filter Comparison — Target at {pct_label}",
+            extra_note=note,
+        )
+    except Exception as e:
+        error_msg = f"⚠️ Scaled-TP report error: {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
 

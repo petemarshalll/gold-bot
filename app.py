@@ -4345,38 +4345,59 @@ def run_replay_filters_scaled_tp_report(batch, fraction):
 # saved outcome regardless of how many filters agree on it. Entirely
 # free, same saved batch, no new Claude calls.
 # ============================================================
-def combine_filters(resolved_records, filter_keys, mode):
+def combine_filters(resolved_records, filter_keys, mode, exclude_keys=None):
     """
-    Returns (combined_records, per_filter_breakdown). The breakdown
-    is how many of the combined records ALSO independently pass each
-    individual selected filter -- under "or" mode this can sum to
-    more than the combined total if there's real overlap between
-    filters, which is expected and fine, not a bug.
+    Returns (combined_records, per_filter_breakdown, exclude_breakdown).
+    exclude_keys (16 Aug) -- optional "emergency brake" list: a
+    record that would otherwise be included gets dropped if it ALSO
+    matches ANY filter in this list, applied strictly on top of the
+    normal include logic, never instead of it. exclude_breakdown
+    shows how many records each individual block filter actually
+    blocked, for transparency on which one is doing the real work.
     """
     lookup = {key: (name, fn) for key, name, fn in FILTER_DEFINITIONS}
     selected = [(key, lookup[key][0], lookup[key][1]) for key in filter_keys]
+    excluded = [(key, lookup[key][0], lookup[key][1]) for key in (exclude_keys or [])]
 
-    combined = []
+    included_pool = []
     for r in resolved_records:
         passes = [fn(r) for _, _, fn in selected]
         if (mode == "and" and all(passes)) or (mode == "or" and any(passes)):
-            combined.append(r)
+            included_pool.append(r)
+
+    combined = []
+    exclude_blocked_counts = {key: 0 for key, _, _ in excluded}
+    for r in included_pool:
+        blocked_by = [key for key, _, fn in excluded if fn(r)]
+        if blocked_by:
+            for key in blocked_by:
+                exclude_blocked_counts[key] += 1
+            continue
+        combined.append(r)
 
     breakdown = {}
     for key, name, fn in selected:
         breakdown[key] = {"name": name, "count": len([r for r in combined if fn(r)])}
 
-    return combined, breakdown
+    exclude_breakdown = {key: {"name": name, "blocked_count": exclude_blocked_counts[key]} for key, name, _ in excluded}
+
+    return combined, breakdown, exclude_breakdown
 
 
 @app.route('/replay-combine', methods=['GET'])
 def replay_combine_endpoint():
     """
     ?filters=A,B,C&mode=or  or  ?filters=A,B,C&mode=and
-    mode=and: tight -- a trade only counts if it passes every
-    selected filter. mode=or: broader -- a trade counts if it passes
-    any selected filter, counted once regardless of how many agree.
-    Free -- reads the same saved batch, no new Claude calls.
+    Optional &exclude=C,confluence,stacked -- "emergency brake": a
+    trade otherwise included gets dropped if it ALSO matches any
+    filter in this list, regardless of the include mode.
+    Optional &fraction=0.8 (or &tp_pct=80, same thing, different
+    convention -- use one or the other, not both) -- combines
+    against a scaled target instead of the original, full one.
+    Free -- reads the same saved batch; fraction/tp_pct costs one
+    extra free price re-download, no new Claude calls either way.
+    Returns the full stats directly in this response AND sends the
+    same summary to Telegram.
     """
     ok, msg = check_bridge_secret()
     if not ok:
@@ -4384,18 +4405,39 @@ def replay_combine_endpoint():
 
     filters_param = request.args.get('filters', '')
     mode = request.args.get('mode', '').lower()
+    exclude_param = request.args.get('exclude', '')
     if not filters_param:
         return jsonify({"status": "error", "message": "filters query param required, e.g. ?filters=A,B,C"}), 400
     if mode not in ('and', 'or'):
         return jsonify({"status": "error", "message": "mode must be exactly 'and' or 'or'"}), 400
 
-    filter_keys = [k.strip() for k in filters_param.split(',') if k.strip()]
     valid_keys = {key for key, _, _ in FILTER_DEFINITIONS}
+    filter_keys = [k.strip() for k in filters_param.split(',') if k.strip()]
     invalid = [k for k in filter_keys if k not in valid_keys]
     if invalid:
         return jsonify({"status": "error", "message": f"Unknown filter key(s): {', '.join(invalid)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
     if len(filter_keys) < 2:
         return jsonify({"status": "error", "message": "Need at least 2 filters to combine -- for a single filter's own results, use /replay-filters instead"}), 400
+
+    exclude_keys = [k.strip() for k in exclude_param.split(',') if k.strip()] if exclude_param else []
+    invalid_exclude = [k for k in exclude_keys if k not in valid_keys]
+    if invalid_exclude:
+        return jsonify({"status": "error", "message": f"Unknown exclude filter key(s): {', '.join(invalid_exclude)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+
+    fraction_param = request.args.get('fraction', None)
+    tp_pct_param = request.args.get('tp_pct', None)
+    if fraction_param is not None and tp_pct_param is not None:
+        return jsonify({"status": "error", "message": "Use either fraction or tp_pct, not both"}), 400
+    fraction = None
+    try:
+        if fraction_param is not None:
+            fraction = float(fraction_param)
+        elif tp_pct_param is not None:
+            fraction = float(tp_pct_param) / 100.0
+    except ValueError:
+        return jsonify({"status": "error", "message": "fraction/tp_pct must be a number, e.g. &fraction=0.8 or &tp_pct=80"}), 400
+    if fraction is not None and not (0 < fraction <= 2.0):
+        return jsonify({"status": "error", "message": "fraction should be between 0 and 2.0 (tp_pct between 0 and 200)"}), 400
 
     try:
         with open(data_path('replay_batch.json'), 'r') as f:
@@ -4408,58 +4450,93 @@ def replay_combine_endpoint():
     if len(resolved) < 5:
         return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
 
-    thread = threading.Thread(target=run_replay_combine_report, args=(batch, filter_keys, mode))
-    thread.start()
-    return jsonify({
-        "status": "report started",
-        "filters": filter_keys,
-        "mode": mode,
-        "batch_generated_at": batch.get("generated_at"),
-        "resolved": len(resolved),
-        "note": "no API calls, no cost — results in Telegram shortly."
-    })
+    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction)
+    status_code = 200 if result.get("status") == "ok" else 500
+    return jsonify(result), status_code
 
 
-def run_replay_combine_report(batch, filter_keys, mode):
+def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None):
     try:
         records = batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
 
-        combined, breakdown = combine_filters(resolved, filter_keys, mode)
+        target_note = ""
+        if fraction is not None:
+            gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+            if gold.empty:
+                error = "No price data returned for the TP-scaling step"
+                send_telegram(f"⚠️ Combine report error: {error}")
+                return {"status": "error", "message": error}
+            gold.columns = [col[0] for col in gold.columns]
+            gold = gold.dropna()
+            resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction)
+            resolved = [r for r in resolved if r["outcome"] is not None]
+            pct_label = f"{fraction * 100:.0f}%"
+            target_note = f"Target scaled to {pct_label} of the way from entry to the original target, stop unchanged."
+
+        combined, breakdown, exclude_breakdown = combine_filters(resolved, filter_keys, mode, exclude_keys)
         stats = _aggregate_stats(combined)
+        total_r = round(sum(r["r_multiple"] for r in combined), 2)
+
+        if stats is None:
+            n, wr, avg_r, long_short = 0, None, None, "0/0"
+            result_line = "No signals passed — 0 trades"
+        else:
+            n, wr, avg_r = stats['n'], stats['wr'], stats['avg_r']
+            long_short = f"{stats['longs']}/{stats['shorts']}"
+            result_line = f"n={n} | WR: {wr}% | Avg R: {avg_r} | Total R: {total_r} | Long/Short: {long_short}"
 
         mode_label = "ALL selected filters must agree (tight intersection)" if mode == "and" else "ANY selected filter is enough (broader union, no duplicates)"
-        result_line = f"n={stats['n']} | WR: {stats['wr']}% | Avg R: {stats['avg_r']} | Long/Short: {stats['longs']}/{stats['shorts']}" if stats else "No signals passed — 0 trades"
-        breakdown_lines = "\n".join([
-            f"  - {info['name']}: {info['count']} of these" for key, info in breakdown.items()
-        ])
+        breakdown_lines = "\n".join([f"  - {info['name']}: {info['count']} of these" for key, info in breakdown.items()])
+        exclude_lines = ""
+        if exclude_keys:
+            exclude_lines = "\n*Blocked by the exclude list (would otherwise have been included):*\n" + "\n".join(
+                [f"  - {info['name']}: blocked {info['blocked_count']}" for key, info in exclude_breakdown.items()]
+            )
 
         explain = ("A trade only counts here if it passed every one of the selected filters."
                    if mode == "and" else
                    "A trade counts here if it passed at least one selected filter — counted once "
                    "even if several would separately have accepted it, since each real signal only "
                    "has one saved outcome regardless of how many filters agree on it.")
+        if exclude_keys:
+            explain += " Any trade also matching an exclude-list filter is dropped regardless, even if it passed the include pool."
 
         report = f"""
 📊 *Combined Filter Report — {mode_label}*
 _{datetime.utcnow().strftime('%d %b %Y')}_
 
-Filters combined: {', '.join(filter_keys)}
+Filters combined: {', '.join(filter_keys)}{f' | Excluded if also matching: {", ".join(exclude_keys)}' if exclude_keys else ''}
 Batch: {len(resolved)} resolved signals total
+{target_note}
 
 *Combined result:*
 {result_line}
 
 *Per-filter breakdown (how many of the combined set each filter individually also accepts):*
 {breakdown_lines}
+{exclude_lines}
 
 _{explain} Small sample sizes limit how much confidence to place in this — read as a comparative first look, not a final verdict._
 """
         send_telegram(report)
+
+        return {
+            "status": "ok",
+            "n": n,
+            "win_rate": wr,
+            "avg_R": avg_r,
+            "total_R": total_r,
+            "long_short_ratio": long_short,
+            "per_filter_breakdown": {key: info["count"] for key, info in breakdown.items()},
+            "exclude_breakdown": {key: info["blocked_count"] for key, info in exclude_breakdown.items()} if exclude_keys else None,
+            "target_scaling": target_note or None,
+        }
     except Exception as e:
         error_msg = f"⚠️ Combine report error: {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
+        return {"status": "error", "message": str(e)}
 
 
 def run_backtest_validation():

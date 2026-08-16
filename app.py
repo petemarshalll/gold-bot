@@ -869,6 +869,45 @@ def variant_confluence_ok(variant, confluence_score):
     return confluence_score is not None and confluence_score >= VARIANT_MIN_CONFLUENCE_SCORE
 
 
+def variant_a_excluded(overridden_confidence, raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+    """
+    A's real-time "emergency brake" (16 Aug) -- given a signal that
+    already has a real, valid, reachable trade (checked separately by
+    the caller), this returns True if it should be excluded anyway
+    because it independently satisfies one of the three specific
+    patterns the full 2-year replay showed performing worse: C's own
+    gate, the raw confluence-only gate, or the maximally-selective
+    "everything stacked" gate.
+
+    Deliberately mirrors filter_C_exact / filter_confluence_only /
+    filter_stacked (used throughout the /replay-* endpoints) piece by
+    piece, on the same real fields under different names -- so the
+    live rule and the tested rule can never silently drift apart.
+    Caller is expected to have already confirmed valid_trade,
+    entry_zone_reached, and has_real_trade_params are all True; this
+    function only adds the three exclude checks on top of that.
+    """
+    # Mirrors filter_C_exact: A's own gate (confidence HIGH/MEDIUM)
+    # plus a 6+ confluence score.
+    passes_c = (overridden_confidence in ("HIGH", "MEDIUM")
+                and confluence_score is not None and confluence_score >= 6)
+
+    # Mirrors filter_confluence_only: ignores confidence entirely,
+    # just a 7+ confluence score.
+    passes_confluence_only = confluence_score is not None and confluence_score >= 7
+
+    # Mirrors filter_stacked: raw (un-overridden) HIGH confidence,
+    # confluence 7+, inside a killzone, and DXY not actively
+    # conflicting with the trade direction.
+    dxy_conflict = ((direction == "LONG" and dxy_implication == "BEARISH")
+                     or (direction == "SHORT" and dxy_implication == "BULLISH"))
+    passes_stacked = (raw_confidence == "HIGH"
+                       and confluence_score is not None and confluence_score >= 7
+                       and is_killzone and not dxy_conflict)
+
+    return passes_c or passes_confluence_only or passes_stacked
+
+
 def extract_confluence_score(analysis):
     """Pulls the numeric X/10 confluence score out of Claude's analysis
     text so it can be logged alongside the trade, instead of being
@@ -1977,6 +2016,99 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         # ============================================================
         for variant in VARIANTS:
             try:
+                # ============================================================
+                # VARIANT A (16 Aug) -- new live logic, replacing the old
+                # confidence-gated approach entirely. Directly applies the
+                # single best-evidenced result from the full replay
+                # exploration (14-16 Aug, real 200-signal historical
+                # batch): no confidence/confluence requirement at all --
+                # just a real, valid trade whose entry zone has genuinely
+                # been reached -- EXCEPT signals that independently match
+                # C/confluence-only/stacked's own gates, which get
+                # excluded even though they'd otherwise qualify. Target
+                # scaled to 80% of the original entry-to-target distance;
+                # stop deliberately, completely untouched.
+                #
+                # Old A (unchanged confidence-override logic) is still
+                # fully preserved in the code below for B and C, and in
+                # every historical trade already logged under A with
+                # BOT_VERSION < the version this shipped in -- old and
+                # new A data stays cleanly separable going forward.
+                # ============================================================
+                if variant == "A":
+                    has_real_trade_params = sl_found and tp_found
+
+                    # Shadow tracking: what happens to the signals A
+                    # specifically excludes, so this keeps getting
+                    # validated on fresh, live data, not just the
+                    # historical replay it was built from.
+                    try:
+                        if valid_trade and entry_zone_reached and has_real_trade_params:
+                            if variant_a_excluded(overridden_confidence, raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+                                shadow_context = {
+                                    "session": session_name, "killzone": is_killzone, "zone": zone,
+                                    "zone_pct": zone_pct, "dxy_direction": dxy_direction,
+                                    "dxy_implication": dxy_implication, "news_risk": news_risk,
+                                    "spread_risk": spread_risk, "hour_quality": hour_quality,
+                                    "confluence_score": confluence_score,
+                                }
+                                log_shadow_trade(variant, alert_type, data.get('price'), direction, entry_price,
+                                                  stop_price, target_price, overridden_confidence,
+                                                  "EXCLUDED_BY_A_RULE", context=shadow_context)
+                    except Exception as e:
+                        print(f"[{variant}] Shadow tracking error (non-fatal, real trade path unaffected): {e}")
+
+                    if valid_trade and entry_zone_reached and has_real_trade_params:
+                        if variant_a_excluded(overridden_confidence, raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches a known-weaker pattern (C-style, high-confluence-only, or the maximally-selective stacked criteria), skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
+                            monitor_active_trades(variant, data.get('price', 0))
+                            continue
+                        risk_ok, risk_msg = check_risk_cap_before_trade(variant)
+                        if risk_ok:
+                            alert_time = datetime.utcnow().strftime('%H:%M UTC')
+                            # 80% target scaling -- stop deliberately
+                            # unchanged. The single most consistent,
+                            # best-evidenced result across every fraction
+                            # tested (50-100%) against the real, saved
+                            # historical batch, confirmed sharpest and
+                            # most consistent on the two largest samples.
+                            scaled_target_price = round(entry_price + (target_price - entry_price) * 0.8, 2)
+                            trade_context = {
+                                "session": session_name, "killzone": is_killzone, "zone": zone,
+                                "zone_pct": zone_pct, "dxy_direction": dxy_direction,
+                                "dxy_implication": dxy_implication, "news_risk": news_risk,
+                                "spread_risk": spread_risk, "hour_quality": hour_quality,
+                                "confluence_score": confluence_score,
+                                "risk_pct": PROP_FIRM_RULES["max_loss_per_trade_pct"],
+                                "original_target": target_price,
+                                "target_scaled_to_pct": 80,
+                            }
+                            if entry_zone:
+                                trade_context["entry_zone_low"] = entry_zone[0]
+                                trade_context["entry_zone_high"] = entry_zone[1]
+                            log_paper_trade(variant, alert_type, data.get('price'), direction, entry_price, stop_price,
+                                             scaled_target_price, overridden_confidence, alert_time, context=trade_context)
+                        else:
+                            print(f"[{variant}] {risk_msg}")
+                            send_telegram(risk_msg)
+                    elif valid_trade and entry_zone_reached and not has_real_trade_params:
+                        print(f"[{variant}] Skipped logging paper trade — Claude did not provide a real extractable stop/target (likely an explicit 'No trade' response). Alert:{alert_type}")
+                    elif valid_trade and not entry_zone_reached:
+                        msg = (f"⏳ *[{variant}] Setup noted — not logged as a trade*\n"
+                               f"Current price (${entry_price:,.2f}) hasn't reached the proposed "
+                               f"entry zone (${entry_zone[0]:,.2f}–${entry_zone[1]:,.2f}) yet. "
+                               f"This is a level to watch, not a live trade.")
+                        print(msg)
+                        send_telegram(msg)
+                    elif not valid_trade:
+                        print(f"[{variant}] Skipped logging paper trade — SL/TP inconsistent. Dir:{direction} Entry:{entry_price} SL:{stop_price} TP:{target_price}")
+
+                    monitor_active_trades(variant, data.get('price', 0))
+                    continue
+
+                # ============================================================
+                # VARIANTS B AND C -- unchanged, exactly as before.
+                # ============================================================
                 confidence_used = raw_confidence if variant == "B" else overridden_confidence
                 drawdown_active, drawdown_reason = check_drawdown_protection(variant)
 

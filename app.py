@@ -117,7 +117,13 @@ scheduler = None
 # Bump this whenever a change could meaningfully affect trade
 # decisions (confidence gating, entry logic, risk sizing, etc).
 # ============================================================
-BOT_VERSION = "1.0.0"
+# 1.1.0 (16 Aug): variant A's entry-gate/exclude/target-scaling rebuild.
+# The comment above the A-rebuild code in the per-variant loop already
+# promised old-vs-new A trades would be separable by this bump; it
+# just never actually happened until now. (In the meantime,
+# target_scaled_to_pct's presence on a trade record is an equivalent
+# way to tell them apart.)
+BOT_VERSION = "1.1.0"
 
 # ============================================================
 # SHADOW TRACKING
@@ -276,7 +282,18 @@ def load_state():
             current_balance = {v: state.get('current_balance', {}).get(v, 10000) for v in VARIANTS}
             trading_days = {v: state.get('trading_days', {}).get(v, 0) for v in VARIANTS}
             consecutive_losses = {v: state.get('consecutive_losses', {}).get(v, 0) for v in VARIANTS}
-        last_trading_day = state.get('last_trading_day', None)
+            # Was loaded unconditionally below, outside this guard --
+            # the one per-variant field that skipped the same
+            # old-format safety net every field above it goes through.
+            # Harmless while bot_state.json already has this in the
+            # current per-variant shape (true today, since real trades
+            # have been closing correctly all week, which apply_trade_pnl
+            # couldn't do if this were ever the wrong type), but a
+            # latent break if the state file is ever reset or hand-
+            # edited: last_trading_day[variant] would then be indexing
+            # into None or a bare string instead of a dict. Moved inside
+            # this branch and loaded defensively like its siblings.
+            last_trading_day = {v: state.get('last_trading_day', {}).get(v) for v in VARIANTS}
         last_pnl_reset_day = state.get('last_pnl_reset_day', None)
         daily_alert_count = state.get('daily_alert_count', 0)
         # Self-heal immediately on load, not just on the next risk
@@ -414,8 +431,8 @@ def check_spread(high, low, price):
 # NEWS RISK CHECK
 # ============================================================
 def check_news_risk():
+    finnhub_key = os.getenv("FINNHUB_API_KEY")  # outside the try so it's always defined for the except block's redaction below
     try:
-        finnhub_key = os.getenv("FINNHUB_API_KEY")
         if not finnhub_key:
             return check_news_risk_fallback()
         today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -448,7 +465,11 @@ def check_news_risk():
                 continue
         return False, "No major news risk detected"
     except Exception as e:
-        print(f"News calendar error: {e}")
+        # requests' own connection/timeout exceptions often embed the
+        # full request URL in str(e) -- redact the key so a Finnhub
+        # blip can't dump it into Railway's console in plaintext.
+        safe_error = str(e).replace(finnhub_key, "[REDACTED]") if finnhub_key else str(e)
+        print(f"News calendar error: {safe_error}")
         return check_news_risk_fallback()
 
 
@@ -671,8 +692,17 @@ def send_telegram(message):
             response = requests.post(url, json=payload, timeout=10)
             print(f"Telegram sent: {response.status_code}")
             if response.status_code == 400:
-                payload["parse_mode"] = "None"
-                requests.post(url, json=payload, timeout=10)
+                # Was setting parse_mode to the STRING "None" here, which
+                # Telegram validates strictly (it even treats "Markdown"
+                # and "markdown" differently) and almost certainly also
+                # rejected -- meaning this retry silently failed the same
+                # way the original attempt did, with nothing anywhere to
+                # show it happened. Popping the key entirely is a genuine
+                # plain-text fallback: no parse_mode means Telegram can't
+                # choke on the message's formatting, whatever it contains.
+                payload.pop("parse_mode", None)
+                retry_response = requests.post(url, json=payload, timeout=10)
+                print(f"Telegram retry (plain text, original parse failed): {retry_response.status_code}")
         except Exception as e:
             print(f"Telegram error: {e}")
 
@@ -1371,8 +1401,24 @@ Stop: {stop} -- price check showed {current_price}. Holding off crediting until 
 # LEARNED RULES
 # ============================================================
 def get_learned_rules():
+    """
+    Feeds into the single shared analysis prompt (analyse_with_claude),
+    so -- same reasoning as drawdown_active_a below -- reads variant
+    A's own approved rules as the representative value, since there's
+    only one shared Claude call per alert, not one per variant.
+
+    Previously read a bare 'learned_rules.txt', which nothing else in
+    this file ever writes to -- /approve-rules, /reset-learned-rules,
+    and /view-rules all correctly use the per-variant
+    learned_rules_{variant}.txt naming, but this function was missed
+    during the A/B/C migration (9 Aug) and kept reading the old,
+    single-account filename. Practical effect: every approval made
+    through /approve-rules since 9 Aug has been silently inert --
+    this always hit the except below and returned "No learned rules
+    yet", regardless of what had actually been approved. Fixed 16 Aug.
+    """
     try:
-        with open(data_path('learned_rules.txt'), 'r') as f:
+        with open(data_path('learned_rules_A.txt'), 'r') as f:
             return f.read()
     except FileNotFoundError:
         return "No learned rules yet — system will develop rules after first self-review."
@@ -3285,13 +3331,21 @@ _Act now or wait for next candle close confirmation_
 # ============================================================
 # SELF LEARNING
 # ============================================================
-@app.route('/self-review', methods=['GET'])
-def self_review():
+def run_self_review(variant):
+    """
+    Core self-review logic for one variant. Pulled out of the
+    /self-review route (16 Aug fix) so the weekly scheduled job can
+    call it directly, once per variant. APScheduler invokes scheduled
+    jobs outside of any Flask request context, so the old code's
+    request.args.get('variant', ...) crashed every single time the
+    schedule fired -- RuntimeError: Working outside of request
+    context -- silently caught by run_in_context()'s own except
+    clause and never surfaced anywhere but Railway's console. This
+    function never touches `request` or `jsonify`, so it's safe to
+    call from either the route below or the scheduler. Returns a
+    plain dict; the route wrapper is responsible for jsonify-ing it.
+    """
     try:
-        variant = request.args.get('variant', 'A')
-        if variant not in VARIANTS:
-            return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
-
         trades = []
         try:
             with open(data_path('trade_log.csv'), 'r') as f:
@@ -3312,7 +3366,7 @@ def self_review():
 
         if len(trades) < 5:
             send_telegram(f"⚠️ [{variant}] Self review skipped — not enough trade data yet. Need at least 5 alerts logged.")
-            return jsonify({"status": "insufficient data"})
+            return {"status": "insufficient data", "variant": variant}
 
         wins = [t for t in paper if t.get('result') == 'WIN']
         losses = [t for t in paper if t.get('result') == 'LOSS']
@@ -3430,12 +3484,40 @@ Approve: https://web-production-387c47.up.railway.app/approve-rules?variant={var
 Reject: https://web-production-387c47.up.railway.app/reject-rules?variant={variant}
 """)
 
-        return jsonify({"status": "self review complete", "variant": variant, "win_rate": win_rate, "total_trades": len(trades)})
+        return {"status": "self review complete", "variant": variant, "win_rate": win_rate, "total_trades": len(trades)}
 
     except Exception as e:
-        error_msg = f"⚠️ Self review error: {str(e)}"
+        error_msg = f"⚠️ [{variant}] Self review error: {str(e)}"
+        print(error_msg)
         send_telegram(error_msg)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return {"status": "error", "variant": variant, "message": str(e)}
+
+
+@app.route('/self-review', methods=['GET'])
+def self_review():
+    variant = request.args.get('variant', 'A')
+    if variant not in VARIANTS:
+        return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
+    result = run_self_review(variant)
+    status_code = 500 if result.get("status") == "error" else 200
+    return jsonify(result), status_code
+
+
+def run_scheduled_self_review():
+    """
+    Weekly scheduled entry point (Sunday 19:00 UTC). Runs self-review
+    for all three variants in turn, not just A -- the old code
+    implicitly only ever ran for A by virtue of request.args.get
+    defaulting to 'A', but since this always runs outside a real HTTP
+    request anyway, and the whole point of this phase is comparing A/
+    B/C against each other, there's no reason the weekly automated
+    review shouldn't cover all three the same way the 19:30
+    counterfactual report already does. Needs no Flask app/request
+    context at all -- run_self_review only touches globals, file I/O,
+    Claude, and Telegram, none of which need one.
+    """
+    for v in VARIANTS:
+        run_self_review(v)
 
 # ============================================================
 # RULE APPROVAL SYSTEM
@@ -5252,7 +5334,7 @@ def test():
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
         zone, zone_pct, zone_advice = get_premium_discount(fake_alert['price'])
         news_risk, news_msg = check_news_risk()
-        drawdown_active, drawdown_msg = check_drawdown_protection()
+        drawdown_active, drawdown_msg = check_drawdown_protection("A")
         analysis = analyse_with_claude(
             fake_alert, "No prior alerts — this is a test",
             session_name, session_desc, is_killzone,
@@ -5306,7 +5388,7 @@ if __name__ == '__main__':
     scheduler.add_job(func=run_in_context(weekly_bias_report), trigger='cron', day_of_week='sun', hour=20, minute=0)
     scheduler.add_job(func=run_in_context(monday_gap_analysis), trigger='cron', day_of_week='mon', hour=6, minute=55)
     scheduler.add_job(func=run_in_context(auto_update_levels), trigger='cron', day_of_week='sun', hour=21, minute=0)
-    scheduler.add_job(func=run_in_context(self_review), trigger='cron', day_of_week='sun', hour=19, minute=0)
+    scheduler.add_job(func=run_scheduled_self_review, trigger='cron', day_of_week='sun', hour=19, minute=0, id='self_review')
     scheduler.add_job(func=run_counterfactual_report, trigger='cron', day_of_week='sun', hour=19, minute=30, id='counterfactual_report')
     scheduler.add_job(func=run_in_context(check_entries), trigger='interval', minutes=5, id='entry_monitor')
     scheduler.add_job(func=run_in_context(monitor_trades_endpoint), trigger='interval', minutes=2, id='trade_monitor')

@@ -4030,18 +4030,18 @@ def filter_killzone_only(r):
 
 
 FILTER_DEFINITIONS = [
-    ("A (control)", filter_A_control),
-    ("B-exact (no override)", filter_B_exact),
-    ("C-exact (confluence floor)", filter_C_exact),
-    ("DXY-strict", filter_dxy_strict),
-    ("Confluence-only (7+)", filter_confluence_only),
-    ("Zone-strict", filter_zone_strict),
-    ("FVG-only", filter_fvg_only),
-    ("SWEEP-only, no override", filter_sweep_only_no_override),
-    ("Everything stacked", filter_stacked),
-    ("Inverse-confidence (MEDIUM only)", filter_inverse_confidence),
-    ("Entry-zone-only", filter_entry_zone_only),
-    ("Killzone-only", filter_killzone_only),
+    ("A", "A (control)", filter_A_control),
+    ("B", "B-exact (no override)", filter_B_exact),
+    ("C", "C-exact (confluence floor)", filter_C_exact),
+    ("dxy", "DXY-strict", filter_dxy_strict),
+    ("confluence", "Confluence-only (7+)", filter_confluence_only),
+    ("zone", "Zone-strict", filter_zone_strict),
+    ("fvg", "FVG-only", filter_fvg_only),
+    ("sweep", "SWEEP-only, no override", filter_sweep_only_no_override),
+    ("stacked", "Everything stacked", filter_stacked),
+    ("inverse", "Inverse-confidence (MEDIUM only)", filter_inverse_confidence),
+    ("entryzone", "Entry-zone-only", filter_entry_zone_only),
+    ("killzone", "Killzone-only", filter_killzone_only),
 ]
 
 
@@ -4075,6 +4075,24 @@ def replay_filters_endpoint():
     })
 
 
+def _aggregate_stats(taken_records):
+    """
+    Shared by the per-filter report loop and the new filter-
+    combination report (16 Aug) -- win rate, avg R, and long/short
+    split for whatever already-selected list of records is passed
+    in. Returns None for an empty list rather than dividing by zero.
+    """
+    n = len(taken_records)
+    if n == 0:
+        return None
+    wins = len([r for r in taken_records if r["outcome"] == "WIN"])
+    wr = round(wins / n * 100, 1)
+    avg_r = round(sum(r["r_multiple"] for r in taken_records) / n, 2)
+    longs = len([r for r in taken_records if r["direction"] == "LONG"])
+    shorts = n - longs
+    return {"n": n, "wr": wr, "avg_r": avg_r, "longs": longs, "shorts": shorts}
+
+
 def run_replay_filters_report(batch, records_override=None, title="Multi-Filter Comparison Report", extra_note=""):
     """
     records_override (15 Aug): lets a caller (e.g. the half-TP variant
@@ -4088,20 +4106,15 @@ def run_replay_filters_report(batch, records_override=None, title="Multi-Filter 
         resolved = [r for r in records if r["outcome"] is not None]
 
         sections = []
-        for name, filter_fn in FILTER_DEFINITIONS:
+        for key, name, filter_fn in FILTER_DEFINITIONS:
             taken = [r for r in resolved if filter_fn(r)]
-            n = len(taken)
-            if n == 0:
+            stats = _aggregate_stats(taken)
+            if stats is None:
                 sections.append(f"*{name}*\nNo signals in this batch matched — 0 trades")
                 continue
-            wins = len([r for r in taken if r["outcome"] == "WIN"])
-            wr = round(wins / n * 100, 1)
-            avg_r = round(sum(r["r_multiple"] for r in taken) / n, 2)
-            longs = len([r for r in taken if r["direction"] == "LONG"])
-            shorts = n - longs
             sections.append(
                 f"*{name}*\n"
-                f"n={n} | WR: {wr}% | Avg R: {avg_r} | Long/Short: {longs}/{shorts}"
+                f"n={stats['n']} | WR: {stats['wr']}% | Avg R: {stats['avg_r']} | Long/Short: {stats['longs']}/{stats['shorts']}"
             )
 
         report = f"""
@@ -4318,6 +4331,133 @@ def run_replay_filters_scaled_tp_report(batch, fraction):
         )
     except Exception as e:
         error_msg = f"⚠️ Scaled-TP report error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
+
+
+# ============================================================
+# FILTER COMBINATION (16 Aug) -- merges multiple existing filters
+# into one, two ways. AND: a signal only counts if it passes every
+# selected filter (a tight, high-conviction intersection). OR: a
+# signal counts if it passes any selected filter, counted once even
+# if several would separately have accepted it -- no genuine
+# duplication risk here, since each real signal only ever has one
+# saved outcome regardless of how many filters agree on it. Entirely
+# free, same saved batch, no new Claude calls.
+# ============================================================
+def combine_filters(resolved_records, filter_keys, mode):
+    """
+    Returns (combined_records, per_filter_breakdown). The breakdown
+    is how many of the combined records ALSO independently pass each
+    individual selected filter -- under "or" mode this can sum to
+    more than the combined total if there's real overlap between
+    filters, which is expected and fine, not a bug.
+    """
+    lookup = {key: (name, fn) for key, name, fn in FILTER_DEFINITIONS}
+    selected = [(key, lookup[key][0], lookup[key][1]) for key in filter_keys]
+
+    combined = []
+    for r in resolved_records:
+        passes = [fn(r) for _, _, fn in selected]
+        if (mode == "and" and all(passes)) or (mode == "or" and any(passes)):
+            combined.append(r)
+
+    breakdown = {}
+    for key, name, fn in selected:
+        breakdown[key] = {"name": name, "count": len([r for r in combined if fn(r)])}
+
+    return combined, breakdown
+
+
+@app.route('/replay-combine', methods=['GET'])
+def replay_combine_endpoint():
+    """
+    ?filters=A,B,C&mode=or  or  ?filters=A,B,C&mode=and
+    mode=and: tight -- a trade only counts if it passes every
+    selected filter. mode=or: broader -- a trade counts if it passes
+    any selected filter, counted once regardless of how many agree.
+    Free -- reads the same saved batch, no new Claude calls.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    filters_param = request.args.get('filters', '')
+    mode = request.args.get('mode', '').lower()
+    if not filters_param:
+        return jsonify({"status": "error", "message": "filters query param required, e.g. ?filters=A,B,C"}), 400
+    if mode not in ('and', 'or'):
+        return jsonify({"status": "error", "message": "mode must be exactly 'and' or 'or'"}), 400
+
+    filter_keys = [k.strip() for k in filters_param.split(',') if k.strip()]
+    valid_keys = {key for key, _, _ in FILTER_DEFINITIONS}
+    invalid = [k for k in filter_keys if k not in valid_keys]
+    if invalid:
+        return jsonify({"status": "error", "message": f"Unknown filter key(s): {', '.join(invalid)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+    if len(filter_keys) < 2:
+        return jsonify({"status": "error", "message": "Need at least 2 filters to combine -- for a single filter's own results, use /replay-filters instead"}), 400
+
+    try:
+        with open(data_path('replay_batch.json'), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    thread = threading.Thread(target=run_replay_combine_report, args=(batch, filter_keys, mode))
+    thread.start()
+    return jsonify({
+        "status": "report started",
+        "filters": filter_keys,
+        "mode": mode,
+        "batch_generated_at": batch.get("generated_at"),
+        "resolved": len(resolved),
+        "note": "no API calls, no cost — results in Telegram shortly."
+    })
+
+
+def run_replay_combine_report(batch, filter_keys, mode):
+    try:
+        records = batch.get("records", [])
+        resolved = [r for r in records if r["outcome"] is not None]
+
+        combined, breakdown = combine_filters(resolved, filter_keys, mode)
+        stats = _aggregate_stats(combined)
+
+        mode_label = "ALL selected filters must agree (tight intersection)" if mode == "and" else "ANY selected filter is enough (broader union, no duplicates)"
+        result_line = f"n={stats['n']} | WR: {stats['wr']}% | Avg R: {stats['avg_r']} | Long/Short: {stats['longs']}/{stats['shorts']}" if stats else "No signals passed — 0 trades"
+        breakdown_lines = "\n".join([
+            f"  - {info['name']}: {info['count']} of these" for key, info in breakdown.items()
+        ])
+
+        explain = ("A trade only counts here if it passed every one of the selected filters."
+                   if mode == "and" else
+                   "A trade counts here if it passed at least one selected filter — counted once "
+                   "even if several would separately have accepted it, since each real signal only "
+                   "has one saved outcome regardless of how many filters agree on it.")
+
+        report = f"""
+📊 *Combined Filter Report — {mode_label}*
+_{datetime.utcnow().strftime('%d %b %Y')}_
+
+Filters combined: {', '.join(filter_keys)}
+Batch: {len(resolved)} resolved signals total
+
+*Combined result:*
+{result_line}
+
+*Per-filter breakdown (how many of the combined set each filter individually also accepts):*
+{breakdown_lines}
+
+_{explain} Small sample sizes limit how much confidence to place in this — read as a comparative first look, not a final verdict._
+"""
+        send_telegram(report)
+    except Exception as e:
+        error_msg = f"⚠️ Combine report error: {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
 

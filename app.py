@@ -2454,11 +2454,22 @@ def monitor_trades_endpoint():
 # side, not here.
 # ============================================================
 def check_bridge_secret():
+    """
+    Header is still the primary, intended method (curl -H, the bridge
+    script itself). The query-param fallback (15 Aug) exists purely
+    so a read-only endpoint can be reached from a plain phone browser
+    address bar, which can't set custom headers at all. Applies to
+    every bridge-protected endpoint, not just the read-only ones,
+    since this is the one shared check they all use -- worth knowing
+    if ever pasting a URL with ?secret=... into a browser for one of
+    the endpoints that actually places or changes something for real,
+    since the secret would then sit in that browser's own history.
+    """
     if not MT5_BRIDGE_SECRET:
         return False, "MT5_BRIDGE_SECRET not configured on the server"
-    provided = request.headers.get('X-Bridge-Secret', '')
+    provided = request.headers.get('X-Bridge-Secret', '') or request.args.get('secret', '')
     if provided != MT5_BRIDGE_SECRET:
-        return False, "invalid or missing X-Bridge-Secret header"
+        return False, "invalid or missing X-Bridge-Secret header (or ?secret= query param)"
     return True, ""
 
 
@@ -3469,6 +3480,30 @@ def replay_generate_endpoint():
     })
 
 
+def _score_trade(gold_df, signal_index, direction, entry, stop, target, risk_amount):
+    """
+    Shared by run_replay_generate and run_replay_half_tp (14 Aug) --
+    runs the same proven simulate_backtest_trade check and computes
+    the same dollar-risk-fixed R-multiple, for whatever entry/stop/
+    target is passed in. Kept as one small, pure function so both
+    callers can never silently drift out of sync with each other on
+    this math.
+    Returns (outcome, r_multiple) -- both None if inconclusive.
+    """
+    outcome = simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, target)
+    if outcome is None:
+        return None, None
+    stop_distance = abs(entry - stop)
+    if outcome == 'WIN':
+        points = abs(target - entry)
+        dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+        trade_pnl = dollar_per_point * points
+    else:
+        trade_pnl = -risk_amount
+    r_multiple = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
+    return outcome, r_multiple
+
+
 def run_replay_generate(per_type=25):
     """
     Same historical sampling and point-in-time context as
@@ -3601,16 +3636,10 @@ def run_replay_generate(per_type=25):
                 outcome = None
                 r_multiple = None
                 if decision["has_real_trade_params"] and decision["valid_trade"]:
-                    outcome = simulate_backtest_trade(gold, i, decision["direction"], price, decision["stop_price"], decision["target_price"])
-                    if outcome is not None:
-                        stop_distance = abs(price - decision["stop_price"])
-                        if outcome == 'WIN':
-                            points = abs(decision["target_price"] - price)
-                            dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
-                            trade_pnl = dollar_per_point * points
-                        else:
-                            trade_pnl = -risk_amount
-                        r_multiple = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
+                    outcome, r_multiple = _score_trade(
+                        gold, i, decision["direction"], price,
+                        decision["stop_price"], decision["target_price"], risk_amount
+                    )
 
                 records.append({
                     "index": i,
@@ -4046,9 +4075,16 @@ def replay_filters_endpoint():
     })
 
 
-def run_replay_filters_report(batch):
+def run_replay_filters_report(batch, records_override=None, title="Multi-Filter Comparison Report", extra_note=""):
+    """
+    records_override (15 Aug): lets a caller (e.g. the half-TP variant
+    below) supply a modified version of the batch's records -- same
+    signals, same Claude analysis, just a different derived outcome
+    -- and get the exact same filter aggregation and report format,
+    without duplicating this logic.
+    """
     try:
-        records = batch.get("records", [])
+        records = records_override if records_override is not None else batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
 
         sections = []
@@ -4069,11 +4105,11 @@ def run_replay_filters_report(batch):
             )
 
         report = f"""
-📊 *Multi-Filter Comparison Report*
+📊 *{title}*
 _{datetime.utcnow().strftime('%d %b %Y')}_
 
-Batch: {len(records)} signals analysed {batch.get('generated_at', '')[:10]} | {len(resolved)} resolved | real cost when generated: ${batch.get('total_cost', 0):.2f}
-
+Batch: {batch.get("sample_size", len(batch.get("records", [])))} signals analysed {batch.get('generated_at', '')[:10]} | {len(resolved)} resolved | real cost when generated: ${batch.get('total_cost', 0):.2f}
+{extra_note}
 {chr(10).join(sections)}
 
 _Every filter above was checked against the exact same {len(resolved)} resolved signals and the exact same Claude analysis of each — the only thing that differs between rows is which ones each filter would have accepted. Small per-filter sample sizes (especially the more selective ones) limit how much confidence to place in any single row — read this as a comparative first look, not a final verdict on any one filter._
@@ -4081,6 +4117,128 @@ _Every filter above was checked against the exact same {len(resolved)} resolved 
         send_telegram(report)
     except Exception as e:
         error_msg = f"⚠️ Filter report error: {str(e)}"
+        print(error_msg)
+        send_telegram(error_msg)
+
+
+# ============================================================
+# HALF-TP VARIANT (15 Aug) -- same saved batch, same filters,
+# stop left completely untouched, target moved to exactly halfway
+# between entry and Claude's original target. Directly tests the
+# "the direction call looks right, the target's just too far" idea --
+# entirely free, since it reuses the same already-paid-for Claude
+# analysis and just re-derives the outcome against a different level
+# using the same real candle data.
+# ============================================================
+def recompute_outcomes_half_tp(records, gold_df):
+    """
+    For each record with a real outcome, halves the distance from
+    entry to target (stop unchanged) and re-runs the exact same
+    simulate_backtest_trade logic already proven throughout this
+    project, against the same real price data. Looks up each
+    signal's position by its saved TIMESTAMP, not its saved
+    positional index -- yfinance's "2y" window rolls forward every
+    day, so a positional index from an earlier download can silently
+    point at the wrong candle by the time this runs later. A signal
+    whose timestamp can't be found in the freshly-downloaded data
+    (should be rare) is left with outcome=None rather than guessed at.
+    """
+    account = PROP_FIRM_RULES["account_size"]
+    risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+    new_records = []
+    for r in records:
+        new_r = dict(r)
+        if r["outcome"] is None:
+            new_records.append(new_r)
+            continue
+        try:
+            ts = pd.Timestamp(r["timestamp"])
+            real_index = gold_df.index.get_loc(ts)
+        except KeyError:
+            new_r["outcome"] = None
+            new_r["r_multiple"] = None
+            new_records.append(new_r)
+            continue
+
+        entry = r["entry"]
+        stop = r["stop"]  # deliberately unchanged
+        half_target = round(entry + (r["target"] - entry) / 2, 2)
+
+        outcome = simulate_backtest_trade(gold_df, real_index, r["direction"], entry, stop, half_target)
+        new_r["target"] = half_target
+        new_r["outcome"] = outcome
+        if outcome is not None:
+            stop_distance = abs(entry - stop)
+            if outcome == "WIN":
+                points = abs(half_target - entry)
+                dollar_per_point = (risk_amount / stop_distance) if stop_distance > 0 else 0
+                trade_pnl = dollar_per_point * points
+            else:
+                trade_pnl = -risk_amount
+            new_r["r_multiple"] = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
+        else:
+            new_r["r_multiple"] = None
+        new_records.append(new_r)
+    return new_records
+
+
+@app.route('/replay-filters-half-tp', methods=['GET'])
+def replay_filters_half_tp_endpoint():
+    """
+    Same saved batch, same 12 filters, target halved (stop untouched).
+    Only cost is one free yfinance re-download to get real price data
+    to re-run the outcome check against -- no Claude calls at all.
+    """
+    try:
+        with open(data_path('replay_batch.json'), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    thread = threading.Thread(target=run_replay_filters_half_tp_report, args=(batch,))
+    thread.start()
+    return jsonify({
+        "status": "report started",
+        "batch_generated_at": batch.get("generated_at"),
+        "batch_size": len(records),
+        "resolved": len(resolved),
+        "note": "no API calls, no cost — one free price re-download, results in Telegram shortly."
+    })
+
+
+def run_replay_filters_half_tp_report(batch):
+    try:
+        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        if gold.empty:
+            send_telegram("⚠️ Half-TP report error: no price data returned")
+            return
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+
+        records = batch.get("records", [])
+        half_tp_records = recompute_outcomes_half_tp(records, gold)
+
+        original_resolved = len([r for r in records if r["outcome"] is not None])
+        half_resolved = len([r for r in half_tp_records if r["outcome"] is not None])
+        note = (f"\n_Stop left completely unchanged — only the target moved, to exactly halfway "
+                f"between entry and Claude's original target. {half_resolved} of {original_resolved} "
+                f"originally-resolved signals still resolved under the new, closer target "
+                f"(a signal can end up unresolved here if price never reached either level within "
+                f"the same lookahead window once the target moved this much closer)._\n")
+
+        run_replay_filters_report(
+            batch,
+            records_override=half_tp_records,
+            title="Multi-Filter Comparison — Target Halved",
+            extra_note=note,
+        )
+    except Exception as e:
+        error_msg = f"⚠️ Half-TP report error: {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
 

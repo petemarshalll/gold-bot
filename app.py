@@ -3371,6 +3371,76 @@ def admin_reopen_trade():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+@app.route('/admin/reset-variant', methods=['POST'])
+def admin_reset_variant():
+    """
+    Resets ONE variant's entire tracked state back to a clean slate --
+    balance to the starting $10,000, every trade list emptied
+    (paper_trades, active_trades, shadow_trades, active_shadow_trades,
+    mt5_pending_trades), every counter zeroed (daily_pnl, total_pnl,
+    trading_days, consecutive_losses, last_trading_day). Built 17 Aug
+    for starting B and C over on fresh MT5 accounts after their live
+    logic rebuild.
+
+    Does NOT touch the other two variants' state at all. Does NOT
+    touch anything MT5/bridge-side -- opening the new demo account,
+    pointing that variant's bridge at it, and re-enabling the manual-
+    approval toggle (known to default OFF on a fresh account, same
+    issue that caused a real rejection on B once already) are separate,
+    manual steps this endpoint has no way to do from here.
+    """
+    global paper_trades, active_trades, shadow_trades, active_shadow_trades
+    global current_balance, daily_pnl, total_pnl, trading_days, consecutive_losses
+    global mt5_pending_trades, last_trading_day
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+
+        previous_balance = current_balance[variant]
+        previous_trade_count = len(paper_trades[variant])
+
+        paper_trades[variant] = []
+        active_trades[variant] = {}
+        shadow_trades[variant] = []
+        active_shadow_trades[variant] = {}
+        mt5_pending_trades[variant] = {}
+        current_balance[variant] = PROP_FIRM_RULES["account_size"]
+        daily_pnl[variant] = 0
+        total_pnl[variant] = 0
+        trading_days[variant] = 0
+        consecutive_losses[variant] = 0
+        last_trading_day[variant] = None
+        check_drawdown_protection(variant)
+
+        with open(data_path('paper_trades.json'), 'w') as f:
+            json.dump(paper_trades, f, indent=2)
+        with open(data_path('shadow_trades.json'), 'w') as f:
+            json.dump(shadow_trades, f, indent=2)
+        save_mt5_queue()
+        save_state()
+
+        send_telegram(
+            f"🔄 *[{variant}] Reset to a clean slate* — balance back to "
+            f"${current_balance[variant]:,.2f} (was ${previous_balance:,.2f}), "
+            f"{previous_trade_count} old trade(s) cleared from tracking. "
+            f"Point this variant's bridge at a fresh MT5 account and confirm "
+            f"the manual-approval toggle is ON before the next signal."
+        )
+        return jsonify({
+            "status": "ok", "variant": variant,
+            "previous_balance": round(previous_balance, 2),
+            "previous_trade_count": previous_trade_count,
+            "new_balance": current_balance[variant],
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # ============================================================
 # SMART ENTRY TIMER
 # ============================================================

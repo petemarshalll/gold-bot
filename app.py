@@ -1516,14 +1516,16 @@ def get_premium_discount_at(gold_df, signal_index, price, lookback_candles=240):
         return "UNKNOWN", 0, "unable to calculate", price, price
 
 
-def get_key_levels_at(gold_df, signal_index, lookback_candles=240):
+def get_key_levels_at(gold_df, signal_index, lookback_candles=240, daily_candles=24):
     """Builds a KEY_LEVELS-style dict from a trailing historical
     window only, to feed the historical prompt instead of reading
     the live global KEY_LEVELS (which reflects today, not the
-    signal's actual point in time)."""
+    signal's actual point in time). daily_candles defaults to 24 --
+    correct for 1h candles (24 = one real day) but needs scaling for
+    any other interval, same reasoning as lookback_candles."""
     start = max(0, signal_index - lookback_candles)
     window = gold_df.iloc[start:signal_index + 1]
-    daily_window = gold_df.iloc[max(0, signal_index - 24):signal_index + 1]
+    daily_window = gold_df.iloc[max(0, signal_index - daily_candles):signal_index + 1]
     return {
         "weekly_high": round(float(window['High'].max()), 2),
         "weekly_low": round(float(window['Low'].min()), 2),
@@ -3617,6 +3619,43 @@ def view_rules():
 # ============================================================
 # BACKTESTING
 # ============================================================
+def interval_scale(interval):
+    """
+    How many `interval`-sized candles fit in one hour. Used to scale
+    every candle-count parameter in the replay pipeline that's
+    secretly a REAL-TIME assumption in disguise -- how many candles
+    of forward room to give a trade before calling it inconclusive,
+    how many trailing candles count as "this week" or "today" -- so
+    switching interval doesn't silently shrink those windows to a
+    fraction of their intended real-world meaning (16 Aug, added
+    alongside 15m/60d support).
+
+    Deliberately does NOT get applied to detect_raw_signals' own FVG
+    (2-candle) or SWEEP (10-candle) lookback -- those define the
+    actual strategy/pattern, and Pine Script's own idiomatic
+    convention (ta.highest(high, N) and friends) is bar-count based,
+    not time-based, so that lookback is left as a raw candle count
+    unchanged across intervals rather than reinterpreted as time.
+    This is a judgment call made without visibility into the actual
+    live Pine Script -- flag it if that assumption is wrong.
+    """
+    return {"15m": 4, "30m": 2, "1h": 1, "60m": 1}.get(interval, 1)
+
+
+def replay_batch_filename(interval, period):
+    """
+    replay_batch.json stays the filename for the original, default
+    1h/2y batch -- full backward compatibility, every existing saved
+    batch and habit keeps working unchanged. Any other interval/
+    period gets its own file (e.g. replay_batch_15m_60d.json) so a
+    differently-timeframed batch can never be silently mixed with, or
+    overwrite, one built from different underlying data.
+    """
+    if interval == "1h" and period == "2y":
+        return "replay_batch.json"
+    return f"replay_batch_{interval}_{period}.json"
+
+
 def simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, target, max_lookahead=50):
     """
     Scans forward candle-by-candle from the signal, checking each
@@ -3682,29 +3721,51 @@ def replay_generate_endpoint():
     This is the expensive, slow step -- the one that makes real,
     billed Claude calls. Only needs running once per desired sample
     size; re-run only to grow the sample, never to test a new filter.
+
+    interval/period (16 Aug): optional, default to the original 1h/2y
+    (matches every existing saved batch and habit exactly). The whole
+    point of adding these: the live TradingView alerts are on a 15m
+    chart, but every replay/backtest function here has always run on
+    1h candles -- a genuinely different underlying process, not just
+    a coarser view of the same one. interval=15m&period=60d builds a
+    batch that actually matches what's live, capped at 60 days
+    because that's yfinance's own hard limit on intraday data, not a
+    choice. Saved to its own file (see replay_batch_filename) --
+    never mixed with the original 1h/2y batch.
     """
     per_type = request.args.get('per_type', default=25, type=int)
-    thread = threading.Thread(target=run_replay_generate, args=(per_type,))
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    if interval not in ('15m', '30m', '1h', '60m'):
+        return jsonify({"status": "error", "message": "interval must be one of 15m, 30m, 1h, 60m"}), 400
+    thread = threading.Thread(target=run_replay_generate, args=(per_type, interval, period))
     thread.start()
     est_calls = per_type * 4
     return jsonify({
         "status": "generation started",
+        "interval": interval,
+        "period": period,
+        "batch_file": replay_batch_filename(interval, period),
         "sample_size": est_calls,
-        "note": f"makes ~{est_calls} REAL Claude API calls (real cost — see Telegram for a running estimate and the final real cost). Roughly {(est_calls * 8 + est_calls * 1.5) // 60:.0f}-{(est_calls * 15 + est_calls * 1.5) // 60:.0f} minutes. Once done, /replay-filters can be run against this saved batch as many times as wanted at zero further cost."
+        "note": f"makes ~{est_calls} REAL Claude API calls (real cost — see Telegram for a running estimate and the final real cost). Roughly {(est_calls * 8 + est_calls * 1.5) // 60:.0f}-{(est_calls * 15 + est_calls * 1.5) // 60:.0f} minutes. Once done, /replay-filters?interval={interval}&period={period} can be run against this saved batch as many times as wanted at zero further cost."
     })
 
 
-def _score_trade(gold_df, signal_index, direction, entry, stop, target, risk_amount):
+def _score_trade(gold_df, signal_index, direction, entry, stop, target, risk_amount, max_lookahead=50):
     """
     Shared by run_replay_generate and run_replay_half_tp (14 Aug) --
     runs the same proven simulate_backtest_trade check and computes
     the same dollar-risk-fixed R-multiple, for whatever entry/stop/
     target is passed in. Kept as one small, pure function so both
     callers can never silently drift out of sync with each other on
-    this math.
+    this math. max_lookahead defaults to simulate_backtest_trade's
+    own default (50, correct for 1h candles = ~50 real hours) --
+    callers on a different interval should pass a scaled value so a
+    trade still gets roughly the same amount of real time to resolve
+    before being called inconclusive.
     Returns (outcome, r_multiple) -- both None if inconclusive.
     """
-    outcome = simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, target)
+    outcome = simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, target, max_lookahead=max_lookahead)
     if outcome is None:
         return None, None
     stop_distance = abs(entry - stop)
@@ -3718,7 +3779,7 @@ def _score_trade(gold_df, signal_index, direction, entry, stop, target, risk_amo
     return outcome, r_multiple
 
 
-def run_replay_generate(per_type=25):
+def run_replay_generate(per_type=25, interval='1h', period='2y'):
     """
     Same historical sampling and point-in-time context as
     run_live_judgment_replay, but saves the FULL structured result of
@@ -3731,19 +3792,34 @@ def run_replay_generate(per_type=25):
     accepted; none of them change the underlying entry/stop/target,
     so one saved outcome per signal is enough to evaluate all of them
     -- this is what makes step 2 free.
+
+    interval/period (16 Aug): default to the original 1h/2y. Passing
+    e.g. interval='15m', period='60d' builds a batch that actually
+    matches the live TradingView alerts' own timeframe (every replay/
+    backtest function here had always run on 1h candles regardless of
+    what's live -- a different underlying process, not a coarser view
+    of the same one). scale = interval_scale(interval) is used
+    throughout below to keep every candle-count parameter that's
+    secretly a real-time assumption (lookahead room before a trade
+    counts as inconclusive, how many trailing candles count as "this
+    week"/"today") representing the same real time regardless of
+    interval. detect_raw_signals' own FVG/SWEEP lookback is
+    deliberately left unscaled -- see interval_scale's docstring.
     """
     try:
+        scale = interval_scale(interval)
+        batch_filename = replay_batch_filename(interval, period)
         est_calls = per_type * 4
-        send_telegram(f"🧪 *Replay generation started (step 1/2)*\nSampling ~{est_calls} signals spread across 2 years, running each through the real live Claude analysis with point-in-time historical context. This makes real API calls — expect roughly {est_calls * 8 // 60}-{est_calls * 15 // 60} minutes and a real charge to your Anthropic account. Once this finishes, /replay-filters can check the saved result against any number of filter definitions for free. Progress updates every 25 signals.")
+        send_telegram(f"🧪 *Replay generation started (step 1/2)*\nSampling ~{est_calls} signals spread across {period} of {interval} candles, running each through the real live Claude analysis with point-in-time historical context. This makes real API calls — expect roughly {est_calls * 8 // 60}-{est_calls * 15 // 60} minutes and a real charge to your Anthropic account. Once this finishes, /replay-filters?interval={interval}&period={period} can check the saved result against any number of filter definitions for free. Progress updates every 25 signals.")
 
-        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        gold = yf.download('GC=F', period=period, interval=interval, progress=False, timeout=20)
         if gold.empty:
-            send_telegram("⚠️ Replay generation error: no gold price data returned")
+            send_telegram(f"⚠️ Replay generation error: no gold price data returned for interval={interval}, period={period}")
             return
         gold.columns = [col[0] for col in gold.columns]
         gold = gold.dropna()
 
-        dxy = yf.download('DX-Y.NYB', period='2y', interval='1h', progress=False, timeout=20)
+        dxy = yf.download('DX-Y.NYB', period=period, interval=interval, progress=False, timeout=20)
         if not dxy.empty:
             if isinstance(dxy.columns, pd.MultiIndex):
                 dxy.columns = [col[0] for col in dxy.columns]
@@ -3760,7 +3836,7 @@ def run_replay_generate(per_type=25):
         existing_batch = None
         existing_indices = set()
         try:
-            with open(data_path('replay_batch.json'), 'r') as f:
+            with open(data_path(batch_filename), 'r') as f:
                 existing_batch = json.load(f)
             existing_indices = {r["index"] for r in existing_batch.get("records", [])}
         except FileNotFoundError:
@@ -3789,8 +3865,8 @@ def run_replay_generate(per_type=25):
             try:
                 session_name, session_desc, is_killzone = get_session_at(timestamp.hour)
                 news_risk, news_msg = get_news_risk_at(timestamp.hour, timestamp.minute, timestamp.weekday())
-                zone, zone_pct, zone_advice, _, _ = get_premium_discount_at(gold, i, price)
-                historical_key_levels = get_key_levels_at(gold, i)
+                zone, zone_pct, zone_advice, _, _ = get_premium_discount_at(gold, i, price, lookback_candles=240 * scale)
+                historical_key_levels = get_key_levels_at(gold, i, lookback_candles=240 * scale, daily_candles=24 * scale)
                 if not dxy.empty:
                     dxy_direction, dxy_desc, dxy_implication = get_dxy_bias_at(dxy, timestamp)
                 else:
@@ -3803,7 +3879,7 @@ def run_replay_generate(per_type=25):
                     context_lines.append(f"- {gold.index[p['index']].strftime('%H:%M UTC')}: {p['type']} at {round(p['price'],2)} — price has since moved {abs(moved):.1f}pts {'up' if moved>0 else 'down' if moved<0 else 'flat'}")
                 recent_context = "\n".join(context_lines)
 
-                alert_data = {"type": sig_type, "price": price, "high": high, "low": low, "timeframe": "15"}
+                alert_data = {"type": sig_type, "price": price, "high": high, "low": low, "timeframe": interval}  # was hardcoded "15" regardless of the real interval used
                 prompt = build_historical_prompt(
                     alert_data, recent_context, session_name, session_desc, is_killzone,
                     zone, zone_pct, zone_advice, news_risk, news_msg, historical_key_levels,
@@ -3852,7 +3928,8 @@ def run_replay_generate(per_type=25):
                 if decision["has_real_trade_params"] and decision["valid_trade"]:
                     outcome, r_multiple = _score_trade(
                         gold, i, decision["direction"], price,
-                        decision["stop_price"], decision["target_price"], risk_amount
+                        decision["stop_price"], decision["target_price"], risk_amount,
+                        max_lookahead=50 * scale
                     )
 
                 records.append({
@@ -3904,22 +3981,25 @@ def run_replay_generate(per_type=25):
 
         batch = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "interval": interval,
+            "period": period,
             "sample_size": len(combined_records),
             "records": combined_records,
             "errors": combined_errors,
             "total_cost": combined_cost,
         }
-        with open(data_path('replay_batch.json'), 'w') as f:
+        with open(data_path(batch_filename), 'w') as f:
             json.dump(batch, f, indent=2)
 
         resolved = len([r for r in records if r["outcome"] is not None])
         total_resolved = len([r for r in combined_records if r["outcome"] is not None])
         send_telegram(f"""
 ✅ *Replay generation complete (step 1/2)*
+Interval: {interval} | Period: {period}
 This run: {len(records)} new signals analysed | {resolved} resolved | {errors} errors | real cost this run: ${total_cost:.2f}
 Cumulative batch: {len(combined_records)} total signals | {total_resolved} total resolved | total real cost so far: ${combined_cost:.2f}
 
-Saved to replay_batch.json — run /replay-filters any time to check this batch against any set of filters, at zero further cost. Run /replay-generate again any time (today, tomorrow, whenever) to add more on top, at zero risk of paying twice for the same signal.
+Saved to {batch_filename} — run /replay-filters?interval={interval}&period={period} any time to check this batch against any set of filters, at zero further cost. Run /replay-generate?interval={interval}&period={period} again any time (today, tomorrow, whenever) to add more on top, at zero risk of paying twice for the same signal.
 """)
     except Exception as e:
         error_msg = f"⚠️ Replay generation error: {str(e)}"
@@ -4262,16 +4342,21 @@ FILTER_DEFINITIONS = [
 @app.route('/replay-filters', methods=['GET'])
 def replay_filters_endpoint():
     """
-    Step 2 of 2. Reads replay_batch.json (produced by /replay-generate)
-    and reports every filter in FILTER_DEFINITIONS against it -- no
-    API calls, no cost, safe to run as many times as wanted, including
-    right after adding a brand new filter function above.
+    Step 2 of 2. Reads the saved batch (produced by /replay-generate)
+    matching the given interval/period -- defaults to the original
+    1h/2y batch, exactly as before -- and reports every filter in
+    FILTER_DEFINITIONS against it. No API calls, no cost, safe to run
+    as many times as wanted, including right after adding a brand new
+    filter function above.
     """
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    batch_filename = replay_batch_filename(interval, period)
     try:
-        with open(data_path('replay_batch.json'), 'r') as f:
+        with open(data_path(batch_filename), 'r') as f:
             batch = json.load(f)
     except FileNotFoundError:
-        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} ({batch_filename}) — run /replay-generate first."}), 404
 
     records = batch.get("records", [])
     resolved = [r for r in records if r["outcome"] is not None]
@@ -4358,7 +4443,7 @@ _Every filter above was checked against the exact same {len(resolved)} resolved 
 # Claude analysis and just re-derives the outcome against a different
 # level using the same real candle data.
 # ============================================================
-def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction):
+def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction, max_lookahead=50):
     """
     For each record with a real outcome, moves the target to
     tp_fraction of the distance from entry to Claude's original
@@ -4374,7 +4459,10 @@ def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction):
     tp_fraction=0.5 reproduces the original half-TP test exactly;
     0.75 moves it most of the way back out toward the original;
     values above 1.0 would extend past the original target instead
-    of shrinking it, if that's ever worth testing too.
+    of shrinking it, if that's ever worth testing too. max_lookahead
+    defaults to simulate_backtest_trade's own default (50, correct
+    for 1h candles); callers re-scoring a batch built on a different
+    interval should pass a scaled value -- see interval_scale.
     """
     account = PROP_FIRM_RULES["account_size"]
     risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
@@ -4397,7 +4485,7 @@ def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction):
         stop = r["stop"]  # deliberately unchanged
         scaled_target = round(entry + (r["target"] - entry) * tp_fraction, 2)
 
-        outcome, r_multiple = _score_trade(gold_df, real_index, r["direction"], entry, stop, scaled_target, risk_amount)
+        outcome, r_multiple = _score_trade(gold_df, real_index, r["direction"], entry, stop, scaled_target, risk_amount, max_lookahead=max_lookahead)
         new_r["target"] = scaled_target
         new_r["outcome"] = outcome
         new_r["r_multiple"] = r_multiple
@@ -4405,11 +4493,11 @@ def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction):
     return new_records
 
 
-def recompute_outcomes_half_tp(records, gold_df):
+def recompute_outcomes_half_tp(records, gold_df, max_lookahead=50):
     """Thin wrapper -- the original, exact-50% test. Kept unchanged
     so the existing /replay-filters-half-tp endpoint (already run for
     real, already documented) keeps working exactly as before."""
-    return recompute_outcomes_scaled_tp(records, gold_df, 0.5)
+    return recompute_outcomes_scaled_tp(records, gold_df, 0.5, max_lookahead=max_lookahead)
 
 
 @app.route('/replay-filters-half-tp', methods=['GET'])
@@ -4419,11 +4507,14 @@ def replay_filters_half_tp_endpoint():
     Only cost is one free yfinance re-download to get real price data
     to re-run the outcome check against -- no Claude calls at all.
     """
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    batch_filename = replay_batch_filename(interval, period)
     try:
-        with open(data_path('replay_batch.json'), 'r') as f:
+        with open(data_path(batch_filename), 'r') as f:
             batch = json.load(f)
     except FileNotFoundError:
-        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} ({batch_filename}) — run /replay-generate first."}), 404
 
     records = batch.get("records", [])
     resolved = [r for r in records if r["outcome"] is not None]
@@ -4443,19 +4534,25 @@ def replay_filters_half_tp_endpoint():
 
 def run_replay_filters_half_tp_report(batch):
     try:
-        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        # Batches saved since 16 Aug carry their own interval/period;
+        # older ones predate that field and were always 1h/2y, so that
+        # remains the correct fallback for them specifically.
+        interval = batch.get("interval", "1h")
+        period = batch.get("period", "2y")
+        scale = interval_scale(interval)
+        gold = yf.download('GC=F', period=period, interval=interval, progress=False, timeout=20)
         if gold.empty:
-            send_telegram("⚠️ Half-TP report error: no price data returned")
+            send_telegram(f"⚠️ Half-TP report error: no price data returned for interval={interval}, period={period}")
             return
         gold.columns = [col[0] for col in gold.columns]
         gold = gold.dropna()
 
         records = batch.get("records", [])
-        half_tp_records = recompute_outcomes_half_tp(records, gold)
+        half_tp_records = recompute_outcomes_half_tp(records, gold, max_lookahead=50 * scale)
 
         original_resolved = len([r for r in records if r["outcome"] is not None])
         half_resolved = len([r for r in half_tp_records if r["outcome"] is not None])
-        note = (f"\n_Stop left completely unchanged — only the target moved, to exactly halfway "
+        note = (f"\n_Interval: {interval}, period: {period}. Stop left completely unchanged — only the target moved, to exactly halfway "
                 f"between entry and Claude's original target. {half_resolved} of {original_resolved} "
                 f"originally-resolved signals still resolved under the new, closer target "
                 f"(a signal can end up unresolved here if price never reached either level within "
@@ -4492,12 +4589,14 @@ def replay_filters_scaled_tp_endpoint():
         return jsonify({"status": "error", "message": "fraction must be a number, e.g. ?fraction=0.75"}), 400
     if not (0 < fraction <= 2.0):
         return jsonify({"status": "error", "message": "fraction should be between 0 and 2.0 (above 1.0 extends past the original target rather than shrinking it)"}), 400
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
 
     try:
-        with open(data_path('replay_batch.json'), 'r') as f:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
             batch = json.load(f)
     except FileNotFoundError:
-        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
 
     records = batch.get("records", [])
     resolved = [r for r in records if r["outcome"] is not None]
@@ -4518,20 +4617,23 @@ def replay_filters_scaled_tp_endpoint():
 
 def run_replay_filters_scaled_tp_report(batch, fraction):
     try:
-        gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+        interval = batch.get("interval", "1h")
+        period = batch.get("period", "2y")
+        scale = interval_scale(interval)
+        gold = yf.download('GC=F', period=period, interval=interval, progress=False, timeout=20)
         if gold.empty:
-            send_telegram("⚠️ Scaled-TP report error: no price data returned")
+            send_telegram(f"⚠️ Scaled-TP report error: no price data returned for interval={interval}, period={period}")
             return
         gold.columns = [col[0] for col in gold.columns]
         gold = gold.dropna()
 
         records = batch.get("records", [])
-        scaled_records = recompute_outcomes_scaled_tp(records, gold, fraction)
+        scaled_records = recompute_outcomes_scaled_tp(records, gold, fraction, max_lookahead=50 * scale)
 
         original_resolved = len([r for r in records if r["outcome"] is not None])
         scaled_resolved = len([r for r in scaled_records if r["outcome"] is not None])
         pct_label = f"{fraction * 100:.0f}%"
-        note = (f"\n_Stop left completely unchanged — only the target moved, to {pct_label} of the way "
+        note = (f"\n_Interval: {interval}, period: {period}. Stop left completely unchanged — only the target moved, to {pct_label} of the way "
                 f"from entry to Claude's original target. {scaled_resolved} of {original_resolved} "
                 f"originally-resolved signals still resolved under this target "
                 f"(a signal can end up unresolved here if price never reached either level within "
@@ -4652,12 +4754,14 @@ def replay_combine_endpoint():
         return jsonify({"status": "error", "message": "fraction/tp_pct must be a number, e.g. &fraction=0.8 or &tp_pct=80"}), 400
     if fraction is not None and not (0 < fraction <= 2.0):
         return jsonify({"status": "error", "message": "fraction should be between 0 and 2.0 (tp_pct between 0 and 200)"}), 400
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
 
     try:
-        with open(data_path('replay_batch.json'), 'r') as f:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
             batch = json.load(f)
     except FileNotFoundError:
-        return jsonify({"status": "error", "message": "No saved batch found — run /replay-generate first."}), 404
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
 
     records = batch.get("records", [])
     resolved = [r for r in records if r["outcome"] is not None]
@@ -4673,17 +4777,19 @@ def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fract
     try:
         records = batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
+        batch_interval = batch.get("interval", "1h")
+        batch_period = batch.get("period", "2y")
 
         target_note = ""
         if fraction is not None:
-            gold = yf.download('GC=F', period='2y', interval='1h', progress=False, timeout=20)
+            gold = yf.download('GC=F', period=batch_period, interval=batch_interval, progress=False, timeout=20)
             if gold.empty:
-                error = "No price data returned for the TP-scaling step"
+                error = f"No price data returned for the TP-scaling step (interval={batch_interval}, period={batch_period})"
                 send_telegram(f"⚠️ Combine report error: {error}")
                 return {"status": "error", "message": error}
             gold.columns = [col[0] for col in gold.columns]
             gold = gold.dropna()
-            resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction)
+            resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction, max_lookahead=50 * interval_scale(batch_interval))
             resolved = [r for r in resolved if r["outcome"] is not None]
             pct_label = f"{fraction * 100:.0f}%"
             target_note = f"Target scaled to {pct_label} of the way from entry to the original target, stop unchanged."

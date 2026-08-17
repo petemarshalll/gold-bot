@@ -179,11 +179,12 @@ PROP_FIRM_RULES = {
     "max_daily_loss_pct": 5.0,
     "max_total_drawdown_pct": 10.0,   # static/non-trailing on the 2-Step path
     "min_trading_days": 4,             # per phase -- matches FTMO's number already
-    "max_loss_per_trade_pct": 0.5,     # halved from 1.0% (8 Aug), directly
-    # because of a real breach: 5 real losses on 5 Aug totalled -$519.64
-    # against FTMO's -$500 (5%) daily limit -- at 0.5% risk, the same
-    # 5-loss streak would only total ~-$260, comfortably inside the
-    # limit even with the daily-loss-limit enforcement re-disabled.
+    "max_loss_per_trade_pct": 0.6,     # bumped from 0.5% (17 Aug), Pete's
+    # explicit call, locked in for this week's live practice run --
+    # not a bug fix, a deliberate risk increase. A repeat of the same
+    # 5-loss streak that breached FTMO's -$500/5% daily limit on 5 Aug
+    # (-$519.64 at the original 1.0%) would total ~-$300 at 0.6%,
+    # still comfortably inside the limit (was ~-$260 at 0.5%).
 }
 
 # Computed once, when this process starts -- the actual empirical test

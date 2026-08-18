@@ -4505,6 +4505,36 @@ def filter_killzone_only(r):
     return r["is_killzone"] and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
 
 
+def filter_asian_session_only(r):
+    """
+    No confidence or confluence requirement -- pure timing filter,
+    Asian session or not (17 Aug, Pete's own observation that trades
+    taken in this window seem to lose disproportionately often).
+
+    Derived from the record's own saved timestamp rather than a
+    stored field -- get_session_at's Asian Session boundary (22:00-
+    07:00 UTC) applied directly to the hour, matching it exactly
+    rather than approximating. This is why it works on every already-
+    saved batch (both 1h/2y and 15m/60d) immediately: no regeneration,
+    no new Claude calls, the timestamp was always there.
+
+    On its own row: how Asian-session trades perform in isolation --
+    the direct test of the hunch. As an &exclude= entry in
+    /replay-combine: what any existing filter combo (including A's
+    live entry-zone-only+80%) looks like with Asian-session signals
+    removed.
+
+    Worth cross-checking against check_hour_quality()'s hardcoded
+    best_hours = [21, 22, 23] elsewhere in this file -- hours 22 and
+    23 fall inside this same Asian window, so that existing "best
+    hours" claim and this filter's own result can't both be right for
+    those two hours.
+    """
+    hour = pd.Timestamp(r["timestamp"]).hour
+    is_asian = (22 <= hour or hour < 7)
+    return is_asian and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
+
+
 FILTER_DEFINITIONS = [
     ("A", "A (control)", filter_A_control),
     ("B", "B-exact (no override)", filter_B_exact),
@@ -4518,6 +4548,7 @@ FILTER_DEFINITIONS = [
     ("inverse", "Inverse-confidence (MEDIUM only)", filter_inverse_confidence),
     ("entryzone", "Entry-zone-only", filter_entry_zone_only),
     ("killzone", "Killzone-only", filter_killzone_only),
+    ("asian", "Asian-session-only", filter_asian_session_only),
 ]
 
 
@@ -4914,13 +4945,20 @@ def replay_combine_endpoint():
     invalid = [k for k in filter_keys if k not in valid_keys]
     if invalid:
         return jsonify({"status": "error", "message": f"Unknown filter key(s): {', '.join(invalid)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
-    if len(filter_keys) < 2:
-        return jsonify({"status": "error", "message": "Need at least 2 filters to combine -- for a single filter's own results, use /replay-filters instead"}), 400
-
     exclude_keys = [k.strip() for k in exclude_param.split(',') if k.strip()] if exclude_param else []
     invalid_exclude = [k for k in exclude_keys if k not in valid_keys]
     if invalid_exclude:
         return jsonify({"status": "error", "message": f"Unknown exclude filter key(s): {', '.join(invalid_exclude)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+
+    if len(filter_keys) < 2 and not exclude_keys:
+        # A single include filter with NO exclude list is genuinely
+        # redundant with /replay-filters -- same numbers, no reason to
+        # use this endpoint instead. But a single include filter WITH
+        # an exclude list (17 Aug) is a real, new combination that
+        # endpoint can't show -- e.g. A's actual live setup is just
+        # entry-zone-only, so "entry-zone-only minus Asian session" is
+        # exactly this shape and was being wrongly blocked before.
+        return jsonify({"status": "error", "message": "Need at least 2 filters to combine, unless you're also using &exclude= -- for a single filter's own results with no exclude, use /replay-filters instead"}), 400
 
     fraction_param = request.args.get('fraction', None)
     tp_pct_param = request.args.get('tp_pct', None)

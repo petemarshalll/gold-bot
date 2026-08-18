@@ -3027,6 +3027,34 @@ def mt5_ack():
         else:
             entry["status"] = "FAILED"
             entry["error"] = data.get('error', 'unknown error')
+            # Remove the trade from active_trades/paper_trades entirely
+            # (18 Aug) -- previously a failed real-order placement was
+            # only marked FAILED here in the bridge queue, while the
+            # SAME trade stayed fully live in active_trades as an
+            # ordinary OPEN paper trade. Both the wick-detection scan
+            # and the 2-min price monitor only skip a trade once it has
+            # a real mt5_ticket -- a failed placement never gets one --
+            # so a trade that never actually went live could still be
+            # "closed" for a fake WIN/LOSS off simulated price action,
+            # corrupting the real variant's balance/stats and sending a
+            # misleading Telegram closure message. Confirmed live (18
+            # Aug) on B: a GBPUSD symbol-lookup failure, unrelated to
+            # the market itself, still produced a fake STOP HIT close a
+            # few minutes later. Removed here the same way
+            # /admin/remove-trade removes a manually-injected test
+            # trade -- a placement that never happened shouldn't
+            # pollute either the real balance or the paper-trade
+            # research dataset.
+            removed_trade = active_trades[variant].pop(trade_id, None)
+            if removed_trade is not None:
+                paper_trade_match = next((t for t in paper_trades[variant] if t.get('id') == trade_id), None)
+                if paper_trade_match is not None:
+                    paper_trades[variant].remove(paper_trade_match)
+                try:
+                    with open(data_path('paper_trades.json'), 'w') as f:
+                        json.dump(paper_trades, f, indent=2)
+                except Exception as e:
+                    print(f"Paper trade save error on MT5 ack failure: {e}")
             send_telegram(f"⚠️ *[{variant}] MT5 order failed* — {entry['alert_type']} {entry['direction']}: {entry['error']}")
         save_mt5_queue()
         return jsonify({"status": "ok"})

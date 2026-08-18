@@ -185,7 +185,138 @@ PROP_FIRM_RULES = {
     # 5-loss streak that breached FTMO's -$500/5% daily limit on 5 Aug
     # (-$519.64 at the original 1.0%) would total ~-$300 at 0.6%,
     # still comfortably inside the limit (was ~-$260 at 0.5%).
+    "drawdown_type": "static",
+    "daily_reset_hour_utc": 0,
 }
+
+# Per-variant overrides (18 Aug) -- B is now running a REAL, paid FTUK
+# Flex Challenge evaluation ($50k, one-step), not a demo account
+# emulating generic FTMO-style rules. Genuinely different account
+# size, drawdown TYPE, and daily reset time -- not just different
+# numbers in the same formula. A and C stay on the shared
+# PROP_FIRM_RULES above, completely untouched by any of this.
+#
+# FTUK's own stated rules (confirmed directly by Pete, 18 Aug):
+# - Daily drawdown 5%, floor recalculated every day at 22:00 UTC,
+#   anchored to whichever is HIGHER of equity or balance at that
+#   exact moment (needs live equity -- see mt5_account_snapshot).
+# - Max drawdown: trails with the highest-ever CLOSING balance at 6%
+#   below it, but capped so the floor can never exceed the account's
+#   own starting balance -- once the trail would reach that point, it
+#   locks there permanently (see prop_firm_max_dd_floor()).
+# - Minimum 1 trading day in the evaluation phase (informational only
+#   here -- nothing in this codebase blocks trading before a minimum
+#   is reached, it's just tracked for Pete's own reference).
+VARIANT_PROP_FIRM_OVERRIDES = {
+    "B": {
+        "account_size": 50000,
+        "max_daily_loss_pct": 5.0,
+        "min_trading_days": 1,
+        "drawdown_type": "trailing_lockable",
+        "max_total_drawdown_pct": 6.0,
+        "daily_reset_hour_utc": 22,
+    },
+}
+
+
+def get_prop_rules(variant):
+    """Merges VARIANT_PROP_FIRM_OVERRIDES on top of the shared
+    PROP_FIRM_RULES defaults for one variant. A and C get the shared
+    defaults back unchanged (empty override); B gets its real FTUK
+    numbers. Every prop-firm-relevant calculation should read through
+    this rather than PROP_FIRM_RULES directly wherever a variant is
+    in scope -- reading PROP_FIRM_RULES directly silently means "use
+    the shared/demo numbers regardless of which variant this actually
+    is," which is exactly wrong for B now."""
+    rules = dict(PROP_FIRM_RULES)
+    rules.update(VARIANT_PROP_FIRM_OVERRIDES.get(variant, {}))
+    return rules
+
+
+# Peak CLOSING balance ever reached, per variant -- the basis for
+# B's trailing max-drawdown floor specifically (see
+# prop_firm_max_dd_floor()). Starts at each variant's own real
+# account_size, not the shared default -- get_prop_rules must be
+# defined above this line.
+peak_closing_balance = {v: get_prop_rules(v)["account_size"] for v in VARIANTS}
+
+# FTUK-style daily drawdown floor tracking (18 Aug) -- entirely
+# separate from ensure_daily_reset()'s existing daily_pnl reset,
+# which is fixed to UTC midnight and shared/global across all
+# variants. FTUK resets at 22:00 UTC specifically (a different
+# boundary), so reusing the midnight-UTC mechanism here would
+# silently check against the wrong day's window for this specific
+# rule. prop_daily_floor_set_on tracks which "prop day" (as a date
+# string, keyed to that variant's own reset hour) the current floor
+# was computed for, so it's only recalculated once per real reset,
+# not on every check.
+prop_daily_floor = {v: None for v in VARIANTS}
+prop_daily_floor_set_on = {v: None for v in VARIANTS}
+
+# Live account snapshot relayed by each variant's own bridge (18 Aug)
+# -- balance/equity Railway has no other way to see. Needed for
+# FTUK's "highest of equity or balance at reset" daily floor rule.
+# Unlike price/candles (genuinely shared market data, only A's bridge
+# relays it), this is per-account information -- every variant's own
+# bridge reports its own snapshot.
+mt5_account_snapshot = {v: {"balance": None, "equity": None, "updated_at": None} for v in VARIANTS}
+MT5_ACCOUNT_SNAPSHOT_STALENESS_SECONDS = 180
+
+
+def ensure_prop_daily_reset(variant):
+    """
+    Recomputes this variant's FTUK-style daily drawdown floor once
+    per "prop day" at its own configured reset hour (22:00 UTC for
+    B) -- a no-op for variants without a real prop-firm daily rule
+    (drawdown_type == "static"), since A and C have no such floor to
+    track. Floor = max(equity, balance) at the reset moment x
+    (1 - max_daily_loss_pct/100), per FTUK's own stated rule. Falls
+    back to Railway's own tracked balance if no equity/balance
+    snapshot has arrived yet from the bridge -- less accurate for
+    that one calculation, but never crashes, and self-corrects the
+    next time a real snapshot lands.
+    """
+    rules = get_prop_rules(variant)
+    if rules["drawdown_type"] == "static":
+        return
+    reset_hour = rules["daily_reset_hour_utc"]
+    now = datetime.now(timezone.utc)
+    reset_boundary_today = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+    current_prop_day = (now if now >= reset_boundary_today else now - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    if prop_daily_floor_set_on[variant] == current_prop_day:
+        return
+
+    snapshot = mt5_account_snapshot.get(variant, {})
+    anchor = current_balance[variant]
+    if snapshot.get("balance") is not None:
+        anchor = max(anchor, snapshot["balance"])
+    if snapshot.get("equity") is not None:
+        anchor = max(anchor, snapshot["equity"])
+
+    prop_daily_floor[variant] = round(anchor * (1 - rules["max_daily_loss_pct"] / 100), 2)
+    prop_daily_floor_set_on[variant] = current_prop_day
+    print(f"[{variant}] Prop daily floor reset for {current_prop_day}: anchor=${anchor:,.2f}, floor=${prop_daily_floor[variant]:,.2f}")
+
+
+def prop_firm_max_dd_floor(variant):
+    """
+    FTUK's trailing-with-breakeven-lock max drawdown floor: trails up
+    with the highest CLOSING balance this variant has ever reached
+    (not equity -- FTUK's own rule specifically says closing balance),
+    capped so it can never exceed the account's own starting balance.
+    Once the trail would reach that point, it locks there permanently
+    -- matches FTUK's own stated rule exactly ("once it reaches the
+    initial balance, it is locked in and will not trail"). Returns
+    None for any variant without this drawdown type (A, C) -- callers
+    should fall back to the existing static check for those.
+    """
+    rules = get_prop_rules(variant)
+    if rules["drawdown_type"] != "trailing_lockable":
+        return None
+    initial = rules["account_size"]
+    trailing_floor = peak_closing_balance[variant] * (1 - rules["max_total_drawdown_pct"] / 100)
+    return min(initial, trailing_floor)
 
 # Computed once, when this process starts -- the actual empirical test
 # for whether Railway is running more than one instance of this app.
@@ -797,7 +928,7 @@ def queue_mt5_trade(variant, trade):
     same way apply_trade_pnl() reads it, so a reduced-risk trade during
     drawdown queues at the correct (already-halved) size automatically.
     """
-    risk_pct = trade.get('risk_pct', PROP_FIRM_RULES["max_loss_per_trade_pct"])
+    risk_pct = trade.get('risk_pct', get_prop_rules(variant)["max_loss_per_trade_pct"])
     mt5_pending_trades[variant][trade['id']] = {
         "trade_id": trade['id'],
         "status": "PENDING",
@@ -872,8 +1003,8 @@ def monitor_shadow_trades(variant, gold_df):
         hit_type, hit_price, hit_time = scan_candles_for_hit(trade, gold_df)
         if hit_type is None:
             continue
-        account = PROP_FIRM_RULES["account_size"]
-        risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+        account = get_prop_rules(variant)["account_size"]
+        risk_amount = account * (get_prop_rules(variant)["max_loss_per_trade_pct"] / 100)
         if hit_type == 'WIN':
             points = abs(trade['target'] - trade['entry'])
             stop_distance = abs(trade['entry'] - trade['stop'])
@@ -1090,8 +1221,9 @@ def extract_confidence(analysis):
 # drawdown_protection already do via apply_trade_pnl).
 # ============================================================
 def get_open_risk_exposure(variant):
-    account = PROP_FIRM_RULES["account_size"]
-    risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
+    rules = get_prop_rules(variant)
+    account = rules["account_size"]
+    risk_per_trade = account * (rules["max_loss_per_trade_pct"] / 100)
     open_count = sum(1 for t in active_trades[variant].values() if t.get('result') == 'OPEN')
     return open_count * risk_per_trade, open_count
 
@@ -1109,6 +1241,12 @@ def ensure_daily_reset():
     Called from multiple places deliberately: if any one of them
     fails to run for some reason, the others still guarantee this
     can't silently get stuck the way the old single-path reset did.
+
+    Deliberately separate from ensure_prop_daily_reset() (18 Aug) --
+    this is the bot's own UTC-midnight bookkeeping day, unrelated to
+    any specific prop firm's own daily reset time (22:00 UTC for
+    B's FTUK rules). Conflating the two would silently check B's real
+    daily drawdown against the wrong day's window.
     """
     global daily_pnl, last_pnl_reset_day, daily_alert_count
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -1120,13 +1258,44 @@ def ensure_daily_reset():
         print(f"Daily counters reset for new UTC day: {today_str}")
 
 
+def get_reference_balance(variant):
+    """
+    Best available real-time balance/equity figure for risk checks:
+    the bridge's own live-reported equity if a fresh-enough snapshot
+    exists (captures any currently-floating P&L on open positions,
+    not just closed trades), else falls back to Railway's own tracked
+    current_balance (closed trades only, always available, just less
+    current). Used by B's real prop-firm checks specifically, where
+    "am I about to breach a real limit" needs to reflect reality as
+    closely as possible, not lag behind it.
+    """
+    snapshot = mt5_account_snapshot.get(variant, {})
+    updated_at = snapshot.get("updated_at")
+    if updated_at is not None:
+        age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+        if age <= MT5_ACCOUNT_SNAPSHOT_STALENESS_SECONDS and snapshot.get("equity") is not None:
+            return snapshot["equity"]
+    return current_balance[variant]
+
+
 def check_risk_cap_before_trade(variant):
     """Returns (allowed: bool, message: str) for a specific variant.
-    Disallows opening a new paper trade if doing so — combined with
+
+    A and C (drawdown_type == "static"): unchanged from before --
+    disallows opening a new paper trade if doing so, combined with
     the worst case of all that variant's currently open trades hitting
-    stop loss — would exceed that variant's own account's daily loss
-    limit. Entirely independent per variant: a bad day on one account
-    can't block or be blocked by the other two.
+    stop loss, would exceed that variant's own account's daily loss
+    limit as a fixed percentage of the starting account size.
+
+    B (drawdown_type == "trailing_lockable", 18 Aug): genuinely
+    different checks, against B's real FTUK numbers. Daily: worst-case
+    projected balance/equity can't fall below prop_daily_floor(),
+    which resets at 22:00 UTC specifically, not the bot's own
+    UTC-midnight day. Max drawdown: also checked pre-trade here now --
+    nothing previously checked the overall/max drawdown before placing
+    a trade for ANY variant, only reactively after a close, but B's
+    6% trailing floor is tight enough that this seemed worth adding
+    for B specifically, without changing A/C's existing behavior.
 
     Checks and self-heals the daily reset on every single call,
     independent of the scheduled midnight job or a trade closing.
@@ -1144,17 +1313,38 @@ def check_risk_cap_before_trade(variant):
     if DAILY_LOSS_LIMIT_DISABLED:
         return True, ""
 
-    account = PROP_FIRM_RULES["account_size"]
-    risk_per_trade = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
-    daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
+    rules = get_prop_rules(variant)
+    account = rules["account_size"]
+    risk_per_trade = account * (rules["max_loss_per_trade_pct"] / 100)
     existing_risk, open_count = get_open_risk_exposure(variant)
+
+    if rules["drawdown_type"] == "trailing_lockable":
+        ensure_prop_daily_reset(variant)
+        reference_balance = get_reference_balance(variant)
+        projected_worst_case_balance = reference_balance - existing_risk - risk_per_trade
+
+        if prop_daily_floor[variant] is not None and projected_worst_case_balance < prop_daily_floor[variant]:
+            return False, (f"⚠️ [{variant}] Trade NOT logged — worst case would put balance/equity at "
+                            f"${projected_worst_case_balance:,.2f} today (across {open_count} open trade(s) "
+                            f"+ this one), below the FTUK daily floor of ${prop_daily_floor[variant]:,.2f}. "
+                            f"Skipped to protect the account.")
+
+        max_dd_floor = prop_firm_max_dd_floor(variant)
+        if max_dd_floor is not None and projected_worst_case_balance < max_dd_floor:
+            return False, (f"⚠️ [{variant}] Trade NOT logged — worst case would put balance/equity at "
+                            f"${projected_worst_case_balance:,.2f}, below the FTUK max drawdown floor of "
+                            f"${max_dd_floor:,.2f} (trails the highest closing balance, ${peak_closing_balance[variant]:,.2f} "
+                            f"so far, capped at the ${rules['account_size']:,.2f} starting balance). Skipped to protect the account.")
+        return True, ""
+
+    daily_loss_limit = account * (rules["max_daily_loss_pct"] / 100)
     already_lost_today = abs(min(daily_pnl[variant], 0))
     projected_worst_case = already_lost_today + existing_risk + risk_per_trade
     if projected_worst_case > daily_loss_limit:
         return False, (f"⚠️ [{variant}] Trade NOT logged — opening it would risk a worst-case "
                         f"${projected_worst_case:,.2f} today (across {open_count} open "
                         f"trade(s) + today's losses already taken), beyond the "
-                        f"{PROP_FIRM_RULES['max_daily_loss_pct']}% daily limit "
+                        f"{rules['max_daily_loss_pct']}% daily limit "
                         f"(${daily_loss_limit:,.2f}). Skipped to protect the account.")
     return True, ""
 
@@ -1189,8 +1379,8 @@ def apply_trade_pnl(variant, trade, result, real_pnl_override=None):
     global daily_pnl, total_pnl, current_balance, trading_days
     global consecutive_losses, last_trading_day, last_pnl_reset_day
 
-    account = PROP_FIRM_RULES["account_size"]
-    risk_pct = trade.get('risk_pct', PROP_FIRM_RULES["max_loss_per_trade_pct"])
+    account = get_prop_rules(variant)["account_size"]
+    risk_pct = trade.get('risk_pct', get_prop_rules(variant)["max_loss_per_trade_pct"])
     risk_amount = account * (risk_pct / 100)
 
     if real_pnl_override is not None:
@@ -1227,18 +1417,36 @@ def apply_trade_pnl(variant, trade, result, real_pnl_override=None):
     daily_pnl[variant] += pnl
     total_pnl[variant] += pnl
     current_balance[variant] += pnl
+    # Basis for B's trailing max-drawdown floor -- only ever moves up,
+    # tracks the highest CLOSING balance this variant has ever reached.
+    # Harmless to update for A/C too (drawdown_type=="static" never
+    # reads it), simpler to keep unconditional than special-case it.
+    peak_closing_balance[variant] = max(peak_closing_balance[variant], current_balance[variant])
 
     check_drawdown_protection(variant)
 
-    daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
-    total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
+    rules = get_prop_rules(variant)
     warnings = []
-    if abs(min(daily_pnl[variant], 0)) >= daily_loss_limit:
-        warnings.append(f"🚨 [{variant}] DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
-    elif abs(min(daily_pnl[variant], 0)) >= daily_loss_limit * 0.8:
-        warnings.append(f"⚠️ [{variant}] DAILY LOSS WARNING — at {(abs(min(daily_pnl[variant], 0)) / account) * 100:.1f}% of limit")
-    if abs(min(total_pnl[variant], 0)) >= total_drawdown_limit:
-        warnings.append(f"🚨 [{variant}] TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
+    if rules["drawdown_type"] == "trailing_lockable":
+        ensure_prop_daily_reset(variant)
+        reference_balance = get_reference_balance(variant)
+        if prop_daily_floor[variant] is not None:
+            if reference_balance <= prop_daily_floor[variant]:
+                warnings.append(f"🚨 [{variant}] FTUK DAILY DRAWDOWN BREACHED — balance/equity ${reference_balance:,.2f} at or below today's floor ${prop_daily_floor[variant]:,.2f}")
+            elif reference_balance <= prop_daily_floor[variant] + (account * 0.2 / 100):
+                warnings.append(f"⚠️ [{variant}] FTUK DAILY DRAWDOWN WARNING — balance/equity ${reference_balance:,.2f}, floor ${prop_daily_floor[variant]:,.2f}")
+        max_dd_floor = prop_firm_max_dd_floor(variant)
+        if max_dd_floor is not None and reference_balance <= max_dd_floor:
+            warnings.append(f"🚨 [{variant}] FTUK MAX DRAWDOWN BREACHED — balance/equity ${reference_balance:,.2f} at or below the floor ${max_dd_floor:,.2f}")
+    else:
+        daily_loss_limit = account * (rules["max_daily_loss_pct"] / 100)
+        total_drawdown_limit = account * (rules["max_total_drawdown_pct"] / 100)
+        if abs(min(daily_pnl[variant], 0)) >= daily_loss_limit:
+            warnings.append(f"🚨 [{variant}] DAILY LOSS LIMIT HIT — STOP TRADING TODAY")
+        elif abs(min(daily_pnl[variant], 0)) >= daily_loss_limit * 0.8:
+            warnings.append(f"⚠️ [{variant}] DAILY LOSS WARNING — at {(abs(min(daily_pnl[variant], 0)) / account) * 100:.1f}% of limit")
+        if abs(min(total_pnl[variant], 0)) >= total_drawdown_limit:
+            warnings.append(f"🚨 [{variant}] TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
     if consecutive_losses[variant] == 3:
         warnings.append(f"⚠️ [{variant}] DRAWDOWN PROTECTION ACTIVE — {consecutive_losses[variant]} consecutive losses, confidence threshold raised")
     if warnings:
@@ -2214,7 +2422,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                                 "dxy_implication": dxy_implication, "news_risk": news_risk,
                                 "spread_risk": spread_risk, "hour_quality": hour_quality,
                                 "confluence_score": confluence_score,
-                                "risk_pct": PROP_FIRM_RULES["max_loss_per_trade_pct"],
+                                "risk_pct": get_prop_rules(variant)["max_loss_per_trade_pct"],
                                 "original_target": target_price,
                                 "target_scaled_to_pct": 80,
                             }
@@ -2293,7 +2501,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                                 "dxy_implication": dxy_implication, "news_risk": news_risk,
                                 "spread_risk": spread_risk, "hour_quality": hour_quality,
                                 "confluence_score": confluence_score,
-                                "risk_pct": PROP_FIRM_RULES["max_loss_per_trade_pct"],
+                                "risk_pct": get_prop_rules(variant)["max_loss_per_trade_pct"],
                                 "original_target": target_price,
                                 "target_scaled_to_pct": 80,
                             }
@@ -2360,7 +2568,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                                 "dxy_implication": dxy_implication, "news_risk": news_risk,
                                 "spread_risk": spread_risk, "hour_quality": hour_quality,
                                 "confluence_score": confluence_score,
-                                "risk_pct": PROP_FIRM_RULES["max_loss_per_trade_pct"],
+                                "risk_pct": get_prop_rules(variant)["max_loss_per_trade_pct"],
                                 "original_target": target_price,
                                 "target_scaled_to_pct": 80,
                             }
@@ -2556,28 +2764,27 @@ _Week of {cot_data['date']}_
 @app.route('/prop-status', methods=['GET'])
 def prop_status():
     try:
-        account = PROP_FIRM_RULES["account_size"]
-        daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
-        total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
         sections = []
         statuses = {}
         for v in VARIANTS:
+            rules = get_prop_rules(v)
+            account = rules["account_size"]
+            daily_loss_limit = account * (rules["max_daily_loss_pct"] / 100)
+            total_drawdown_limit = account * (rules["max_total_drawdown_pct"] / 100)
             daily_used_pct = (abs(min(daily_pnl[v], 0)) / account) * 100
             total_used_pct = (abs(min(total_pnl[v], 0)) / account) * 100
             daily_remaining = daily_loss_limit - abs(min(daily_pnl[v], 0))
             total_remaining = total_drawdown_limit - abs(min(total_pnl[v], 0))
             daily_status = "🔴 DANGER" if daily_used_pct >= 80 else "🟡 CAUTION" if daily_used_pct >= 50 else "🟢 SAFE"
             total_status = "🔴 DANGER" if total_used_pct >= 80 else "🟡 CAUTION" if total_used_pct >= 50 else "🟢 SAFE"
-            statuses[v] = {"daily_status": daily_status, "total_status": total_status}
+            statuses[v] = {"daily_status": daily_status, "total_status": total_status, "account_size": account}
             sections.append(f"""
-*[{v}]* Balance: ${current_balance[v]:,.2f} | Today: ${daily_pnl[v]:,.2f} | Total: ${total_pnl[v]:,.2f} | Days: {trading_days[v]}/{PROP_FIRM_RULES['min_trading_days']}
+*[{v}]* Account: ${account:,.2f} | Balance: ${current_balance[v]:,.2f} | Today: ${daily_pnl[v]:,.2f} | Total: ${total_pnl[v]:,.2f} | Days: {trading_days[v]}/{rules['min_trading_days']}
+Max Risk/Trade: {rules['max_loss_per_trade_pct']}% (${account * rules['max_loss_per_trade_pct'] / 100:,.2f})
 Daily Loss: {daily_status} ({daily_used_pct:.1f}% used, ${daily_remaining:,.2f} left)
-Drawdown: {total_status} ({total_used_pct:.1f}% used, ${total_remaining:,.2f} left)""")
+Drawdown: {total_status} ({total_used_pct:.1f}% used, ${total_remaining:,.2f} left){' [FTUK: floor $' + f'{prop_daily_floor[v]:,.2f}' + ']' if rules['drawdown_type'] == 'trailing_lockable' and prop_daily_floor[v] is not None else ''}""")
         message = f"""
 📊 *Prop Firm Status Report — A/B/C*
-
-*Account Size (each):* ${account:,.2f}
-*Max Risk Per Trade:* {PROP_FIRM_RULES['max_loss_per_trade_pct']}% (${account * PROP_FIRM_RULES['max_loss_per_trade_pct'] / 100:,.2f})
 {"".join(sections)}
 """
         send_telegram(message)
@@ -2603,9 +2810,11 @@ def update_pnl():
         daily_pnl[variant] += trade_pnl
         total_pnl[variant] += trade_pnl
         current_balance[variant] += trade_pnl
-        account = PROP_FIRM_RULES["account_size"]
-        daily_loss_limit = account * (PROP_FIRM_RULES["max_daily_loss_pct"] / 100)
-        total_drawdown_limit = account * (PROP_FIRM_RULES["max_total_drawdown_pct"] / 100)
+        peak_closing_balance[variant] = max(peak_closing_balance[variant], current_balance[variant])
+        rules = get_prop_rules(variant)
+        account = rules["account_size"]
+        daily_loss_limit = account * (rules["max_daily_loss_pct"] / 100)
+        total_drawdown_limit = account * (rules["max_total_drawdown_pct"] / 100)
         warnings = []
         if abs(min(daily_pnl[variant], 0)) >= daily_loss_limit * 0.8:
             warnings.append(f"⚠️ [{variant}] DAILY LOSS WARNING — at {(abs(min(daily_pnl[variant],0))/account)*100:.1f}% of limit")
@@ -2970,6 +3179,41 @@ def mt5_price_update():
         return jsonify({"status": "ok"})
     except (TypeError, ValueError) as e:
         return jsonify({"status": "error", "message": f"bid/ask must be numeric: {e}"}), 400
+
+
+@app.route('/mt5/account-update', methods=['POST'])
+def mt5_account_update():
+    """
+    Each variant's own bridge relays its own real balance/equity here
+    periodically (18 Aug) -- unlike price/candles (genuinely shared
+    market data, only A's bridge relays it), this is per-account
+    information, so every variant's own bridge reports its own.
+    Currently only needed for B's real FTUK daily-drawdown floor
+    (get_reference_balance/ensure_prop_daily_reset), which needs to
+    know live equity Railway has no other way to see -- but harmless
+    to relay from A and C's bridges too, for whenever it's useful.
+    Same validation pattern as mt5_price_update -- a degenerate
+    reading (0 or negative) must never get stored.
+    """
+    global mt5_account_snapshot
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        balance, equity = data.get('balance'), data.get('equity')
+        if balance is None or equity is None:
+            return jsonify({"status": "error", "message": "balance and equity are both required"}), 400
+        balance, equity = float(balance), float(equity)
+        if balance <= 0 or equity <= 0:
+            return jsonify({"status": "error", "message": "balance and equity must both be positive"}), 400
+        mt5_account_snapshot[variant] = {"balance": balance, "equity": equity, "updated_at": datetime.now(timezone.utc)}
+        return jsonify({"status": "ok"})
+    except (TypeError, ValueError) as e:
+        return jsonify({"status": "error", "message": f"balance/equity must be numeric: {e}"}), 400
 
 
 mt5_candle_history = {"candles": [], "updated_at": None}
@@ -3377,15 +3621,20 @@ def admin_reopen_trade():
 def admin_reset_variant():
     """
     Resets ONE variant's entire tracked state back to a clean slate --
-    balance to the starting $10,000, every trade list emptied
-    (paper_trades, active_trades, shadow_trades, active_shadow_trades,
-    mt5_pending_trades), every counter zeroed (daily_pnl, total_pnl,
-    trading_days, consecutive_losses, last_trading_day). Built 17 Aug
-    for starting B and C over on fresh MT5 accounts after their live
-    logic rebuild.
+    balance to that variant's own real starting account size (reads
+    through get_prop_rules, not the shared PROP_FIRM_RULES directly --
+    using the shared default here would silently reset B to $10,000
+    instead of its real $50,000 FTUK balance), every trade list
+    emptied (paper_trades, active_trades, shadow_trades,
+    active_shadow_trades, mt5_pending_trades), every counter zeroed
+    (daily_pnl, total_pnl, trading_days, consecutive_losses,
+    last_trading_day), plus (18 Aug) peak_closing_balance and the
+    FTUK-style daily floor for any variant using the trailing-lockable
+    drawdown type. Built 17 Aug for starting B and C over on fresh MT5
+    accounts after their live logic rebuild.
 
     Does NOT touch the other two variants' state at all. Does NOT
-    touch anything MT5/bridge-side -- opening the new demo account,
+    touch anything MT5/bridge-side -- opening the new account,
     pointing that variant's bridge at it, and re-enabling the manual-
     approval toggle (known to default OFF on a fresh account, same
     issue that caused a real rejection on B once already) are separate,
@@ -3393,7 +3642,8 @@ def admin_reset_variant():
     """
     global paper_trades, active_trades, shadow_trades, active_shadow_trades
     global current_balance, daily_pnl, total_pnl, trading_days, consecutive_losses
-    global mt5_pending_trades, last_trading_day
+    global mt5_pending_trades, last_trading_day, peak_closing_balance
+    global prop_daily_floor, prop_daily_floor_set_on
     ok, msg = check_bridge_secret()
     if not ok:
         return jsonify({"status": "error", "message": msg}), 401
@@ -3405,18 +3655,22 @@ def admin_reset_variant():
 
         previous_balance = current_balance[variant]
         previous_trade_count = len(paper_trades[variant])
+        new_account_size = get_prop_rules(variant)["account_size"]
 
         paper_trades[variant] = []
         active_trades[variant] = {}
         shadow_trades[variant] = []
         active_shadow_trades[variant] = {}
         mt5_pending_trades[variant] = {}
-        current_balance[variant] = PROP_FIRM_RULES["account_size"]
+        current_balance[variant] = new_account_size
         daily_pnl[variant] = 0
         total_pnl[variant] = 0
         trading_days[variant] = 0
         consecutive_losses[variant] = 0
         last_trading_day[variant] = None
+        peak_closing_balance[variant] = new_account_size
+        prop_daily_floor[variant] = None
+        prop_daily_floor_set_on[variant] = None
         check_drawdown_protection(variant)
 
         with open(data_path('paper_trades.json'), 'w') as f:
@@ -5407,7 +5661,8 @@ def dashboard():
     if not trades_html:
         trades_html = "<div class='no-data'>No active paper trades</div>"
     levels_html = "".join([f'<div class="level-row"><span class="level-label">{k.replace("_", " ").title()}</span><span class="level-value">{v}</span></div>' for k, v in KEY_LEVELS.items()])
-    account = PROP_FIRM_RULES["account_size"]
+    dashboard_rules = get_prop_rules(variant)
+    account = dashboard_rules["account_size"]
     daily_used_pct = (abs(min(daily_pnl[variant], 0)) / account) * 100
     total_used_pct = (abs(min(total_pnl[variant], 0)) / account) * 100
     daily_status_color = "#ff4444" if daily_used_pct >= 80 else "#ffaa00" if daily_used_pct >= 50 else "#44ff88"
@@ -5478,14 +5733,14 @@ def dashboard():
             <div class="prop-row"><span class="prop-label">Today P&L</span><span style="color:{'#44ff88' if daily_pnl[variant] >= 0 else '#ff4444'}">${daily_pnl[variant]:,.2f}</span></div>
             <div class="prop-row"><span class="prop-label">Total P&L</span><span style="color:{'#44ff88' if total_pnl[variant] >= 0 else '#ff4444'}">${total_pnl[variant]:,.2f}</span></div>
             <div style="margin-top:10px;">
-                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Daily Loss Used</span><span style="color:{daily_status_color}">{daily_used_pct:.1f}% of {PROP_FIRM_RULES['max_daily_loss_pct']}%</span></div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Daily Loss Used</span><span style="color:{daily_status_color}">{daily_used_pct:.1f}% of {dashboard_rules['max_daily_loss_pct']}%</span></div>
                 <div class="progress-bar"><div class="progress-fill" style="width:{min(daily_used_pct, 100)}%;background:{daily_status_color}"></div></div>
             </div>
             <div style="margin-top:8px;">
-                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Total Drawdown Used</span><span style="color:{total_status_color}">{total_used_pct:.1f}% of {PROP_FIRM_RULES['max_total_drawdown_pct']}%</span></div>
+                <div style="display:flex;justify-content:space-between;font-size:11px;color:#aaa;"><span>Total Drawdown Used</span><span style="color:{total_status_color}">{total_used_pct:.1f}% of {dashboard_rules['max_total_drawdown_pct']}%</span></div>
                 <div class="progress-bar"><div class="progress-fill" style="width:{min(total_used_pct, 100)}%;background:{total_status_color}"></div></div>
             </div>
-            <div class="prop-row" style="margin-top:10px;"><span class="prop-label">Trading Days</span><span style="color:#ffd700">{trading_days[variant]}/{PROP_FIRM_RULES['min_trading_days']}</span></div>
+            <div class="prop-row" style="margin-top:10px;"><span class="prop-label">Trading Days</span><span style="color:#ffd700">{trading_days[variant]}/{dashboard_rules['min_trading_days']}</span></div>
             <div class="prop-row"><span class="prop-label">Drawdown Protection</span><span style="color:{'#ff4444' if drawdown_protection[variant] else '#44ff88'}">{'ACTIVE' if drawdown_protection[variant] else 'OFF'}</span></div>
         </div>
         <div class="card full-width"><h3>📡 Today's Alerts ({len(recent_alerts)} this session, shared across all variants)</h3>{alerts_html}</div>
@@ -5607,7 +5862,7 @@ def send_heartbeat():
             open_trades = sum(1 for t in active_trades[v].values() if t.get('result') == 'OPEN')
             sections.append(
                 f"*[{v}]* Active: {open_trades} | Balance: ${current_balance[v]:,.2f} | "
-                f"Total P&L: ${total_pnl[v]:,.2f} | Days: {trading_days[v]}/{PROP_FIRM_RULES['min_trading_days']} | "
+                f"Total P&L: ${total_pnl[v]:,.2f} | Days: {trading_days[v]}/{get_prop_rules(v)['min_trading_days']} | "
                 f"Drawdown: {'ACTIVE ⚠️' if drawdown_protection[v] else 'OFF ✅'}"
             )
         msg = f"""

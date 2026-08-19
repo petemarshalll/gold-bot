@@ -1159,8 +1159,31 @@ def variant_c_excluded(confluence_score, is_killzone):
 def extract_confluence_score(analysis):
     """Pulls the numeric X/10 confluence score out of Claude's analysis
     text so it can be logged alongside the trade, instead of being
-    thrown away after the Telegram message is sent."""
+    thrown away after the Telegram message is sent.
+
+    Two Claude output formats seen live, both handled (19 Aug): the
+    original single-line "CONFLUENCE SCORE: 6/10" (score immediately
+    after the header, caught by the primary pattern's tight 20-char
+    window) and a newer itemized-breakdown style Claude has since
+    started using -- "CONFLUENCE SCORE" on its own line, followed by
+    several "- Category: X/2" sub-lines, with the real total only
+    appearing at the very end as "Total: 7/10", far outside that
+    20-char window. Confirmed live: the primary pattern silently
+    returned None for every itemized-format alert tested (including a
+    real BEARISH_SWEEP signal that should have been caught by B's
+    confluence>=7 exclude rule and wasn't, since every confluence-based
+    filter check in this codebase is gated on confluence_score is not
+    None first) -- a None score doesn't just mean a missing log field,
+    it silently disables every confluence-based include/exclude gate
+    for that signal. The 20-char primary pattern is kept exactly as-is
+    (proven correct for the original format, no reason to loosen it
+    and risk matching a stray "/10" elsewhere), with this second
+    "Total: X/10" pattern only tried as a fallback when the first
+    finds nothing.
+    """
     match = re.search(r'CONFLUENCE SCORE[^\d]{0,20}(\d{1,2})\s*/\s*10', analysis, re.IGNORECASE)
+    if not match:
+        match = re.search(r'Total\s*:?\s*(\d{1,2})\s*/\s*10', analysis, re.IGNORECASE)
     if match:
         score = int(match.group(1))
         if 0 <= score <= 10:

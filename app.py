@@ -3680,6 +3680,68 @@ def admin_reopen_trade():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/admin/manual-trade', methods=['POST'])
+def admin_manual_trade():
+    """
+    Manual trade injection (19 Aug) -- for Pete to take a real trade
+    himself when he's watching a live setup and worried a bug might
+    stop the automated path from placing it. Deliberately skips the
+    confidence/confluence FILTER (variant_b_included/excluded etc) --
+    Pete is the one judging the setup here, not the bot -- but does
+    NOT skip check_risk_cap_before_trade(): a manual override still
+    can't push the real account past FTUK's daily or max drawdown
+    floor, since that protection exists for the account regardless of
+    where a trade came from.
+
+    Goes through the exact same log_paper_trade() -> queue_mt5_trade()
+    path every real signal uses (unlike /mt5/test-queue, which
+    deliberately skips paper_trades/active_trades/balance tracking
+    for bridge-testing purposes) -- so a manual trade updates balance,
+    shows up in /admin/recent-trades, and gets closure-tracked
+    normally, exactly like an automated one. Target is scaled to 80%
+    the same way a normal signal's is, so Pete enters the same raw
+    numbers he'd see in a Telegram alert rather than pre-computing the
+    scaled figure himself. Tagged alert_type/confidence "MANUAL" with
+    manual_override:true in its context so it's clearly distinguishable
+    from bot-driven trades in any later performance review.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        direction = data.get('direction', '')
+        if direction not in ('LONG', 'SHORT'):
+            return jsonify({"status": "error", "message": "'direction' required, must be LONG or SHORT"}), 400
+        try:
+            entry = float(data['entry'])
+            stop = float(data['stop'])
+            target = float(data['target'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"status": "error", "message": "'entry', 'stop', and 'target' are required and must be numbers"}), 400
+
+        risk_ok, risk_msg = check_risk_cap_before_trade(variant)
+        if not risk_ok:
+            return jsonify({"status": "error", "message": f"Blocked by risk cap: {risk_msg}"}), 400
+
+        risk_pct = data.get('risk_pct', get_prop_rules(variant)["max_loss_per_trade_pct"])
+        scaled_target = round(entry + (target - entry) * 0.8, 2)
+        alert_time = datetime.utcnow().strftime('%H:%M UTC')
+        trade_context = {"risk_pct": risk_pct, "manual_override": True, "original_target": target, "target_scaled_to_pct": 80}
+        trade_id = log_paper_trade(variant, "MANUAL", entry, direction, entry, stop, scaled_target,
+                                    "MANUAL", alert_time, context=trade_context)
+        send_telegram(f"🖐️ *[{variant}] Manual trade injected* — {direction} entry {entry}, SL {stop}, TP {scaled_target} (80% of {target}), risk {risk_pct}%. Trade ID: {trade_id}")
+        return jsonify({
+            "status": "ok", "variant": variant, "trade_id": trade_id, "scaled_target": scaled_target,
+            "message": "Queued for the bridge -- tracked exactly like a normal trade, will place on the next poll cycle (~20s)"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route('/admin/reset-variant', methods=['POST'])
 def admin_reset_variant():
     """

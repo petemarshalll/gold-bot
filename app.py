@@ -1470,7 +1470,19 @@ def apply_trade_pnl(variant, trade, result, real_pnl_override=None):
             warnings.append(f"⚠️ [{variant}] DAILY LOSS WARNING — at {(abs(min(daily_pnl[variant], 0)) / account) * 100:.1f}% of limit")
         if abs(min(total_pnl[variant], 0)) >= total_drawdown_limit:
             warnings.append(f"🚨 [{variant}] TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
-    if consecutive_losses[variant] == 3:
+    # Only warns while drawdown protection's real effects are actually
+    # enabled (19 Aug) -- previously fired unconditionally off
+    # consecutive_losses alone, with no regard for DRAWDOWN_PROTECTION_
+    # DISABLED, so it kept sending "confidence threshold raised" even
+    # while that flag (correctly) meant no such thing was happening --
+    # confirmed live: drawdown_protection[variant] (the actual
+    # behavioral flag, set by check_drawdown_protection) is only ever
+    # read for display/status text, never to gate a real confidence
+    # threshold or risk size anywhere in the trade-decision path. This
+    # brings the alert in line with the disable flag everything else
+    # already respects, rather than changing what's real -- nothing
+    # about B's actual trade sizing or confidence gating changes here.
+    if not DRAWDOWN_PROTECTION_DISABLED and consecutive_losses[variant] == 3:
         warnings.append(f"⚠️ [{variant}] DRAWDOWN PROTECTION ACTIVE — {consecutive_losses[variant]} consecutive losses, confidence threshold raised")
     if warnings:
         send_telegram("\n".join(warnings))

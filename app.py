@@ -1161,33 +1161,30 @@ def extract_confluence_score(analysis):
     text so it can be logged alongside the trade, instead of being
     thrown away after the Telegram message is sent.
 
-    Two Claude output formats seen live, both handled (19 Aug): the
-    original single-line "CONFLUENCE SCORE: 6/10" (score immediately
-    after the header, caught by the primary pattern's tight 20-char
-    window) and a newer itemized-breakdown style Claude has since
-    started using -- "CONFLUENCE SCORE" on its own line, followed by
-    several "- Category: X/2" sub-lines, with the real total only
-    appearing at the very end as "Total: 7/10", far outside that
-    20-char window. Confirmed live: the primary pattern silently
-    returned None for every itemized-format alert tested (including a
-    real BEARISH_SWEEP signal that should have been caught by B's
-    confluence>=7 exclude rule and wasn't, since every confluence-based
-    filter check in this codebase is gated on confluence_score is not
-    None first) -- a None score doesn't just mean a missing log field,
-    it silently disables every confluence-based include/exclude gate
-    for that signal. The 20-char primary pattern is kept exactly as-is
-    (proven correct for the original format, no reason to loosen it
-    and risk matching a stray "/10" elsewhere), with this second
-    "Total: X/10" pattern only tried as a fallback when the first
-    finds nothing.
+    Rewritten (19 Aug) after THREE distinct real formatting variants
+    broke two successive narrower fixes in one evening: the original
+    single-line "CONFLUENCE SCORE: 6/10", an itemized breakdown with
+    the real total only appearing at the end as "Total: 7/10", and
+    (found live, causing a real HIGH-confluence B trade to slip past
+    the confluence>=7 exclude rule) a decimal score with an em-dash
+    separator and no "Total:" line at all -- "CONFLUENCE SCORE —
+    8.5/10". Chasing each new separator/label individually kept
+    regressing, so this stops trying to anchor on a specific format
+    and instead just finds the first X/10 (or X.Y/10) fraction
+    anywhere in a generous window after the header -- safe because
+    every sub-item in every real format seen uses /2, never /10, so
+    the first /10 fraction after the header is reliably the real
+    total regardless of label, separator, or decimal precision.
     """
-    match = re.search(r'CONFLUENCE SCORE[^\d]{0,20}(\d{1,2})\s*/\s*10', analysis, re.IGNORECASE)
-    if not match:
-        match = re.search(r'Total\s*:?\s*(\d{1,2})\s*/\s*10', analysis, re.IGNORECASE)
+    header_match = re.search(r'CONFLUENCE SCORE', analysis, re.IGNORECASE)
+    if not header_match:
+        return None
+    window = analysis[header_match.end():header_match.end() + 400]
+    match = re.search(r'(\d{1,2}(?:\.\d+)?)\s*/\s*10', window)
     if match:
-        score = int(match.group(1))
+        score = float(match.group(1))
         if 0 <= score <= 10:
-            return score
+            return int(score) if score == int(score) else score
     return None
 
 # ============================================================

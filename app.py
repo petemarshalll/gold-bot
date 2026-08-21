@@ -3677,6 +3677,93 @@ def admin_reopen_trade():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/replay-hourly-breakdown', methods=['GET'])
+def replay_hourly_breakdown_endpoint():
+    """
+    Backtest-only, additive (21 Aug) -- Pete's own observation from the
+    old pre-rebuild system: multi-loss streaks tended to cluster in the
+    early-morning hours, well past where Asian session results held up.
+    filter_asian_session_only already treats 22:00-07:00 UTC as one
+    single block -- this is finer-grained: does performance actually
+    hold steady across that whole block, or does it fall off partway
+    through? One row per UTC hour (0-23), each with its own win rate /
+    avg R / trade count, via the same _aggregate_stats helper every
+    other replay report already uses.
+
+    Purely a read-only analysis tool -- doesn't touch, gate, or change
+    any live filter/trading decision for A, B, or C.
+
+    Optional &filters=/&mode=/&exclude= (identical syntax to
+    /replay-combine) restricts the breakdown to only signals that ALSO
+    pass a given filter combination first -- e.g. B's own actual live
+    rule (?filters=B,zone&mode=or&exclude=confluence,stacked) -- so the
+    hour-by-hour picture can be checked either across every signal in
+    the batch, or specifically within trades B would actually take.
+    Omitting all three just breaks down every resolved signal in the
+    batch, unfiltered.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    try:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    filters_param = request.args.get('filters', '')
+    mode = request.args.get('mode', '').lower()
+    exclude_param = request.args.get('exclude', '')
+
+    if filters_param:
+        if mode not in ('and', 'or'):
+            return jsonify({"status": "error", "message": "mode must be exactly 'and' or 'or' when filters is given"}), 400
+        valid_keys = {key for key, _, _ in FILTER_DEFINITIONS}
+        filter_keys = [k.strip() for k in filters_param.split(',') if k.strip()]
+        invalid = [k for k in filter_keys if k not in valid_keys]
+        if invalid:
+            return jsonify({"status": "error", "message": f"Unknown filter key(s): {', '.join(invalid)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+        exclude_keys = [k.strip() for k in exclude_param.split(',') if k.strip()] if exclude_param else []
+        invalid_exclude = [k for k in exclude_keys if k not in valid_keys]
+        if invalid_exclude:
+            return jsonify({"status": "error", "message": f"Unknown exclude filter key(s): {', '.join(invalid_exclude)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+        base_records, _, _ = combine_filters(resolved, filter_keys, mode, exclude_keys)
+    else:
+        base_records = resolved
+
+    if len(base_records) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(base_records)} signals after applying filters — not enough to break down by hour."}), 400
+
+    buckets = {h: [] for h in range(24)}
+    for r in base_records:
+        hour = pd.Timestamp(r["timestamp"]).hour
+        buckets[hour].append(r)
+
+    hourly = []
+    for hour in range(24):
+        stats = _aggregate_stats(buckets[hour])
+        if stats is None:
+            hourly.append({"hour_utc": hour, "n": 0, "wr": None, "avg_r": None})
+        else:
+            hourly.append({"hour_utc": hour, **stats})
+
+    return jsonify({
+        "status": "ok", "batch_size": len(records), "resolved": len(resolved),
+        "filtered_to": len(base_records), "interval": interval, "period": period,
+        "filters_applied": filters_param or None, "mode": mode or None, "exclude_applied": exclude_param or None,
+        "hourly_breakdown": hourly,
+        "note": "hour_utc is the UTC hour each signal's own saved timestamp falls in. Hours with n<5 have too little data to read into. Backtest-only — does not affect any live trading."
+    })
+
+
 @app.route('/admin/manual-trade', methods=['POST'])
 def admin_manual_trade():
     """

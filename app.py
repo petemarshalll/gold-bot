@@ -3677,6 +3677,60 @@ def admin_reopen_trade():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/replay-raw-signal-count', methods=['GET'])
+def replay_raw_signal_count_endpoint():
+    """
+    Backtest-only, additive (21 Aug) -- Pete's own question: do the
+    saved replay batches actually represent every raw pattern match
+    detect_raw_signals finds in the window, or just a sample of it?
+
+    Answer: a sample. stratified_sample_signals deliberately caps at
+    per_type signals of each type (default 25, so 100/run), evenly
+    spread across the window -- not everything detect_raw_signals
+    actually finds. This reports the TRUE total, broken down by type,
+    with zero Claude API calls and zero cost -- exactly the same
+    detection scan /replay-generate itself runs first, stopped before
+    the costed analysis step -- so the real population size is known
+    before deciding whether it's worth paying to pull a bigger sample
+    via /replay-generate?per_type=N.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+
+    gold = yf.download('GC=F', period=period, interval=interval, progress=False, timeout=20)
+    if gold.empty:
+        return jsonify({"status": "error", "message": f"No gold price data returned for interval={interval}, period={period}"}), 400
+    gold.columns = [col[0] for col in gold.columns]
+    gold = gold.dropna()
+
+    all_raw_signals = detect_raw_signals(gold)
+    by_type = {}
+    for s in all_raw_signals:
+        by_type[s["type"]] = by_type.get(s["type"], 0) + 1
+
+    batch_filename = replay_batch_filename(interval, period)
+    already_saved = 0
+    try:
+        with open(data_path(batch_filename), 'r') as f:
+            existing_batch = json.load(f)
+        already_saved = len(existing_batch.get("records", []))
+    except FileNotFoundError:
+        pass
+
+    return jsonify({
+        "status": "ok", "interval": interval, "period": period,
+        "candles_loaded": len(gold),
+        "total_raw_signals_detected": len(all_raw_signals),
+        "by_type": by_type,
+        "already_saved_and_analyzed": already_saved,
+        "note": "total_raw_signals_detected is every raw pattern match found in the window — free, no Claude calls. already_saved_and_analyzed is a stratified SAMPLE of this (capped per type via /replay-generate's per_type param), not necessarily the same number."
+    })
+
+
 @app.route('/replay-hourly-breakdown', methods=['GET'])
 def replay_hourly_breakdown_endpoint():
     """

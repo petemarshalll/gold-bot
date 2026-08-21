@@ -15,6 +15,7 @@ import io
 import threading
 import time
 import uuid
+import itertools
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -3755,6 +3756,15 @@ def replay_hourly_breakdown_endpoint():
     the batch, or specifically within trades B would actually take.
     Omitting all three just breaks down every resolved signal in the
     batch, unfiltered.
+
+    Optional &fraction=0.8 (or &tp_pct=80, same thing) -- mirrors
+    /replay-combine's own scaled-target option (21 Aug, added after
+    initially shipping this endpoint without it, which Pete caught --
+    every number here was silently scored against the FULL original
+    target, not the 80% one actually live on B/C's real trades, which
+    is meaningfully easier to hit and changes the real picture). Same
+    free one-time price re-download as /replay-combine, no new Claude
+    calls either way.
     """
     ok, msg = check_bridge_secret()
     if not ok:
@@ -3762,6 +3772,22 @@ def replay_hourly_breakdown_endpoint():
 
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
+
+    fraction_param = request.args.get('fraction', None)
+    tp_pct_param = request.args.get('tp_pct', None)
+    if fraction_param is not None and tp_pct_param is not None:
+        return jsonify({"status": "error", "message": "Use either fraction or tp_pct, not both"}), 400
+    fraction = None
+    try:
+        if fraction_param is not None:
+            fraction = float(fraction_param)
+        elif tp_pct_param is not None:
+            fraction = float(tp_pct_param) / 100.0
+    except ValueError:
+        return jsonify({"status": "error", "message": "fraction/tp_pct must be a number, e.g. &fraction=0.8 or &tp_pct=80"}), 400
+    if fraction is not None and not (0 < fraction <= 2.0):
+        return jsonify({"status": "error", "message": "fraction should be between 0 and 2.0 (tp_pct between 0 and 200)"}), 400
+
     try:
         with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
             batch = json.load(f)
@@ -3772,6 +3798,19 @@ def replay_hourly_breakdown_endpoint():
     resolved = [r for r in records if r["outcome"] is not None]
     if len(resolved) < 5:
         return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    target_note = None
+    if fraction is not None:
+        batch_interval = batch.get("interval", interval)
+        batch_period = batch.get("period", period)
+        gold = yf.download('GC=F', period=batch_period, interval=batch_interval, progress=False, timeout=20)
+        if gold.empty:
+            return jsonify({"status": "error", "message": f"No price data returned for the TP-scaling step (interval={batch_interval}, period={batch_period})"}), 500
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+        resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction, max_lookahead=50 * interval_scale(batch_interval))
+        resolved = [r for r in resolved if r["outcome"] is not None]
+        target_note = f"Target scaled to {fraction * 100:.0f}% of the way from entry to the original target, stop unchanged."
 
     filters_param = request.args.get('filters', '')
     mode = request.args.get('mode', '').lower()
@@ -3813,6 +3852,7 @@ def replay_hourly_breakdown_endpoint():
         "status": "ok", "batch_size": len(records), "resolved": len(resolved),
         "filtered_to": len(base_records), "interval": interval, "period": period,
         "filters_applied": filters_param or None, "mode": mode or None, "exclude_applied": exclude_param or None,
+        "fraction_applied": fraction, "target_note": target_note,
         "hourly_breakdown": hourly,
         "note": "hour_utc is the UTC hour each signal's own saved timestamp falls in. Hours with n<5 have too little data to read into. Backtest-only — does not affect any live trading."
     })
@@ -5508,6 +5548,219 @@ def replay_combine_endpoint():
     result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction)
     status_code = 200 if result.get("status") == "ok" else 500
     return jsonify(result), status_code
+
+
+def run_replay_optimize(interval_a='15m', period_a='60d', interval_b='1h', period_b='2y',
+                         fractions=None, min_n=20, top_n=10):
+    """
+    Filter/TP-fraction search (21 Aug) -- Pete's own request: search
+    every combination of the named filters and every target-scaling
+    fraction, find what actually holds up, and keep using it as the
+    dataset grows. Built with real safeguards, not a naive "find the
+    best number" search -- a brute-force search over enough
+    combinations WILL surface lucky-looking noise (this is exactly
+    the trap C's own current live rule fell into: it looked good on
+    one dataset and explicitly did not replicate on the other, and
+    still got shipped as a live experiment). Three real protections
+    against that, all required, not optional:
+
+    1. Minimum sample size (min_n, default 20) on EACH dataset
+       independently -- a lucky 6-trade fluke can never qualify.
+    2. Every candidate is checked against BOTH datasets
+       (interval_a/period_a AND interval_b/period_b) independently --
+       the same two-dataset method that validated every real finding
+       tonight. Ranked by whichever dataset's total R is WORSE (not
+       averaged), so a combo can't rank highly by being great on one
+       dataset and terrible on the other.
+    3. Reports the top N (default 10), not just #1, so a genuine
+       cluster of similar good combos (real signal) is visible and
+       distinguishable from one lucky outlier standing alone.
+
+    Search space is include (any single named filter, or an OR-pair
+    of two) x exclude (none, a single filter, or an OR-pair of two) --
+    matching the actual architecture B and C's real live rules already
+    use ("X or Y, excluding P or Q"), not every theoretically possible
+    subset. Deeper (3+) combinations were deliberately left out of
+    scope -- they multiply both the search space and the overfitting
+    risk sharply, while moving further from anything that maps to a
+    sensibly-describable, maintainable live rule. Worth revisiting
+    only if singles+pairs alone don't turn up anything solid.
+
+    Fractions default to a spread from 50% to 100% if none given.
+    Real price data is re-downloaded once per fraction per dataset
+    (not once per combo) -- the only genuinely repeated cost here is a
+    handful of free re-downloads. The search itself (21 Aug, rewritten
+    for speed after an initial version re-scanned every record from
+    scratch inside each of the ~134k combo checks) instead computes,
+    once per dataset/fraction, which record-indices each of the 13
+    named filters individually accepts -- 13 quick passes total, not
+    134k. Every include/exclude candidate's own index-set is then just
+    a union of those, precomputed once too, so the inner loop over
+    every include x exclude pair is pure, fast set algebra (union,
+    subtraction, length) rather than re-evaluating filter functions
+    per combo. Same result as calling combine_filters per combo would
+    give, just without the redundant repeated work. Free either way --
+    no new Claude calls, whether run now on today's partial batch or
+    later against a fully-exhausted one.
+    """
+    try:
+        if fractions is None:
+            fractions = [0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0]
+
+        send_telegram(
+            f"🔎 *Filter/TP optimizer started*\nSearching every include (single or OR-pair of {len(FILTER_DEFINITIONS)} named filters) x every exclude (none/single/OR-pair) x {len(fractions)} target fractions, cross-checked against BOTH {interval_a}/{period_a} and {interval_b}/{period_b} independently. Only combos with at least {min_n} trades on EACH dataset are eligible. Free, no new Claude calls -- may take a while, results in Telegram when done."
+        )
+
+        try:
+            with open(data_path(replay_batch_filename(interval_a, period_a)), 'r') as f:
+                batch_a = json.load(f)
+        except FileNotFoundError:
+            send_telegram(f"⚠️ Optimizer error: no saved batch for {interval_a}/{period_a} — run /replay-generate first.")
+            return
+        try:
+            with open(data_path(replay_batch_filename(interval_b, period_b)), 'r') as f:
+                batch_b = json.load(f)
+        except FileNotFoundError:
+            send_telegram(f"⚠️ Optimizer error: no saved batch for {interval_b}/{period_b} — run /replay-generate first.")
+            return
+
+        resolved_a_base = [r for r in batch_a.get("records", []) if r["outcome"] is not None]
+        resolved_b_base = [r for r in batch_b.get("records", []) if r["outcome"] is not None]
+
+        per_fraction_a = {}
+        per_fraction_b = {}
+        for frac in fractions:
+            if frac == 1.0:
+                per_fraction_a[frac] = resolved_a_base
+                per_fraction_b[frac] = resolved_b_base
+                continue
+            gold_a = yf.download('GC=F', period=period_a, interval=interval_a, progress=False, timeout=20)
+            gold_a.columns = [c[0] for c in gold_a.columns]
+            gold_a = gold_a.dropna()
+            per_fraction_a[frac] = [r for r in recompute_outcomes_scaled_tp(resolved_a_base, gold_a, frac, max_lookahead=50 * interval_scale(interval_a)) if r["outcome"] is not None]
+
+            gold_b = yf.download('GC=F', period=period_b, interval=interval_b, progress=False, timeout=20)
+            gold_b.columns = [c[0] for c in gold_b.columns]
+            gold_b = gold_b.dropna()
+            per_fraction_b[frac] = [r for r in recompute_outcomes_scaled_tp(resolved_b_base, gold_b, frac, max_lookahead=50 * interval_scale(interval_b)) if r["outcome"] is not None]
+            send_telegram(f"  ...priced target={frac * 100:.0f}% on both datasets")
+
+        keys = [k for k, _, _ in FILTER_DEFINITIONS]
+        include_candidates = [[k] for k in keys] + [list(p) for p in itertools.combinations(keys, 2)]
+        exclude_candidates = [[]] + [[k] for k in keys] + [list(p) for p in itertools.combinations(keys, 2)]
+        total_combos = len(fractions) * len(include_candidates) * len(exclude_candidates)
+
+        def build_membership(records):
+            """Which record-indices each named filter accepts, computed
+            ONCE per dataset/fraction -- one pass per filter (13 total)
+            instead of re-evaluating every filter function fresh inside
+            every one of the ~134k combo checks below."""
+            return {key: {i for i, r in enumerate(records) if fn(r)} for key, _, fn in FILTER_DEFINITIONS}
+
+        def union_sets(membership, candidate_lists):
+            """Precomputes the OR'd index-set for every include/exclude
+            candidate once, so the inner loop is pure set algebra."""
+            out = []
+            for cand in candidate_lists:
+                s = set()
+                for k in cand:
+                    s |= membership[k]
+                out.append((cand, s))
+            return out
+
+        results = []
+        for frac in fractions:
+            ra = per_fraction_a[frac]
+            rb = per_fraction_b[frac]
+            inc_sets_a = union_sets(build_membership(ra), include_candidates)
+            exc_sets_a = union_sets(build_membership(ra), exclude_candidates)
+            inc_sets_b = union_sets(build_membership(rb), include_candidates)
+            exc_sets_b = union_sets(build_membership(rb), exclude_candidates)
+            for (inc, inc_idx_a), (_, inc_idx_b) in zip(inc_sets_a, inc_sets_b):
+                for (exc, exc_idx_a), (_, exc_idx_b) in zip(exc_sets_a, exc_sets_b):
+                    idx_a = inc_idx_a - exc_idx_a
+                    if len(idx_a) < min_n:
+                        continue
+                    idx_b = inc_idx_b - exc_idx_b
+                    if len(idx_b) < min_n:
+                        continue
+                    combined_a = [ra[i] for i in idx_a]
+                    combined_b = [rb[i] for i in idx_b]
+                    stats_a = _aggregate_stats(combined_a)
+                    stats_b = _aggregate_stats(combined_b)
+                    if stats_a is None or stats_b is None:
+                        continue  # defensive only -- unreachable once min_n>=1 is enforced at the route
+                    total_r_a = round(sum(r['r_multiple'] for r in combined_a), 2)
+                    total_r_b = round(sum(r['r_multiple'] for r in combined_b), 2)
+                    results.append({
+                        "fraction": frac, "include": inc, "exclude": exc,
+                        "a": {**stats_a, "total_r": total_r_a},
+                        "b": {**stats_b, "total_r": total_r_b},
+                        "worst_total_r": min(total_r_a, total_r_b),
+                    })
+            send_telegram(f"  ...target={frac * 100:.0f}% done, {len(results)} qualifying combos so far (of {total_combos} total checked)")
+
+        results.sort(key=lambda x: x['worst_total_r'], reverse=True)
+        top = results[:top_n]
+
+        if not top:
+            send_telegram(f"🔎 *Filter/TP optimizer finished* — {total_combos} combos checked, none passed min_n={min_n} on BOTH datasets. Try a lower &min_n= or wait for a bigger saved batch.")
+            return
+
+        lines = [
+            f"🏆 *Filter/TP Optimizer Report*",
+            f"{total_combos} combos checked, {len(results)} passed min n={min_n} on BOTH {interval_a}/{period_a} and {interval_b}/{period_b}. Ranked by whichever dataset's total R is WORSE, so nothing here looks good only by luck on one side.",
+            ""
+        ]
+        for i, r in enumerate(top, 1):
+            inc_names = "+".join(r["include"])
+            exc_names = "+".join(r["exclude"]) if r["exclude"] else "none"
+            lines.append(
+                f"{i}. include={inc_names} | exclude={exc_names} | tp={r['fraction'] * 100:.0f}%\n"
+                f"   {interval_a}/{period_a}: n={r['a']['n']} WR={r['a']['wr']}% R={r['a']['total_r']}\n"
+                f"   {interval_b}/{period_b}: n={r['b']['n']} WR={r['b']['wr']}% R={r['b']['total_r']}"
+            )
+        send_telegram("\n".join(lines))
+    except Exception as e:
+        send_telegram(f"⚠️ Optimizer error: {str(e)}")
+
+
+@app.route('/replay-optimize', methods=['GET'])
+def replay_optimize_endpoint():
+    """
+    Kicks off run_replay_optimize as a background job -- same
+    fire-and-report-to-Telegram pattern as every other replay report.
+    Optional &min_n= (default 20), &top_n= (default 10),
+    &fractions=0.6,0.7,0.8,1.0 (comma-separated, default a spread from
+    50-100%), &interval_a=/&period_a=/&interval_b=/&period_b= (default
+    the two datasets already in use: 15m/60d and 1h/2y).
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    interval_a = request.args.get('interval_a', default='15m')
+    period_a = request.args.get('period_a', default='60d')
+    interval_b = request.args.get('interval_b', default='1h')
+    period_b = request.args.get('period_b', default='2y')
+    min_n = max(1, request.args.get('min_n', default=20, type=int))
+    top_n = request.args.get('top_n', default=10, type=int)
+
+    fractions_param = request.args.get('fractions', '')
+    fractions = None
+    if fractions_param:
+        try:
+            fractions = [float(x) for x in fractions_param.split(',') if x.strip()]
+        except ValueError:
+            return jsonify({"status": "error", "message": "fractions must be comma-separated numbers, e.g. &fractions=0.6,0.7,0.8,1.0"}), 400
+
+    thread = threading.Thread(target=run_replay_optimize, args=(interval_a, period_a, interval_b, period_b, fractions, min_n, top_n))
+    thread.start()
+    return jsonify({
+        "status": "search started",
+        "min_n": min_n, "top_n": top_n,
+        "note": f"Searching every include (single/pair of {len(FILTER_DEFINITIONS)} named filters) x every exclude (none/single/pair) x target fractions, cross-checked against BOTH {interval_a}/{period_a} and {interval_b}/{period_b} independently -- only combos with at least {min_n} trades on EACH dataset are eligible. Free, no new Claude calls, may take a while. Results in Telegram when done."
+    })
 
 
 def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None):

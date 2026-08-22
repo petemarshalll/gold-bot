@@ -111,6 +111,36 @@ daily_alert_count = 0
 scheduler = None
 
 # ============================================================
+# REPLAY-GENERATE CONCURRENCY LOCK (22 Aug)
+# Confirmed live (21 Aug): the batch file is only written ONCE, at the
+# very end of the whole run -- not incrementally. Two /replay-generate
+# calls on the SAME (interval, period) starting close together both
+# read the same "already saved" baseline before either has written
+# anything back, so both independently sample the SAME "new" signals
+# (the sampling is deterministic) -- the second run adds zero new
+# data and just pays again for analyzing what the first one already
+# covered. Confirmed real: an accidental double-tap cost ~$4.79 for
+# nothing. This lock stops a second run from even starting while one
+# is already active for that exact dataset, rather than relying on
+# remembering not to double-tap a link.
+_replay_generate_lock_guard = threading.Lock()
+_replay_generate_active = set()  # set of (interval, period) tuples currently running
+
+
+def _try_acquire_replay_lock(interval, period):
+    key = (interval, period)
+    with _replay_generate_lock_guard:
+        if key in _replay_generate_active:
+            return False
+        _replay_generate_active.add(key)
+        return True
+
+
+def _release_replay_lock(interval, period):
+    with _replay_generate_lock_guard:
+        _replay_generate_active.discard((interval, period))
+
+# ============================================================
 # VERSION TAGGING
 # Every trade (real and shadow) stores which version of the bot
 # produced it, so results stay comparable across future changes
@@ -132,7 +162,30 @@ scheduler = None
 # datasets; C's did not (0.29R on 15m/60d vs 0.05R on 1h/2y) and
 # shipped anyway as a live continuation of that test, Pete's explicit
 # call.
-BOT_VERSION = "1.2.0"
+# 1.3.0 (22 Aug): full account reshuffle + rule rewrite for all three
+# variants, from the 22 Aug optimizer search (66,976 combos, every
+# candidate cross-checked against both 15m/60d and 1h/2y
+# independently), re-run twice more the same day as the 1h/2y batch
+# genuinely grew (200 -> 267 signals) -- the final picks below are
+# from the last re-run, confirmed against the real, current batch
+# state via /replay-filters immediately beforehand. The real, paid
+# FTUK account physically swapped places with A's old demo -- A now
+# runs sweep-only-no-override OR Asian-session, excluding stacked,
+# 80% target (the closest-converged, best-supported result across
+# every re-run, chosen deliberately for the account carrying real
+# money). B (now hosting A's old demo) runs DXY-strict (A's own
+# confidence gate plus no active DXY conflict) OR Asian-session,
+# excluding stacked, 90% -- the largest sample of any candidate found
+# in the whole search on both datasets, and a genuinely different
+# mechanism (macro dollar strength, not another timing/pattern
+# filter) from everything else in play. C keeps its own demo but
+# gets confluence-only OR Asian-session, excluding stacked, 90% --
+# the best 1h win rate in the search, on a thinner sample, also a
+# genuine live test rather than a risk to real capital.
+# VARIANT_PROP_FIRM_OVERRIDES moved from key "B" to key "A" to follow
+# the real account to its new slot. News-risk suppression added to A
+# for the first time (it never carried real money before now).
+BOT_VERSION = "1.3.0"
 
 # ============================================================
 # SHADOW TRACKING
@@ -190,11 +243,13 @@ PROP_FIRM_RULES = {
     "daily_reset_hour_utc": 0,
 }
 
-# Per-variant overrides (18 Aug) -- B is now running a REAL, paid FTUK
-# Flex Challenge evaluation ($50k, one-step), not a demo account
-# emulating generic FTMO-style rules. Genuinely different account
+# Per-variant overrides (18 Aug, reassigned 22 Aug for v1.3) -- A is
+# now running the REAL, paid FTUK Flex Challenge ($50k, one-step),
+# not a demo account emulating generic FTMO-style rules -- moved here
+# from B during the v1.3 account reshuffle (the real account swapped
+# physical places with A's old demo). Genuinely different account
 # size, drawdown TYPE, and daily reset time -- not just different
-# numbers in the same formula. A and C stay on the shared
+# numbers in the same formula. B and C stay on the shared
 # PROP_FIRM_RULES above, completely untouched by any of this.
 #
 # FTUK's own stated rules (confirmed directly by Pete, 18 Aug):
@@ -209,7 +264,7 @@ PROP_FIRM_RULES = {
 #   here -- nothing in this codebase blocks trading before a minimum
 #   is reached, it's just tracked for Pete's own reference).
 VARIANT_PROP_FIRM_OVERRIDES = {
-    "B": {
+    "A": {
         "account_size": 50000,
         "max_daily_loss_pct": 5.0,
         "min_trading_days": 1,
@@ -1041,120 +1096,152 @@ def variant_confluence_ok(variant, confluence_score):
     return confluence_score is not None and confluence_score >= VARIANT_MIN_CONFLUENCE_SCORE
 
 
-def variant_a_excluded(overridden_confidence, raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+def _passes_stacked_pattern(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
     """
-    A's real-time "emergency brake" (16 Aug) -- given a signal that
-    already has a real, valid, reachable trade (checked separately by
-    the caller), this returns True if it should be excluded anyway
-    because it independently satisfies one of the three specific
-    patterns the full 2-year replay showed performing worse: C's own
-    gate, the raw confluence-only gate, or the maximally-selective
-    "everything stacked" gate.
-
-    Deliberately mirrors filter_C_exact / filter_confluence_only /
-    filter_stacked (used throughout the /replay-* endpoints) piece by
-    piece, on the same real fields under different names -- so the
-    live rule and the tested rule can never silently drift apart.
-    Caller is expected to have already confirmed valid_trade,
-    entry_zone_reached, and has_real_trade_params are all True; this
-    function only adds the three exclude checks on top of that.
+    Shared by every v1.3 variant's exclude gate (22 Aug) -- all three
+    of A/B/C's new live rules share the identical exclude condition,
+    mirroring filter_stacked exactly: raw HIGH confidence AND
+    confluence 7+ AND inside a killzone AND no DXY conflict. Written
+    once here so the three variant-specific exclude functions below
+    can never silently drift apart on this shared piece, the same
+    reasoning that already applied within each variant's own old
+    exclude list before this rewrite.
     """
-    # Mirrors filter_C_exact: A's own gate (confidence HIGH/MEDIUM)
-    # plus a 6+ confluence score.
-    passes_c = (overridden_confidence in ("HIGH", "MEDIUM")
-                and confluence_score is not None and confluence_score >= 6)
-
-    # Mirrors filter_confluence_only: ignores confidence entirely,
-    # just a 7+ confluence score.
-    passes_confluence_only = confluence_score is not None and confluence_score >= 7
-
-    # Mirrors filter_stacked: raw (un-overridden) HIGH confidence,
-    # confluence 7+, inside a killzone, and DXY not actively
-    # conflicting with the trade direction.
+    if raw_confidence != "HIGH":
+        return False
+    if confluence_score is None or confluence_score < 7:
+        return False
+    if not is_killzone:
+        return False
     dxy_conflict = ((direction == "LONG" and dxy_implication == "BEARISH")
                      or (direction == "SHORT" and dxy_implication == "BULLISH"))
-    passes_stacked = (raw_confidence == "HIGH"
-                       and confluence_score is not None and confluence_score >= 7
-                       and is_killzone and not dxy_conflict)
-
-    return passes_c or passes_confluence_only or passes_stacked
+    return not dxy_conflict
 
 
-def variant_b_included(raw_confidence, overridden_confidence, direction, zone):
+def variant_a_included(raw_confidence, session_name, alert_type):
     """
-    B's new live entry gate (17 Aug) -- built from the same real,
-    saved 15m/60d and 1h/2y batches used to validate A's own rebuild,
-    replicated across both before shipping (0.17R / 0.13R avg R,
-    n=80 / n=87). Mirrors filter_B_exact / filter_zone_strict piece
-    by piece, on the same real fields under different names, so the
-    live rule and the tested rule can never silently drift apart.
+    A's v1.3 live entry gate (22 Aug) -- replaces the pre-v1.3 "any
+    valid, reachable signal, no confidence/confluence requirement"
+    gate now that the real FTUK account has moved into this slot.
+    Mirrors filter_sweep_only_no_override / filter_asian_session_only
+    piece by piece, on the same real fields under different names, so
+    the live rule and the tested rule can never silently drift apart.
+
+    From the 22 Aug optimizer search (66,976 combos checked, every
+    candidate cross-checked against BOTH the 15m/60d and 1h/2y
+    datasets independently, ranked by whichever dataset's result was
+    WORSE so nothing here looks good only by luck on one side),
+    re-run twice more the same day as the 1h/2y batch genuinely grew
+    (200 -> 267 signals) -- confirmed against the current batch state
+    via /replay-filters immediately before this final version:
+    n=334/121, WR=38.0%/43.8%, total R=32.98/36.81 -- the 1h result
+    actually IMPROVED as the sample grew, the strongest form of
+    evidence seen for any single candidate all day, which is why it
+    was chosen specifically for the account carrying real money
+    rather than a result with a higher raw number on one dataset but
+    a wider gap to the other.
+
+    session_name is passed through directly from get_session() rather
+    than a raw hour, since get_session()'s own "Asian Session" branch
+    already uses the identical 22:00-07:00 UTC boundary this needs --
+    no reason to recompute the same check a second way.
+
     Caller is expected to have already confirmed valid_trade,
     entry_zone_reached, and has_real_trade_params are all True.
-
-    Include: passes B's own raw-confidence gate (no FVG/SWEEP
-    override), OR passes the zone-strict gate (A's gate plus strict
-    premium/discount alignment -- longs only in discount, shorts only
-    in premium).
-    """
-    passes_b_exact = raw_confidence in ("HIGH", "MEDIUM")
-    passes_zone_strict = (
-        overridden_confidence in ("HIGH", "MEDIUM")
-        and ((direction == "LONG" and zone == "DISCOUNT") or (direction == "SHORT" and zone == "PREMIUM"))
-    )
-    return passes_b_exact or passes_zone_strict
-
-
-def variant_b_excluded(confluence_score, raw_confidence, is_killzone, direction, dxy_implication):
-    """
-    B's exclude/"emergency brake" (17 Aug), checked only on signals
-    that already passed variant_b_included. Mirrors
-    filter_confluence_only / filter_stacked -- the two filters that
-    the replay comparison showed contributing nothing (or worse) on
-    top of zone-strict, same reasoning as A's own exclude list.
-    """
-    passes_confluence_only = confluence_score is not None and confluence_score >= 7
-    dxy_conflict = ((direction == "LONG" and dxy_implication == "BEARISH")
-                     or (direction == "SHORT" and dxy_implication == "BULLISH"))
-    passes_stacked = (raw_confidence == "HIGH"
-                       and confluence_score is not None and confluence_score >= 7
-                       and is_killzone and not dxy_conflict)
-    return passes_confluence_only or passes_stacked
-
-
-def variant_c_included(raw_confidence, overridden_confidence, direction, zone, alert_type):
-    """
-    C's new live entry gate (17 Aug) -- replaces the old hard 6/10
-    confluence floor entirely. Built the same way as B's, off the
-    same saved batches, but this specific combination (sweep+zone,
-    excluding confluence+killzone) is the one that did NOT replicate
-    between the two datasets during testing (0.29R on 15m/60d vs
-    0.05R on 1h/2y) -- shipped anyway at Pete's explicit call, as a
-    live continuation of that same test rather than a validated edge.
-    Worth revisiting once C has real live data of its own. Mirrors
-    filter_sweep_only_no_override / filter_zone_strict.
     """
     passes_sweep_only = raw_confidence in ("HIGH", "MEDIUM") and "SWEEP" in alert_type
-    passes_zone_strict = (
-        overridden_confidence in ("HIGH", "MEDIUM")
-        and ((direction == "LONG" and zone == "DISCOUNT") or (direction == "SHORT" and zone == "PREMIUM"))
-    )
-    return passes_sweep_only or passes_zone_strict
+    passes_asian = session_name == "Asian Session"
+    return passes_sweep_only or passes_asian
 
 
-def variant_c_excluded(confluence_score, is_killzone):
+def variant_a_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
     """
-    C's exclude/"emergency brake" (17 Aug), checked only on signals
-    that already passed variant_c_included. Mirrors
-    filter_confluence_only / filter_killzone_only. Note the killzone
-    exclusion specifically is what drove most of this combo's failure
-    to replicate on the 1h/2y batch (blocked 44 of 49 candidates on
-    the 60-day window alone) -- a timing-based cut on a narrow sample,
-    the classic shape of overfitting. Flagging again here since it's
-    baked into C's live logic now, not just a backtest footnote.
+    A's v1.3 exclude/"emergency brake" (22 Aug), checked only on
+    signals that already passed variant_a_included. Mirrors
+    filter_stacked exactly via the shared _passes_stacked_pattern
+    helper -- see that function's docstring for the real reasoning.
+    Replaces the old three-way exclude list (C-style/confluence-only/
+    stacked) from A's pre-v1.3 rule, which doesn't apply to this new
+    combination at all.
+    """
+    return _passes_stacked_pattern(raw_confidence, confluence_score, is_killzone, direction, dxy_implication)
+
+
+def variant_b_included(overridden_confidence, direction, dxy_implication, session_name):
+    """
+    B's v1.3 live entry gate (22 Aug, updated after a second optimizer
+    re-run against the grown 1h/2y batch showed this beating the
+    original killzone+asian pick on every measure). Mirrors
+    filter_dxy_strict / filter_asian_session_only piece by piece.
+    filter_dxy_strict is NOT a pure DXY check -- it's A's own base
+    gate (overridden_confidence HIGH/MEDIUM) PLUS no active DXY
+    conflict with the trade direction; neutral DXY still passes.
+
+    From the 22 Aug optimizer search, re-run against the confirmed-
+    current 267-signal/171-resolved batch: n=477/139, WR=34.8%/39.6%,
+    total R=37.76/30.95 -- the LARGEST sample of any candidate found
+    in the entire search on both datasets, closer to the real ~150
+    per-dataset bar than anything else tested. Also a genuinely
+    different underlying mechanism from every other candidate in
+    play (a macro dollar-strength signal, not another timing or
+    pattern-based filter) -- worth a real live test specifically
+    because it teaches something the other two variants can't.
+
+    Caller is expected to have already confirmed valid_trade,
+    entry_zone_reached, and has_real_trade_params are all True.
+    """
+    dxy_conflict = ((direction == "LONG" and dxy_implication == "BEARISH")
+                     or (direction == "SHORT" and dxy_implication == "BULLISH"))
+    passes_dxy_strict = overridden_confidence in ("HIGH", "MEDIUM") and not dxy_conflict
+    passes_asian = session_name == "Asian Session"
+    return passes_dxy_strict or passes_asian
+
+
+def variant_b_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+    """
+    B's v1.3 exclude/"emergency brake" (22 Aug), checked only on
+    signals that already passed variant_b_included. Mirrors
+    filter_stacked exactly via the shared _passes_stacked_pattern
+    helper.
+    """
+    return _passes_stacked_pattern(raw_confidence, confluence_score, is_killzone, direction, dxy_implication)
+
+
+def variant_c_included(confluence_score, session_name):
+    """
+    C's v1.3 live entry gate (22 Aug) -- replaces the 17 Aug
+    sweep/zone-strict rule, which never replicated between the two
+    original datasets and was always a live continuation of a test
+    rather than a validated edge (see the removed docstring below in
+    version history for that finding). Mirrors filter_confluence_only
+    / filter_asian_session_only piece by piece.
+
+    From the 22 Aug optimizer search, re-run against the confirmed-
+    current 267-signal/171-resolved batch (same methodology as A's --
+    see variant_a_included's docstring): n=275/82, WR=36.7%/43.9%,
+    total R=30.1/31.2 -- the best 1h win rate of any result in the
+    whole top 10, though still on a thinner 1h sample than A or B's
+    picks. Genuinely different profile from both -- worth a real live
+    test on the account carrying no real stakes, same reasoning as
+    B's pick.
+
+    Caller is expected to have already confirmed valid_trade,
+    entry_zone_reached, and has_real_trade_params are all True.
     """
     passes_confluence_only = confluence_score is not None and confluence_score >= 7
-    passes_killzone_only = is_killzone
-    return passes_confluence_only or passes_killzone_only
+    passes_asian = session_name == "Asian Session"
+    return passes_confluence_only or passes_asian
+
+
+def variant_c_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+    """
+    C's v1.3 exclude/"emergency brake" (22 Aug), checked only on
+    signals that already passed variant_c_included. Mirrors
+    filter_stacked exactly via the shared _passes_stacked_pattern
+    helper -- replaces the old confluence-only/killzone-only exclude
+    list, which doesn't apply to this new combination.
+    """
+    return _passes_stacked_pattern(raw_confidence, confluence_score, is_killzone, direction, dxy_implication)
 
 
 def extract_confluence_score(analysis):
@@ -2397,19 +2484,29 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                 # confidence-gated approach entirely. Directly applies the
                 # single best-evidenced result from the full replay
                 # exploration (14-16 Aug, real 200-signal historical
-                # batch): no confidence/confluence requirement at all --
-                # just a real, valid trade whose entry zone has genuinely
-                # been reached -- EXCEPT signals that independently match
-                # C/confluence-only/stacked's own gates, which get
-                # excluded even though they'd otherwise qualify. Target
-                # scaled to 80% of the original entry-to-target distance;
-                # stop deliberately, completely untouched.
+                # ============================================================
+                # v1.3 (22 Aug): A now hosts the real, paid FTUK Flex
+                # Challenge account (swapped in from B during the account
+                # reshuffle) -- sweep-only-no-override OR Asian-session,
+                # EXCLUDING anything matching the stacked pattern. Target
+                # scaled to 80%, stop deliberately untouched. Built and
+                # cross-checked against the same real, saved 15m/60d and
+                # 1h/2y batches, via the 22 Aug optimizer search (66,976
+                # combos, every candidate checked against both datasets
+                # independently) -- see variant_a_included's own docstring
+                # for the real numbers behind this specific choice.
+                #
+                # News-risk suppression added here for the first time (22
+                # Aug) -- A never had it before since it never previously
+                # carried real money; now matches the same real-money
+                # safety pattern B and C already use.
                 #
                 # Historical trades logged under A with BOT_VERSION < 1.1.0
-                # used the old confidence-gated approach; B and C's own
-                # pre-17-Aug logic is similarly only preserved in trades
-                # with BOT_VERSION < 1.2.0 (see the B/C blocks further
-                # below, rebuilt 17 Aug the same way A was).
+                # used the original confidence-gated approach; trades with
+                # BOT_VERSION 1.1.0-1.2.x used the "any valid, reachable
+                # signal" rule this replaces. B and C's own pre-v1.3 logic
+                # is similarly only preserved in their own historical
+                # trades (BOT_VERSION < 1.3.0).
                 # ============================================================
                 if variant == "A":
                     has_real_trade_params = sl_found and tp_found
@@ -2419,8 +2516,8 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     # validated on fresh, live data, not just the
                     # historical replay it was built from.
                     try:
-                        if valid_trade and entry_zone_reached and has_real_trade_params:
-                            if variant_a_excluded(overridden_confidence, raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+                        if valid_trade and entry_zone_reached and has_real_trade_params and variant_a_included(raw_confidence, session_name, alert_type):
+                            if variant_a_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
                                 shadow_context = {
                                     "session": session_name, "killzone": is_killzone, "zone": zone,
                                     "zone_pct": zone_pct, "dxy_direction": dxy_direction,
@@ -2434,20 +2531,23 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     except Exception as e:
                         print(f"[{variant}] Shadow tracking error (non-fatal, real trade path unaffected): {e}")
 
-                    if valid_trade and entry_zone_reached and has_real_trade_params:
-                        if variant_a_excluded(overridden_confidence, raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
-                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches a known-weaker pattern (C-style, high-confluence-only, or the maximally-selective stacked criteria), skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
+                    if news_risk and overridden_confidence != "HIGH":
+                        send_telegram(f"⚠️ *[{variant}] Alert suppressed — news risk active*\n{news_msg}\nAlert type: {alert_type} at {data.get('price')}")
+                        monitor_active_trades(variant, data.get('price', 0))
+                        continue
+
+                    if valid_trade and entry_zone_reached and has_real_trade_params and variant_a_included(raw_confidence, session_name, alert_type):
+                        if variant_a_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches the maximally-selective stacked criteria, skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
                             monitor_active_trades(variant, data.get('price', 0))
                             continue
                         risk_ok, risk_msg = check_risk_cap_before_trade(variant)
                         if risk_ok:
                             alert_time = datetime.utcnow().strftime('%H:%M UTC')
-                            # 80% target scaling -- stop deliberately
-                            # unchanged. The single most consistent,
-                            # best-evidenced result across every fraction
-                            # tested (50-100%) against the real, saved
-                            # historical batch, confirmed sharpest and
-                            # most consistent on the two largest samples.
+                            # 80% target scaling (kept unchanged in the
+                            # v1.3 swap -- the winning tp in the 22 Aug
+                            # optimizer search for this specific rule),
+                            # stop deliberately, completely untouched.
                             scaled_target_price = round(entry_price + (target_price - entry_price) * 0.8, 2)
                             trade_context = {
                                 "session": session_name, "killzone": is_killzone, "zone": zone,
@@ -2482,14 +2582,20 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     monitor_active_trades(variant, data.get('price', 0))
                     continue
 
-                # Old A (pre-16-Aug confidence-override logic) lives on
-                # only in historical trades with BOT_VERSION < 1.1.0.
-                # B and C's own pre-17-Aug logic is similarly preserved
-                # only in their own historical trades (BOT_VERSION <
-                # 1.2.0) -- both now replaced below, same rebuild
-                # philosophy as A: entry gate + exclude list, built and
-                # cross-checked against the same real, saved 15m/60d and
-                # 1h/2y batches before shipping.
+                # v1.3 (22 Aug): B now hosts the demo account that used
+                # to run as A (swapped out during the account reshuffle) --
+                # DXY-strict (A's own confidence gate plus no active DXY
+                # conflict) OR Asian-session, EXCLUDING the stacked
+                # pattern. Target scaled to 90% (up from 80% pre-v1.3),
+                # stop deliberately untouched. Built the same way as A's
+                # new rule, off the same 22 Aug optimizer search -- see
+                # variant_b_included's own docstring for the real numbers.
+                #
+                # Historical trades logged under B with BOT_VERSION < 1.3.0
+                # used the 17 Aug B-exact/zone-strict rule (or the account's
+                # own older history before that, if any). A and C's own
+                # pre-v1.3 logic is similarly only preserved in their own
+                # historical trades (BOT_VERSION < 1.3.0).
                 # ============================================================
                 if variant == "B":
                     has_real_trade_params = sl_found and tp_found
@@ -2499,8 +2605,8 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                     # getting validated on fresh, live data.
                     try:
                         if valid_trade and entry_zone_reached and has_real_trade_params:
-                            if variant_b_included(raw_confidence, overridden_confidence, direction, zone):
-                                if variant_b_excluded(confluence_score, raw_confidence, is_killzone, direction, dxy_implication):
+                            if variant_b_included(overridden_confidence, direction, dxy_implication, session_name):
+                                if variant_b_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
                                     shadow_context = {
                                         "session": session_name, "killzone": is_killzone, "zone": zone,
                                         "zone_pct": zone_pct, "dxy_direction": dxy_direction,
@@ -2519,15 +2625,19 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                         monitor_active_trades(variant, data.get('price', 0))
                         continue
 
-                    if valid_trade and entry_zone_reached and has_real_trade_params and variant_b_included(raw_confidence, overridden_confidence, direction, zone):
-                        if variant_b_excluded(confluence_score, raw_confidence, is_killzone, direction, dxy_implication):
-                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches a known-weaker pattern (high-confluence-only, or the maximally-selective stacked criteria), skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
+                    if valid_trade and entry_zone_reached and has_real_trade_params and variant_b_included(overridden_confidence, direction, dxy_implication, session_name):
+                        if variant_b_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches the maximally-selective stacked criteria, skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
                             monitor_active_trades(variant, data.get('price', 0))
                             continue
                         risk_ok, risk_msg = check_risk_cap_before_trade(variant)
                         if risk_ok:
                             alert_time = datetime.utcnow().strftime('%H:%M UTC')
-                            scaled_target_price = round(entry_price + (target_price - entry_price) * 0.8, 2)
+                            # 90% target scaling (v1.3, up from 80%) --
+                            # the winning tp for this specific rule in the
+                            # 22 Aug optimizer search. Stop deliberately,
+                            # completely untouched.
+                            scaled_target_price = round(entry_price + (target_price - entry_price) * 0.9, 2)
                             trade_context = {
                                 "session": session_name, "killzone": is_killzone, "zone": zone,
                                 "zone_pct": zone_pct, "dxy_direction": dxy_direction,
@@ -2536,7 +2646,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                                 "confluence_score": confluence_score,
                                 "risk_pct": get_prop_rules(variant)["max_loss_per_trade_pct"],
                                 "original_target": target_price,
-                                "target_scaled_to_pct": 80,
+                                "target_scaled_to_pct": 90,
                             }
                             if entry_zone:
                                 trade_context["entry_zone_low"] = entry_zone[0]
@@ -2566,8 +2676,8 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
 
                     try:
                         if valid_trade and entry_zone_reached and has_real_trade_params:
-                            if variant_c_included(raw_confidence, overridden_confidence, direction, zone, alert_type):
-                                if variant_c_excluded(confluence_score, is_killzone):
+                            if variant_c_included(confluence_score, session_name):
+                                if variant_c_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
                                     shadow_context = {
                                         "session": session_name, "killzone": is_killzone, "zone": zone,
                                         "zone_pct": zone_pct, "dxy_direction": dxy_direction,
@@ -2586,15 +2696,19 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                         monitor_active_trades(variant, data.get('price', 0))
                         continue
 
-                    if valid_trade and entry_zone_reached and has_real_trade_params and variant_c_included(raw_confidence, overridden_confidence, direction, zone, alert_type):
-                        if variant_c_excluded(confluence_score, is_killzone):
-                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches a known-weaker pattern (high-confluence-only, or inside a killzone), skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
+                    if valid_trade and entry_zone_reached and has_real_trade_params and variant_c_included(confluence_score, session_name):
+                        if variant_c_excluded(raw_confidence, confluence_score, is_killzone, direction, dxy_implication):
+                            send_telegram(f"⚠️ *[{variant}] Signal excluded* — matches the maximally-selective stacked criteria, skipped even though it reached its entry zone.\nAlert type: {alert_type} at {data.get('price')}")
                             monitor_active_trades(variant, data.get('price', 0))
                             continue
                         risk_ok, risk_msg = check_risk_cap_before_trade(variant)
                         if risk_ok:
                             alert_time = datetime.utcnow().strftime('%H:%M UTC')
-                            scaled_target_price = round(entry_price + (target_price - entry_price) * 0.8, 2)
+                            # 90% target scaling (v1.3, up from 80%) --
+                            # the winning tp for this specific rule in the
+                            # 22 Aug optimizer search. Stop deliberately,
+                            # completely untouched.
+                            scaled_target_price = round(entry_price + (target_price - entry_price) * 0.9, 2)
                             trade_context = {
                                 "session": session_name, "killzone": is_killzone, "zone": zone,
                                 "zone_pct": zone_pct, "dxy_direction": dxy_direction,
@@ -2603,7 +2717,7 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                                 "confluence_score": confluence_score,
                                 "risk_pct": get_prop_rules(variant)["max_loss_per_trade_pct"],
                                 "original_target": target_price,
-                                "target_scaled_to_pct": 80,
+                                "target_scaled_to_pct": 90,
                             }
                             if entry_zone:
                                 trade_context["entry_zone_low"] = entry_zone[0]
@@ -3001,7 +3115,7 @@ def check_bridge_secret():
     """
     if not MT5_BRIDGE_SECRET:
         return False, "MT5_BRIDGE_SECRET not configured on the server"
-    provided = request.headers.get('X-Bridge-Secret', '') or request.args.get('secret', '')
+    provided = request.headers.get('X-Bridge-Secret', '') or request.values.get('secret', '')
     if provided != MT5_BRIDGE_SECRET:
         return False, "invalid or missing X-Bridge-Secret header (or ?secret= query param)"
     return True, ""
@@ -3732,6 +3846,98 @@ def replay_raw_signal_count_endpoint():
     })
 
 
+@app.route('/replay-mae', methods=['GET'])
+def replay_mae_endpoint():
+    """
+    Maximum Adverse Excursion report (22 Aug) -- for real WIN trades,
+    how close did price get to the stop before turning around? See
+    compute_mae_for_winners' own docstring for the full reasoning.
+
+    Optional &filters=/&mode=/&exclude= (identical syntax to
+    /replay-combine) restricts the report to only the winners within
+    a specific filter combination -- e.g. B's own real live rule --
+    rather than every winner in the whole batch. Omitting all three
+    reports on every real WIN in the batch.
+
+    Free -- one price re-download (same real data every other test
+    here uses), no new Claude calls, doesn't change or re-score
+    anything -- purely descriptive analysis on top of what's already
+    saved.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    try:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    filters_param = request.args.get('filters', '')
+    mode = request.args.get('mode', '').lower()
+    exclude_param = request.args.get('exclude', '')
+    if filters_param:
+        if mode not in ('and', 'or'):
+            return jsonify({"status": "error", "message": "mode must be exactly 'and' or 'or' when filters is given"}), 400
+        valid_keys = {key for key, _, _ in FILTER_DEFINITIONS}
+        filter_keys = [k.strip() for k in filters_param.split(',') if k.strip()]
+        invalid = [k for k in filter_keys if k not in valid_keys]
+        if invalid:
+            return jsonify({"status": "error", "message": f"Unknown filter key(s): {', '.join(invalid)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+        exclude_keys = [k.strip() for k in exclude_param.split(',') if k.strip()] if exclude_param else []
+        invalid_exclude = [k for k in exclude_keys if k not in valid_keys]
+        if invalid_exclude:
+            return jsonify({"status": "error", "message": f"Unknown exclude filter key(s): {', '.join(invalid_exclude)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+        base_records, _, _ = combine_filters(resolved, filter_keys, mode, exclude_keys)
+    else:
+        base_records = resolved
+
+    gold = yf.download('GC=F', period=period, interval=interval, progress=False, timeout=20)
+    if gold.empty:
+        return jsonify({"status": "error", "message": f"No price data returned (interval={interval}, period={period})"}), 500
+    gold.columns = [col[0] for col in gold.columns]
+    gold = gold.dropna()
+
+    mae_records = compute_mae_for_winners(base_records, gold, max_lookahead=50 * interval_scale(interval))
+    if not mae_records:
+        return jsonify({"status": "error", "message": "No real WIN outcomes found in the filtered set to analyze."}), 400
+
+    pcts = [r["mae_pct_of_stop"] for r in mae_records]
+    buckets = {"0-25%": 0, "25-50%": 0, "50-75%": 0, "75-90%": 0, "90-100%": 0, "100%+": 0}
+    for p in pcts:
+        if p < 25: buckets["0-25%"] += 1
+        elif p < 50: buckets["25-50%"] += 1
+        elif p < 75: buckets["50-75%"] += 1
+        elif p < 90: buckets["75-90%"] += 1
+        elif p < 100: buckets["90-100%"] += 1
+        else: buckets["100%+"] += 1
+
+    sorted_pcts = sorted(pcts)
+    median_pct = sorted_pcts[len(sorted_pcts) // 2]
+    avg_pct = round(sum(pcts) / len(pcts), 1)
+    near_miss_count = buckets["90-100%"] + buckets["100%+"]
+
+    return jsonify({
+        "status": "ok",
+        "winners_analyzed": len(mae_records),
+        "avg_mae_pct_of_stop": avg_pct,
+        "median_mae_pct_of_stop": median_pct,
+        "distribution": buckets,
+        "near_miss_count": near_miss_count,
+        "near_miss_pct_of_winners": round(near_miss_count / len(mae_records) * 100, 1),
+        "filters_applied": filters_param or None, "mode": mode or None, "exclude_applied": exclude_param or None,
+        "note": "mae_pct_of_stop is how close each WIN got to the stop before turning, as a % of the original stop distance. Higher = closer to being stopped out. 100%+ flags a real inconsistency worth a second look -- see compute_mae_for_winners' docstring."
+    })
+
+
 @app.route('/replay-hourly-breakdown', methods=['GET'])
 def replay_hourly_breakdown_endpoint():
     """
@@ -4446,7 +4652,7 @@ def replay_sample_endpoint():
     })
 
 
-@app.route('/replay-generate', methods=['GET'])
+@app.route('/replay-generate', methods=['GET', 'POST'])
 def replay_generate_endpoint():
     """
     Step 1 of 2 for multi-filter comparison (14 Aug). Generates real
@@ -4471,12 +4677,68 @@ def replay_generate_endpoint():
     because that's yfinance's own hard limit on intraday data, not a
     choice. Saved to its own file (see replay_batch_filename) --
     never mixed with the original 1h/2y batch.
+
+    GET/POST confirm-before-spend (22 Aug): this is the one replay
+    endpoint that spends real money, and it used to be a bare GET
+    link -- exactly the kind of URL a chat app's own link-preview
+    fetcher, or a browser's own prefetching, can trigger automatically
+    with zero human action, no click involved. Suspected as the real
+    cause of two apparent "accidental double-runs" this weekend that
+    the person didn't consciously trigger either time. Now a GET
+    request only ever renders a small confirmation page with a real
+    button -- costs nothing, starts nothing, safe for any automated
+    fetch to hit. The actual paid run only starts on POST, which only
+    ever happens from a genuine, deliberate tap on that button. Every
+    other replay endpoint stays GET-only -- they're free, so there's
+    nothing an accidental fetch could cost.
+
+    The secret check now runs ONCE, before the GET/POST split, rather
+    than inside the GET branch alone -- caught in a later bug-hunt
+    pass the same day this was written: the first version only
+    checked it inside the GET branch, meaning a direct POST (bypassing
+    the confirmation page entirely) could have started a real, billed
+    run with no authentication at all. Checking it once at the top
+    covers both methods the same way and can't be forgotten again if
+    either branch is edited later.
     """
-    per_type = request.args.get('per_type', default=25, type=int)
-    interval = request.args.get('interval', default='1h')
-    period = request.args.get('period', default='2y')
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    per_type = request.values.get('per_type', default=25, type=int)
+    interval = request.values.get('interval', default='1h')
+    period = request.values.get('period', default='2y')
     if interval not in ('15m', '30m', '1h', '60m'):
         return jsonify({"status": "error", "message": "interval must be one of 15m, 30m, 1h, 60m"}), 400
+
+    if request.method == 'GET':
+        est_calls = per_type * 4
+        secret_provided = request.values.get('secret', '')
+        return f"""
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confirm replay-generate</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; line-height: 1.5;">
+<h2>Confirm before spending</h2>
+<p>This will sample ~<b>{est_calls}</b> new signals ({interval} / {period}, per_type={per_type}) and make real, billed Claude API calls. Nothing has been charged yet -- opening this page costs nothing.</p>
+<form method="POST" action="/replay-generate">
+<input type="hidden" name="per_type" value="{per_type}">
+<input type="hidden" name="interval" value="{interval}">
+<input type="hidden" name="period" value="{period}">
+<input type="hidden" name="secret" value="{secret_provided}">
+<button type="submit" style="font-size: 18px; padding: 14px 28px; width: 100%; background: #d97706; color: white; border: none; border-radius: 8px;">Yes, start this run now</button>
+</form>
+</body></html>
+""", 200, {'Content-Type': 'text/html'}
+
+    # POST from here on -- the actual real run only ever starts here.
+    if not _try_acquire_replay_lock(interval, period):
+        return jsonify({
+            "status": "error",
+            "message": f"A replay-generate run is already in progress for interval={interval}, period={period}. "
+                       f"Wait for its Telegram completion message before starting another -- running two at once on "
+                       f"the same dataset doesn't add more data (the sampling is deterministic), it just pays twice "
+                       f"for the same signals. Confirmed live 21 Aug: a duplicate run added zero new signals for ~$4.79."
+        }), 409
     thread = threading.Thread(target=run_replay_generate, args=(per_type, interval, period))
     thread.start()
     est_calls = per_type * 4
@@ -4516,6 +4778,136 @@ def _score_trade(gold_df, signal_index, direction, entry, stop, target, risk_amo
         trade_pnl = -risk_amount
     r_multiple = round(trade_pnl / risk_amount, 2) if risk_amount > 0 else 0
     return outcome, r_multiple
+
+
+def compute_mae_for_winners(records, gold_df, max_lookahead=50):
+    """
+    Maximum Adverse Excursion (22 Aug) -- Pete's own question: for
+    trades that ultimately WON, how close did price actually get to
+    the stop before turning back? A stop placed right at the edge of
+    normal market noise keeps producing winners that are also
+    near-misses -- worth knowing before deciding whether a stop is
+    genuinely well-placed or just narrowly getting away with it, and
+    a natural companion to the scaled-stop testing above (this shows
+    WHY a tighter stop would or wouldn't have worked, not just
+    whether it would have).
+
+    Only meaningful for real WIN outcomes (a saved LOSS already means
+    the trade hit stop, by definition) -- uses each record's
+    already-saved real entry/stop/target/direction/outcome as-is,
+    doesn't change or re-score anything, purely descriptive analysis
+    layered on top of what's already there. Looks up each signal's
+    position by its saved TIMESTAMP (same reasoning as
+    recompute_outcomes_scaled_tp -- a positional index from an
+    earlier download can silently point at the wrong candle later).
+
+    Walks the same real candle-by-candle path as
+    simulate_backtest_trade, using the identical stop-checked-first-
+    each-candle convention, but instead of stopping at the first hit,
+    tracks the single worst (closest-to-stop) price reached at any
+    point before the target was hit.
+
+    Returns only the winning records that could be scored, each with
+    two new fields added:
+    - mae_points: the worst adverse move, in real price points
+    - mae_pct_of_stop: that same move as a percentage of the
+      ORIGINAL stop distance (85 means the trade got 85% of the way
+      to being stopped out before it turned around and won). Values
+      at or above 100 flag a real inconsistency worth a second look --
+      a fresh candle-by-candle re-scan finding the stop level touched
+      or breached on a trade the saved data already calls a WIN
+      (possible if the original outcome was scored against slightly
+      different price data, or if a stop-hit candle's wick genuinely
+      pierced past the exact stop price on its way to also hitting
+      target within the same candle).
+    """
+    results = []
+    for r in records:
+        if r.get("outcome") != "WIN":
+            continue
+        try:
+            ts = pd.Timestamp(r["timestamp"])
+            signal_index = gold_df.index.get_loc(ts)
+
+            entry, stop, target, direction = r["entry"], r["stop"], r["target"], r["direction"]
+            stop_distance = abs(entry - stop)
+            if stop_distance <= 0:
+                continue
+
+            worst_adverse = 0.0
+            end = min(signal_index + 1 + max_lookahead, len(gold_df))
+            for j in range(signal_index + 1, end):
+                row = gold_df.iloc[j]
+                high = float(row['High'])
+                low = float(row['Low'])
+                if direction == 'LONG':
+                    hit_target = high >= target
+                    hit_stop = low <= stop
+                    adverse_this_candle = entry - low
+                else:
+                    hit_target = low <= target
+                    hit_stop = high >= stop
+                    adverse_this_candle = high - entry
+                worst_adverse = max(worst_adverse, adverse_this_candle)
+                if hit_stop or hit_target:
+                    break
+
+            new_r = dict(r)
+            new_r["mae_points"] = round(worst_adverse, 2)
+            new_r["mae_pct_of_stop"] = round(worst_adverse / stop_distance * 100, 1)
+            results.append(new_r)
+        except (KeyError, TypeError, ValueError):
+            # One malformed or unexpectedly-shaped record (a missing
+            # field, an unparseable timestamp, a non-numeric value)
+            # skips silently rather than crashing the whole report --
+            # same defensive isolation already used elsewhere in this
+            # codebase (run_replay_generate's own per-signal try/
+            # except, the webhook's shadow-tracking try/except) so one
+            # bad record can never take down an entire batch.
+            continue
+    return results
+
+
+def _merge_and_save_batch(existing_batch, new_records, errors, total_cost, batch_filename, interval, period):
+    """
+    Shared by run_replay_generate's incremental checkpoint saves and its
+    final save (22 Aug) -- one source of truth for the merge/write
+    logic, so a mid-run checkpoint and the eventual completion save can
+    never drift out of sync with each other.
+
+    Confirmed live (22 Aug): the batch previously only wrote once, at
+    the very end of the whole run. A real run that got cut short that
+    day -- simply running out of Anthropic account credit mid-run, no
+    deploy or crash involved -- lost 100% of its progress, not just the
+    unfinished part, since nothing had ever been saved yet
+    (/replay-raw-signal-count showed the exact same already_saved
+    count after the run as before it started). Checkpointing every 25
+    signals (matching the existing Telegram progress-update cadence
+    exactly, so no extra API/network cost beyond one small local file
+    write) means the worst case going forward is losing at most ~24
+    signals' worth of real, already-paid-for work -- not the entire run.
+    """
+    if existing_batch:
+        combined_records = existing_batch.get("records", []) + new_records
+        combined_cost = round(existing_batch.get("total_cost", 0) + total_cost, 2)
+        combined_errors = existing_batch.get("errors", 0) + errors
+    else:
+        combined_records = new_records
+        combined_cost = round(total_cost, 2)
+        combined_errors = errors
+
+    batch = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "interval": interval,
+        "period": period,
+        "sample_size": len(combined_records),
+        "records": combined_records,
+        "errors": combined_errors,
+        "total_cost": combined_cost,
+    }
+    with open(data_path(batch_filename), 'w') as f:
+        json.dump(batch, f, indent=2)
+    return combined_records, combined_cost, combined_errors
 
 
 def run_replay_generate(per_type=25, interval='1h', period='2y'):
@@ -4701,34 +5093,11 @@ def run_replay_generate(per_type=25, interval='1h', period='2y'):
 
             if (n + 1) % 25 == 0:
                 est_cost_so_far = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)
+                _merge_and_save_batch(existing_batch, records, errors, est_cost_so_far, batch_filename, interval, period)
                 send_telegram(f"⏳ {n + 1}/{len(sample)} processed | est. cost so far: ${est_cost_so_far:.2f}")
 
         total_cost = (total_input_tokens / 1_000_000 * REPLAY_INPUT_COST_PER_M) + (total_output_tokens / 1_000_000 * REPLAY_OUTPUT_COST_PER_M)
-
-        # Merge into any existing batch rather than overwrite it --
-        # every top-up run (any day, any budget) adds to the same
-        # growing, cumulative sample instead of discarding whatever
-        # was already paid for.
-        if existing_batch:
-            combined_records = existing_batch.get("records", []) + records
-            combined_cost = round(existing_batch.get("total_cost", 0) + total_cost, 2)
-            combined_errors = existing_batch.get("errors", 0) + errors
-        else:
-            combined_records = records
-            combined_cost = round(total_cost, 2)
-            combined_errors = errors
-
-        batch = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "interval": interval,
-            "period": period,
-            "sample_size": len(combined_records),
-            "records": combined_records,
-            "errors": combined_errors,
-            "total_cost": combined_cost,
-        }
-        with open(data_path(batch_filename), 'w') as f:
-            json.dump(batch, f, indent=2)
+        combined_records, combined_cost, combined_errors = _merge_and_save_batch(existing_batch, records, errors, total_cost, batch_filename, interval, period)
 
         resolved = len([r for r in records if r["outcome"] is not None])
         total_resolved = len([r for r in combined_records if r["outcome"] is not None])
@@ -4744,6 +5113,8 @@ Saved to {batch_filename} — run /replay-filters?interval={interval}&period={pe
         error_msg = f"⚠️ Replay generation error: {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
+    finally:
+        _release_replay_lock(interval, period)
 
 
 # Sonnet pricing used for the live cost estimate shown in Telegram.
@@ -5213,26 +5584,45 @@ _Every filter above was checked against the exact same {len(resolved)} resolved 
 # Claude analysis and just re-derives the outcome against a different
 # level using the same real candle data.
 # ============================================================
-def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction, max_lookahead=50):
+def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction, max_lookahead=50, sl_fraction=None):
     """
     For each record with a real outcome, moves the target to
     tp_fraction of the distance from entry to Claude's original
-    target (stop unchanged) and re-runs the exact same
-    simulate_backtest_trade/_score_trade logic already proven
-    throughout this project, against the same real price data. Looks
-    up each signal's position by its saved TIMESTAMP, not its saved
-    positional index -- yfinance's "2y" window rolls forward every
-    day, so a positional index from an earlier download can silently
-    point at the wrong candle by the time this runs later. A signal
-    whose timestamp can't be found in the freshly-downloaded data
-    (should be rare) is left with outcome=None rather than guessed at.
-    tp_fraction=0.5 reproduces the original half-TP test exactly;
-    0.75 moves it most of the way back out toward the original;
-    values above 1.0 would extend past the original target instead
-    of shrinking it, if that's ever worth testing too. max_lookahead
+    target and re-runs the exact same simulate_backtest_trade/
+    _score_trade logic already proven throughout this project,
+    against the same real price data. Looks up each signal's position
+    by its saved TIMESTAMP, not its saved positional index --
+    yfinance's "2y" window rolls forward every day, so a positional
+    index from an earlier download can silently point at the wrong
+    candle by the time this runs later. A signal whose timestamp
+    can't be found in the freshly-downloaded data (should be rare) is
+    left with outcome=None rather than guessed at. tp_fraction=0.5
+    reproduces the original half-TP test exactly; 0.75 moves it most
+    of the way back out toward the original; values above 1.0 extend
+    past the original target instead of shrinking it. max_lookahead
     defaults to simulate_backtest_trade's own default (50, correct
     for 1h candles); callers re-scoring a batch built on a different
     interval should pass a scaled value -- see interval_scale.
+
+    sl_fraction (22 Aug, optional -- defaults to None, meaning the
+    stop is genuinely untouched, byte-identical to this function's
+    original behavior) -- scales the STOP the same way tp_fraction
+    scales the target, using the identical signed-distance formula
+    (entry + (original - entry) * fraction), which already handles
+    LONG and SHORT automatically without any separate direction
+    logic, same as the target side. 0.5 halves the stop distance
+    (tighter); 1.25 widens it 25%. risk_amount stays fixed regardless
+    of the new stop distance -- _score_trade already recalculates
+    dollar-per-point against whatever stop_distance it's given,
+    exactly mirroring what a real recalculated lot size would do for
+    a genuinely different stop placement. A full stop-out is always
+    exactly -1R by definition no matter how far the stop sits -- only
+    how OFTEN a trade hits stop vs target changes as it moves, not
+    the fixed dollar cost of a loss when it does. When both fractions
+    are given together, they're applied in the SAME _score_trade call
+    per record, not two separate re-simulations chained together --
+    no risk of one transformation's output silently feeding into the
+    other.
     """
     account = PROP_FIRM_RULES["account_size"]
     risk_amount = account * (PROP_FIRM_RULES["max_loss_per_trade_pct"] / 100)
@@ -5252,11 +5642,15 @@ def recompute_outcomes_scaled_tp(records, gold_df, tp_fraction, max_lookahead=50
             continue
 
         entry = r["entry"]
-        stop = r["stop"]  # deliberately unchanged
         scaled_target = round(entry + (r["target"] - entry) * tp_fraction, 2)
+        if sl_fraction is not None:
+            scaled_stop = round(entry + (r["stop"] - entry) * sl_fraction, 2)
+        else:
+            scaled_stop = r["stop"]  # deliberately unchanged
 
-        outcome, r_multiple = _score_trade(gold_df, real_index, r["direction"], entry, stop, scaled_target, risk_amount, max_lookahead=max_lookahead)
+        outcome, r_multiple = _score_trade(gold_df, real_index, r["direction"], entry, scaled_stop, scaled_target, risk_amount, max_lookahead=max_lookahead)
         new_r["target"] = scaled_target
+        new_r["stop"] = scaled_stop
         new_r["outcome"] = outcome
         new_r["r_multiple"] = r_multiple
         new_records.append(new_r)
@@ -5480,8 +5874,29 @@ def replay_combine_endpoint():
     Optional &fraction=0.8 (or &tp_pct=80, same thing, different
     convention -- use one or the other, not both) -- combines
     against a scaled target instead of the original, full one.
-    Free -- reads the same saved batch; fraction/tp_pct costs one
-    extra free price re-download, no new Claude calls either way.
+    Optional &sl_fraction=0.75 (or &sl_pct=75, same idea, use one or
+    the other, not both) -- 22 Aug, the stop-side equivalent of
+    fraction/tp_pct. Scales the STOP the same way, independently of
+    any target scaling -- both can be given together in one call
+    (e.g. &fraction=0.8&sl_fraction=1.25 tests a shorter target AND a
+    wider stop at once). risk stays fixed regardless, same as every
+    other test in this project -- a wider stop means a smaller real
+    lot size, not more dollars at risk; a tighter stop means a bigger
+    one. What changes is how OFTEN a trade hits stop vs target, not
+    the fixed dollar cost when it does.
+    Optional &exclude_hours=1,5,8 (or &only_hours=22,2,4, use one or
+    the other, not both) -- comma-separated UTC hours (22 Aug). Tests
+    "this filter combo, minus specific bad hours" (or "restricted to
+    specific good hours") as ONE real combined number, instead of
+    manually adding up separate rows from /replay-hourly-breakdown by
+    hand. Applied after the filter/exclude combination and after any
+    fraction/sl_fraction scaling, using each record's own saved
+    signal timestamp (entry time, not close time -- same as
+    /replay-hourly-breakdown).
+    Free -- reads the same saved batch; fraction/sl_fraction together
+    still cost only ONE price re-download (both scalings are applied
+    in the same re-simulation pass, not two separate ones), no new
+    Claude calls either way.
     Returns the full stats directly in this response AND sends the
     same summary to Telegram.
     """
@@ -5531,6 +5946,44 @@ def replay_combine_endpoint():
         return jsonify({"status": "error", "message": "fraction/tp_pct must be a number, e.g. &fraction=0.8 or &tp_pct=80"}), 400
     if fraction is not None and not (0 < fraction <= 2.0):
         return jsonify({"status": "error", "message": "fraction should be between 0 and 2.0 (tp_pct between 0 and 200)"}), 400
+
+    # sl_fraction/sl_pct (22 Aug) -- same syntax as fraction/tp_pct
+    # above, but scales the STOP instead of the target. Independent of
+    # the target-scaling params -- either or both can be given at
+    # once, e.g. &fraction=0.8&sl_fraction=1.25 tests a shorter target
+    # AND a wider stop together, in one real re-simulation per record.
+    sl_fraction_param = request.args.get('sl_fraction', None)
+    sl_pct_param = request.args.get('sl_pct', None)
+    if sl_fraction_param is not None and sl_pct_param is not None:
+        return jsonify({"status": "error", "message": "Use either sl_fraction or sl_pct, not both"}), 400
+    sl_fraction = None
+    try:
+        if sl_fraction_param is not None:
+            sl_fraction = float(sl_fraction_param)
+        elif sl_pct_param is not None:
+            sl_fraction = float(sl_pct_param) / 100.0
+    except ValueError:
+        return jsonify({"status": "error", "message": "sl_fraction/sl_pct must be a number, e.g. &sl_fraction=0.75 or &sl_pct=75"}), 400
+    if sl_fraction is not None and not (0 < sl_fraction <= 3.0):
+        return jsonify({"status": "error", "message": "sl_fraction should be between 0 and 3.0 (sl_pct between 0 and 300)"}), 400
+
+    exclude_hours_param = request.args.get('exclude_hours', '')
+    only_hours_param = request.args.get('only_hours', '')
+    if exclude_hours_param and only_hours_param:
+        return jsonify({"status": "error", "message": "Use either exclude_hours or only_hours, not both"}), 400
+    exclude_hours = None
+    only_hours = None
+    try:
+        if exclude_hours_param:
+            exclude_hours = {int(h) for h in exclude_hours_param.split(',') if h.strip()}
+        if only_hours_param:
+            only_hours = {int(h) for h in only_hours_param.split(',') if h.strip()}
+    except ValueError:
+        return jsonify({"status": "error", "message": "exclude_hours/only_hours must be comma-separated integers 0-23, e.g. &exclude_hours=1,5,8"}), 400
+    for hour_set, param_name in ((exclude_hours, 'exclude_hours'), (only_hours, 'only_hours')):
+        if hour_set is not None and not all(0 <= h <= 23 for h in hour_set):
+            return jsonify({"status": "error", "message": f"{param_name} values must be between 0 and 23"}), 400
+
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
 
@@ -5545,7 +5998,7 @@ def replay_combine_endpoint():
     if len(resolved) < 5:
         return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
 
-    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction)
+    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction)
     status_code = 200 if result.get("status") == "ok" else 500
     return jsonify(result), status_code
 
@@ -5763,7 +6216,7 @@ def replay_optimize_endpoint():
     })
 
 
-def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None):
+def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None):
     try:
         records = batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
@@ -5771,20 +6224,51 @@ def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fract
         batch_period = batch.get("period", "2y")
 
         target_note = ""
-        if fraction is not None:
+        if fraction is not None or sl_fraction is not None:
             gold = yf.download('GC=F', period=batch_period, interval=batch_interval, progress=False, timeout=20)
             if gold.empty:
-                error = f"No price data returned for the TP-scaling step (interval={batch_interval}, period={batch_period})"
+                error = f"No price data returned for the TP/SL-scaling step (interval={batch_interval}, period={batch_period})"
                 send_telegram(f"⚠️ Combine report error: {error}")
                 return {"status": "error", "message": error}
             gold.columns = [col[0] for col in gold.columns]
             gold = gold.dropna()
-            resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction, max_lookahead=50 * interval_scale(batch_interval))
+            # tp_fraction=1.0 is a genuine no-op (scaled_target == original
+            # target exactly) when only sl_fraction was actually requested.
+            resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction if fraction is not None else 1.0, max_lookahead=50 * interval_scale(batch_interval), sl_fraction=sl_fraction)
             resolved = [r for r in resolved if r["outcome"] is not None]
-            pct_label = f"{fraction * 100:.0f}%"
-            target_note = f"Target scaled to {pct_label} of the way from entry to the original target, stop unchanged."
+            notes = []
+            if fraction is not None:
+                notes.append(f"Target scaled to {fraction * 100:.0f}% of the way from entry to the original target.")
+            if sl_fraction is not None:
+                notes.append(f"Stop scaled to {sl_fraction * 100:.0f}% of the original entry-to-stop distance.")
+            if fraction is None:
+                notes.append("Target unchanged.")
+            if sl_fraction is None:
+                notes.append("Stop unchanged.")
+            target_note = " ".join(notes)
 
         combined, breakdown, exclude_breakdown = combine_filters(resolved, filter_keys, mode, exclude_keys)
+
+        hour_note = ""
+        if exclude_hours is not None:
+            combined = [r for r in combined if pd.Timestamp(r["timestamp"]).hour not in exclude_hours]
+            hour_note = f"Hours excluded (UTC): {', '.join(str(h) for h in sorted(exclude_hours))}."
+        elif only_hours is not None:
+            combined = [r for r in combined if pd.Timestamp(r["timestamp"]).hour in only_hours]
+            hour_note = f"Restricted to hours (UTC): {', '.join(str(h) for h in sorted(only_hours))}."
+
+        if exclude_hours is not None or only_hours is not None:
+            # breakdown was computed against the pre-hour-filter set above --
+            # recompute against the FINAL combined list so the per-filter
+            # counts shown can never exceed the actual reported n (they'd
+            # otherwise be stale and confusing, e.g. showing more matches
+            # than there are total trades in the result).
+            filter_fn_by_key = {key: fn for key, _, fn in FILTER_DEFINITIONS}
+            breakdown = {
+                key: {"name": name, "count": len([r for r in combined if filter_fn_by_key[key](r)])}
+                for key, name, _ in FILTER_DEFINITIONS if key in filter_keys
+            }
+
         stats = _aggregate_stats(combined)
         total_r = round(sum(r["r_multiple"] for r in combined), 2)
 
@@ -5819,6 +6303,7 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 Filters combined: {', '.join(filter_keys)}{f' | Excluded if also matching: {", ".join(exclude_keys)}' if exclude_keys else ''}
 Batch: {len(resolved)} resolved signals total
 {target_note}
+{hour_note}
 
 *Combined result:*
 {result_line}
@@ -5841,6 +6326,7 @@ _{explain} Small sample sizes limit how much confidence to place in this — rea
             "per_filter_breakdown": {key: info["count"] for key, info in breakdown.items()},
             "exclude_breakdown": {key: info["blocked_count"] for key, info in exclude_breakdown.items()} if exclude_keys else None,
             "target_scaling": target_note or None,
+            "hour_restriction": hour_note or None,
         }
     except Exception as e:
         error_msg = f"⚠️ Combine report error: {str(e)}"

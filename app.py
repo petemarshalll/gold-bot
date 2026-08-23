@@ -111,6 +111,18 @@ last_pnl_reset_day = None
 daily_alert_count = 0
 scheduler = None
 
+# Remote pause (22 Aug) -- a real, previously-missing "emergency
+# brake" reachable without VPS/physical access, added the night
+# before A's first real trade ever, specifically because the person
+# running this won't be at a computer for hours after market open.
+# Blocks a variant from taking any NEW real trade while paused;
+# does NOT touch already-open positions or their closure tracking at
+# all, since that runs entirely through the bridge's own separate
+# polling loop, untouched by this. Persisted the same way every
+# other piece of real state here is, so it survives a Railway
+# restart rather than silently resetting.
+PAUSED_VARIANTS = set()
+
 # ============================================================
 # REPLAY-GENERATE CONCURRENCY LOCK (22 Aug)
 # Confirmed live (21 Aug): the batch file is only written ONCE, at the
@@ -446,6 +458,7 @@ def save_state():
             "last_trading_day": last_trading_day,
             "last_pnl_reset_day": last_pnl_reset_day,
             "daily_alert_count": daily_alert_count,
+            "paused_variants": list(PAUSED_VARIANTS),
         }
         with open(data_path('bot_state.json'), 'w') as f:
             json.dump(state, f, indent=2)
@@ -458,10 +471,12 @@ def load_state():
     global KEY_LEVELS, paper_trades, active_trades, daily_pnl, total_pnl
     global current_balance, trading_days, consecutive_losses, last_trading_day
     global last_pnl_reset_day, daily_alert_count, shadow_trades, active_shadow_trades
+    global PAUSED_VARIANTS
     try:
         with open(data_path('bot_state.json'), 'r') as f:
             state = json.load(f)
         KEY_LEVELS.update(state.get('key_levels', {}))
+        PAUSED_VARIANTS = set(v for v in state.get('paused_variants', []) if v in VARIANTS)
         saved_paper_trades = state.get('paper_trades', {})
         if isinstance(saved_paper_trades, list):
             # Old, pre-variant flat format (from the now-ended FTMO
@@ -2480,6 +2495,14 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
         # ============================================================
         for variant in VARIANTS:
             try:
+                if variant in PAUSED_VARIANTS:
+                    # Remote pause (22 Aug) -- see /admin/pause-variant's
+                    # own docstring. Skips straight to monitoring
+                    # whatever's already open for this variant; no new
+                    # trade gets taken or even evaluated against this
+                    # variant's rules while paused.
+                    monitor_active_trades(variant, data.get('price', 0))
+                    continue
                 # ============================================================
                 # VARIANT A (16 Aug) -- new live logic, replacing the old
                 # confidence-gated approach entirely. Directly applies the
@@ -4324,6 +4347,65 @@ def admin_manual_trade():
             "status": "ok", "variant": variant, "trade_id": trade_id, "scaled_target": scaled_target,
             "message": "Queued for the bridge -- tracked exactly like a normal trade, will place on the next poll cycle (~20s)"
         })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/admin/pause-variant', methods=['POST'])
+def admin_pause_variant():
+    """
+    Blocks ONE variant from taking any NEW real trade (22 Aug) -- a
+    real "emergency brake" reachable from a phone via a plain POST,
+    with no VPS/physical access needed at all. Built the night before
+    A's first real trade ever, specifically because the person
+    running this won't be at a computer for hours after market open.
+
+    Does NOT touch anything already open -- closure detection and
+    reporting for an already-placed real trade runs entirely through
+    the bridge's own separate polling loop (/mt5/pending, /mt5/ack,
+    /mt5/trade-closed), completely untouched by this. This only stops
+    the NEXT signal for this variant from being acted on; the bridge
+    itself keeps running and keeps managing whatever's already open.
+
+    Persisted the same way every other piece of real state here is,
+    so it survives a Railway restart rather than silently clearing.
+    """
+    global PAUSED_VARIANTS
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        reason = data.get('reason', '')
+        PAUSED_VARIANTS.add(variant)
+        save_state()
+        send_telegram(f"⏸️ *[{variant}] PAUSED* — no new real trades will be taken until resumed via /admin/resume-variant.{' Reason: ' + reason if reason else ''}")
+        return jsonify({"status": "ok", "variant": variant, "paused_variants": sorted(PAUSED_VARIANTS)})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/admin/resume-variant', methods=['POST'])
+def admin_resume_variant():
+    """Reverses /admin/pause-variant -- see its own docstring for the
+    real reasoning. Safe to call even if the variant wasn't actually
+    paused."""
+    global PAUSED_VARIANTS
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        PAUSED_VARIANTS.discard(variant)
+        save_state()
+        send_telegram(f"▶️ *[{variant}] RESUMED* — new real trades will be taken normally again.")
+        return jsonify({"status": "ok", "variant": variant, "paused_variants": sorted(PAUSED_VARIANTS)})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 

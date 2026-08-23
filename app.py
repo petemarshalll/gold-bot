@@ -3847,6 +3847,79 @@ def replay_raw_signal_count_endpoint():
     })
 
 
+@app.route('/replay-dedupe', methods=['GET'])
+def replay_dedupe_endpoint():
+    """
+    Removes exact duplicate records (same timestamp AND same signal
+    type) from a saved batch -- residue from concurrent
+    /replay-generate runs that happened before the concurrency lock
+    existed, confirmed real via /replay-overlap-check finding entries
+    where the "combination" was really just one type appearing twice
+    against the same candle, not two different types genuinely
+    overlapping.
+
+    Dry-run by default -- reports what WOULD be removed without
+    touching the saved file at all. Add &apply=true to actually
+    commit the change. This is real, paid-for data (each duplicate
+    represents genuine API spend), so nothing gets deleted without an
+    explicit, deliberate confirmation -- same reasoning as the
+    confirm-before-spend gate on /replay-generate itself.
+
+    Keeps exactly one copy of each duplicate group (the first
+    encountered in the saved order) and removes the rest. Free --
+    reads and, if &apply=true, rewrites the already-saved batch file
+    only. No price download, no Claude calls.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    apply_change = request.args.get('apply', '').lower() == 'true'
+
+    try:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    seen = set()
+    deduped = []
+    removed = []
+    for r in records:
+        key = (r.get("timestamp"), r.get("type"))
+        if key in seen:
+            removed.append(r)
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    result = {
+        "status": "ok",
+        "interval": interval, "period": period,
+        "original_count": len(records),
+        "duplicate_records_found": len(removed),
+        "count_after_dedup": len(deduped),
+        "applied": apply_change,
+    }
+
+    if apply_change and removed:
+        batch["records"] = deduped
+        batch["sample_size"] = len(deduped)
+        with open(data_path(replay_batch_filename(interval, period)), 'w') as f:
+            json.dump(batch, f, indent=2)
+        result["note"] = f"Saved file updated -- {len(removed)} duplicate record(s) permanently removed."
+        send_telegram(f"🧹 *Dedupe applied* — interval={interval}, period={period}: removed {len(removed)} duplicate record(s), {len(deduped)} remain.")
+    elif apply_change:
+        result["note"] = "No duplicates found -- nothing to apply."
+    else:
+        result["note"] = "Dry run only -- nothing was changed. Add &apply=true to actually remove these duplicates from the saved batch."
+
+    return jsonify(result)
+
+
 @app.route('/replay-overlap-check', methods=['GET'])
 def replay_overlap_check_endpoint():
     """

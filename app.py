@@ -3501,6 +3501,67 @@ def check_bridge_watchdog():
             bridge_watchdog_alerted[variant] = True
 
 
+@app.route('/mt5/closure-lookup-failed', methods=['POST'])
+def mt5_closure_lookup_failed():
+    """
+    Reports that the bridge genuinely gave up trying to find a real
+    trade's closure record (22 Aug) -- found in a fresh bug-hunt pass
+    the night before A's first real trade ever: previously, if a
+    position closed on MT5's side but its closure record still wasn't
+    findable via the API after MAX_CLOSURE_RETRIES (~5 min -- a real,
+    if uncommon, possibility with broker/API sync lag), the bridge
+    just silently gave up locally. Railway's own active_trades/
+    paper_trades tracking for that specific trade would stay
+    permanently marked OPEN forever, with no mechanism ever
+    correcting it and no notification anyone could act on. The wick-
+    detection/2-min simulated monitors explicitly skip any trade with
+    a real mt5_ticket too, so a trade stuck this way was invisible to
+    every safety net this system has.
+
+    Doesn't guess at WIN/LOSS or apply any PnL -- the whole point is
+    we genuinely don't know the real outcome. Marks the trade with an
+    explicit closure_lookup_failed flag (visible in paper_trades for
+    anyone auditing later), removes it from active_trades since the
+    bridge has genuinely stopped watching it, and sends an urgent,
+    unambiguous Telegram alert naming the real ticket number so it
+    can be checked directly in MT5 by hand.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    try:
+        data = request.get_json(silent=True) or {}
+        variant = data.get('variant', '')
+        if variant not in VARIANTS:
+            return jsonify({"status": "error", "message": f"'variant' required in body, must be one of {VARIANTS}"}), 400
+        trade_id = data.get('trade_id')
+        ticket = data.get('ticket')
+        trade = active_trades[variant].get(trade_id)
+        if not trade:
+            trade = next((t for t in paper_trades[variant] if t.get('id') == trade_id), None)
+        if not trade:
+            return jsonify({"status": "error", "message": f"unknown trade_id {trade_id} for variant {variant}"}), 404
+
+        trade['closure_lookup_failed'] = True
+        active_trades[variant].pop(trade_id, None)
+        try:
+            with open(data_path('paper_trades.json'), 'w') as f:
+                json.dump(paper_trades, f, indent=2)
+        except Exception as e:
+            print(f"Paper trade save error on closure-lookup-failed: {e}")
+        save_state()
+
+        send_telegram(
+            f"🚨 *[{variant}] MANUAL CHECK NEEDED* — ticket #{ticket} closed on MT5 but its real "
+            f"closure record couldn't be found after repeated retries. Balance/P&L NOT updated for "
+            f"this trade — please check ticket #{ticket} directly in MT5 and reconcile manually.\n"
+            f"Trade: {trade.get('type', '')} {trade.get('direction', '')} | id: {trade_id}"
+        )
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route('/mt5/trade-closed', methods=['POST'])
 def mt5_trade_closed():
     """

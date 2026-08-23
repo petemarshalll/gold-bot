@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 import itertools
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -3843,6 +3844,73 @@ def replay_raw_signal_count_endpoint():
         "by_type": by_type,
         "already_saved_and_analyzed": already_saved,
         "note": "total_raw_signals_detected is every raw pattern match found in the window — free, no Claude calls. already_saved_and_analyzed is a stratified SAMPLE of this (capped per type via /replay-generate's per_type param), not necessarily the same number."
+    })
+
+
+@app.route('/replay-overlap-check', methods=['GET'])
+def replay_overlap_check_endpoint():
+    """
+    Cross-type overlap check (22 Aug) -- Pete's own sharp question
+    (via someone else's fabricated-sounding "concurrency gate"
+    framing, which doesn't correspond to anything real in this
+    codebase -- detect_raw_signals checks each type with a single
+    `if` per candle, not a loop, so the SAME type genuinely cannot
+    fire twice on one candle). The real, narrower version of the
+    concern: a SWEEP and an FVG check completely independent
+    conditions, so it IS possible for both to fire on the same
+    candle -- the same real price move logged as two separate signal
+    TYPES. Not a bug (each type has genuinely different entry/stop/
+    target logic even when they share a candle), but worth measuring
+    directly on the real saved sample rather than leaving as a
+    hunch either way.
+
+    Groups every resolved record in the saved batch by its own saved
+    timestamp (the same field every other replay tool uses to
+    identify which real candle a signal belongs to) and reports how
+    many distinct candles have more than one signal TYPE saved
+    against them, and what fraction of the total sample that
+    represents. Free -- reads the already-saved batch only, no price
+    download, no Claude calls.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    try:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    by_timestamp = {}
+    for r in resolved:
+        by_timestamp.setdefault(r["timestamp"], []).append(r["type"])
+
+    overlapping = {ts: types for ts, types in by_timestamp.items() if len(types) > 1}
+    overlap_signal_count = sum(len(types) for types in overlapping.values())
+
+    pair_counter = Counter()
+    for types in overlapping.values():
+        pair_counter[tuple(sorted(set(types)))] += 1
+
+    return jsonify({
+        "status": "ok",
+        "total_resolved_signals": len(resolved),
+        "distinct_candles_used": len(by_timestamp),
+        "candles_with_multiple_signal_types": len(overlapping),
+        "signals_involved_in_overlap": overlap_signal_count,
+        "pct_of_signals_in_overlap": round(overlap_signal_count / len(resolved) * 100, 1),
+        "most_common_type_combinations": [
+            {"types": list(k), "count": v} for k, v in pair_counter.most_common(10)
+        ],
+        "note": "candles_with_multiple_signal_types is how many real candles have more than one signal TYPE saved against them (e.g. a sweep and an FVG on the same candle) -- not duplicates of the same type, which the detection code makes structurally impossible.",
     })
 
 

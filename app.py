@@ -5599,6 +5599,20 @@ def filter_killzone_only(r):
     return r["is_killzone"] and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
 
 
+def filter_long_only(r):
+    """No confidence or confluence requirement -- pure direction
+    filter (22 Aug, built to check whether A's rule's weak second-
+    half split-test result tracked a real broader trend it doesn't
+    currently account for at all)."""
+    return r["direction"] == "LONG" and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
+
+
+def filter_short_only(r):
+    """No confidence or confluence requirement -- pure direction
+    filter, the SHORT-side counterpart to filter_long_only."""
+    return r["direction"] == "SHORT" and r["valid_trade"] and r["entry_zone_reached"] and r["has_real_trade_params"]
+
+
 def filter_asian_session_only(r):
     """
     No confidence or confluence requirement -- pure timing filter,
@@ -5643,6 +5657,8 @@ FILTER_DEFINITIONS = [
     ("entryzone", "Entry-zone-only", filter_entry_zone_only),
     ("killzone", "Killzone-only", filter_killzone_only),
     ("asian", "Asian-session-only", filter_asian_session_only),
+    ("long", "Long-only", filter_long_only),
+    ("short", "Short-only", filter_short_only),
 ]
 
 
@@ -6173,6 +6189,19 @@ def replay_combine_endpoint():
     if date_from is not None and date_to is not None and date_from >= date_to:
         return jsonify({"status": "error", "message": "date_from must be before date_to"}), 400
 
+    # direction (22 Aug) -- restricts the combined result to LONG or
+    # SHORT only, applied on top of whatever filters/dates/hours are
+    # already in play. Built to test a specific hypothesis directly:
+    # A's rule showed a weak second-half split-test result during a
+    # period the real chart shows was a strong, sustained uptrend --
+    # since the rule has no trend awareness at all, splitting by
+    # direction checks whether that weakness was concentrated in
+    # shorts fighting the trend, rather than a broader decline.
+    direction_param = request.args.get('direction', '').upper()
+    if direction_param and direction_param not in ('LONG', 'SHORT'):
+        return jsonify({"status": "error", "message": "direction must be exactly LONG or SHORT"}), 400
+    direction_filter = direction_param or None
+
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
 
@@ -6187,7 +6216,7 @@ def replay_combine_endpoint():
     if len(resolved) < 5:
         return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
 
-    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction, date_from, date_to)
+    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction, date_from, date_to, direction_filter)
     status_code = 200 if result.get("status") == "ok" else 500
     return jsonify(result), status_code
 
@@ -6405,7 +6434,7 @@ def replay_optimize_endpoint():
     })
 
 
-def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None, date_from=None, date_to=None):
+def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None, date_from=None, date_to=None, direction_filter=None):
     try:
         records = batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
@@ -6454,7 +6483,12 @@ def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fract
             combined = [r for r in combined if pd.Timestamp(r["timestamp"]).hour in only_hours]
             hour_note = f"Restricted to hours (UTC): {', '.join(str(h) for h in sorted(only_hours))}."
 
-        if exclude_hours is not None or only_hours is not None or date_from is not None or date_to is not None:
+        direction_note = ""
+        if direction_filter is not None:
+            combined = [r for r in combined if r.get("direction") == direction_filter]
+            direction_note = f"Restricted to {direction_filter} trades only."
+
+        if exclude_hours is not None or only_hours is not None or date_from is not None or date_to is not None or direction_filter is not None:
             # breakdown was computed against the pre-filter set above --
             # recompute against the FINAL combined list so the per-filter
             # counts shown can never exceed the actual reported n (they'd
@@ -6502,6 +6536,7 @@ Batch: {len(resolved)} resolved signals total
 {target_note}
 {date_note}
 {hour_note}
+{direction_note}
 
 *Combined result:*
 {result_line}
@@ -6526,6 +6561,7 @@ _{explain} Small sample sizes limit how much confidence to place in this — rea
             "target_scaling": target_note or None,
             "hour_restriction": hour_note or None,
             "date_restriction": date_note or None,
+            "direction_restriction": direction_note or None,
         }
     except Exception as e:
         error_msg = f"⚠️ Combine report error: {str(e)}"

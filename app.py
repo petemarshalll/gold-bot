@@ -5089,6 +5089,66 @@ def _score_trade(gold_df, signal_index, direction, entry, stop, target, risk_amo
     return outcome, r_multiple
 
 
+def compute_trend_alignment(records, gold_df, ma_period=50):
+    """
+    Adds a real, honest trend-alignment check to each record (22 Aug)
+    -- built specifically after a held-out test found every one of
+    tonight's three live rules losing on the exact same recent
+    window, all going almost entirely short into what the real chart
+    showed was a sustained rally. Pete's own idea (a time-based
+    "sit out after N losses" pause) has a real flaw he spotted
+    himself: time passing doesn't mean a trend has ended, so it can
+    just as easily block a genuinely good trade as a genuinely bad
+    one. This measures the actual thing that matters -- which way
+    price has genuinely been moving -- continuously, not reactively
+    after losses have already piled up.
+
+    For each record, looks up its real candle index by its own saved
+    timestamp (same reasoning as every other recompute function here
+    -- a positional index from an earlier download can silently point
+    at the wrong candle later), then computes the simple moving
+    average of the ma_period CLOSES immediately BEFORE that index --
+    strictly before, never including the signal's own candle or
+    anything after it, so this can never leak future information into
+    a decision that would only have had past information available in
+    real time.
+
+    Adds two new fields to a copy of each record:
+    - trend_direction: "LONG_FAVORED" if price was above its own
+      recent MA at signal time, "SHORT_FAVORED" if below.
+    - trend_aligned: True if the record's own trade direction matches
+      trend_direction, False if it was a counter-trend trade by this
+      simple measure.
+
+    Records without enough prior history for a full MA window, or
+    whose timestamp can't be found in the price data, are left
+    without these fields (skipped, not guessed at).
+    """
+    results = []
+    for r in records:
+        new_r = dict(r)
+        try:
+            ts = pd.Timestamp(r["timestamp"])
+            signal_index = gold_df.index.get_loc(ts)
+            if signal_index < ma_period:
+                results.append(new_r)
+                continue
+            prior_closes = gold_df.iloc[signal_index - ma_period:signal_index]['Close']
+            ma = float(prior_closes.mean())
+            signal_price = float(gold_df.iloc[signal_index]['Close'])
+            trend_direction = "LONG_FAVORED" if signal_price > ma else "SHORT_FAVORED"
+            trend_aligned = (
+                (r["direction"] == "LONG" and trend_direction == "LONG_FAVORED")
+                or (r["direction"] == "SHORT" and trend_direction == "SHORT_FAVORED")
+            )
+            new_r["trend_direction"] = trend_direction
+            new_r["trend_aligned"] = trend_aligned
+        except (KeyError, TypeError, ValueError):
+            pass
+        results.append(new_r)
+    return results
+
+
 def compute_mae_for_winners(records, gold_df, max_lookahead=50):
     """
     Maximum Adverse Excursion (22 Aug) -- Pete's own question: for
@@ -6345,6 +6405,21 @@ def replay_combine_endpoint():
         return jsonify({"status": "error", "message": "direction must be exactly LONG or SHORT"}), 400
     direction_filter = direction_param or None
 
+    # trend_filter (22 Aug) -- restricts to trades that were (or were
+    # NOT) aligned with a simple, real, honest price-vs-moving-average
+    # trend measure at signal time. Built directly after a held-out
+    # test found every one of tonight's three live rules losing on the
+    # same recent window, going almost entirely short into a real,
+    # sustained rally. Uses compute_trend_alignment -- see its own
+    # docstring for the no-lookahead-bias reasoning.
+    trend_filter_param = request.args.get('trend_filter', '').lower()
+    if trend_filter_param and trend_filter_param not in ('aligned', 'counter'):
+        return jsonify({"status": "error", "message": "trend_filter must be exactly 'aligned' or 'counter'"}), 400
+    trend_filter = trend_filter_param or None
+    ma_period = request.args.get('ma_period', default=50, type=int)
+    if ma_period < 5:
+        return jsonify({"status": "error", "message": "ma_period must be at least 5"}), 400
+
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
 
@@ -6359,7 +6434,7 @@ def replay_combine_endpoint():
     if len(resolved) < 5:
         return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
 
-    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction, date_from, date_to, direction_filter)
+    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction, date_from, date_to, direction_filter, trend_filter, ma_period)
     status_code = 200 if result.get("status") == "ok" else 500
     return jsonify(result), status_code
 
@@ -6577,13 +6652,14 @@ def replay_optimize_endpoint():
     })
 
 
-def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None, date_from=None, date_to=None, direction_filter=None):
+def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None, date_from=None, date_to=None, direction_filter=None, trend_filter=None, ma_period=50):
     try:
         records = batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
         batch_interval = batch.get("interval", "1h")
         batch_period = batch.get("period", "2y")
 
+        gold = None
         target_note = ""
         if fraction is not None or sl_fraction is not None:
             gold = yf.download('GC=F', period=batch_period, interval=batch_interval, progress=False, timeout=20)
@@ -6631,7 +6707,26 @@ def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fract
             combined = [r for r in combined if r.get("direction") == direction_filter]
             direction_note = f"Restricted to {direction_filter} trades only."
 
-        if exclude_hours is not None or only_hours is not None or date_from is not None or date_to is not None or direction_filter is not None:
+        trend_note = ""
+        if trend_filter is not None:
+            if gold is None:
+                gold = yf.download('GC=F', period=batch_period, interval=batch_interval, progress=False, timeout=20)
+                if gold.empty:
+                    error = f"No price data returned for the trend-filter step (interval={batch_interval}, period={batch_period})"
+                    send_telegram(f"⚠️ Combine report error: {error}")
+                    return {"status": "error", "message": error}
+                gold.columns = [col[0] for col in gold.columns]
+                gold = gold.dropna()
+            combined = compute_trend_alignment(combined, gold, ma_period=ma_period)
+            combined = [r for r in combined if "trend_aligned" in r]  # drop any record too early for a full MA window
+            if trend_filter == "aligned":
+                combined = [r for r in combined if r["trend_aligned"]]
+                trend_note = f"Restricted to trades aligned with their own {ma_period}-period price trend at signal time."
+            else:
+                combined = [r for r in combined if not r["trend_aligned"]]
+                trend_note = f"Restricted to trades AGAINST their own {ma_period}-period price trend at signal time."
+
+        if exclude_hours is not None or only_hours is not None or date_from is not None or date_to is not None or direction_filter is not None or trend_filter is not None:
             # breakdown was computed against the pre-filter set above --
             # recompute against the FINAL combined list so the per-filter
             # counts shown can never exceed the actual reported n (they'd
@@ -6680,6 +6775,7 @@ Batch: {len(resolved)} resolved signals total
 {date_note}
 {hour_note}
 {direction_note}
+{trend_note}
 
 *Combined result:*
 {result_line}
@@ -6705,6 +6801,7 @@ _{explain} Small sample sizes limit how much confidence to place in this — rea
             "hour_restriction": hour_note or None,
             "date_restriction": date_note or None,
             "direction_restriction": direction_note or None,
+            "trend_restriction": trend_note or None,
         }
     except Exception as e:
         error_msg = f"⚠️ Combine report error: {str(e)}"

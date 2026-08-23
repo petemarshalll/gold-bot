@@ -4210,12 +4210,28 @@ def admin_reset_variant():
     drawdown type. Built 17 Aug for starting B and C over on fresh MT5
     accounts after their live logic rebuild.
 
+    Optional "starting_balance" in the POST body (22 Aug) -- overrides
+    the nominal configured account_size with a real, specific figure
+    instead. Added after a genuine near-miss: resetting the real FTUK
+    account to its full nominal $50,000 when the real, current balance
+    was actually $48,094.41 would have anchored every drawdown-floor
+    calculation to a starting point $1,905.59 higher than reality --
+    meaning Railway's own internal safety floor could have let real
+    losses accumulate well past what FTUK's actual rules would tolerate
+    before anything here recognized a problem. Pass the account's real,
+    current balance here whenever resetting an account that already has
+    real trading history behind it, rather than a genuinely fresh one.
+
     Does NOT touch the other two variants' state at all. Does NOT
     touch anything MT5/bridge-side -- opening the new account,
     pointing that variant's bridge at it, and re-enabling the manual-
     approval toggle (known to default OFF on a fresh account, same
     issue that caused a real rejection on B once already) are separate,
-    manual steps this endpoint has no way to do from here.
+    manual steps this endpoint has no way to do from here. The
+    bridge's own ACCOUNT_SIZE launch variable also needs to match
+    whatever real balance is passed here -- see place_order's own
+    comment in mt5_mcp_bridge.py for why the two are deliberately kept
+    in lockstep rather than one tracking the real live MT5 balance.
     """
     global paper_trades, active_trades, shadow_trades, active_shadow_trades
     global current_balance, daily_pnl, total_pnl, trading_days, consecutive_losses
@@ -4232,7 +4248,15 @@ def admin_reset_variant():
 
         previous_balance = current_balance[variant]
         previous_trade_count = len(paper_trades[variant])
-        new_account_size = get_prop_rules(variant)["account_size"]
+        starting_balance_override = data.get('starting_balance', None)
+        if starting_balance_override is not None:
+            try:
+                starting_balance_override = float(starting_balance_override)
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "message": "starting_balance must be a number"}), 400
+            if starting_balance_override <= 0:
+                return jsonify({"status": "error", "message": "starting_balance must be greater than 0"}), 400
+        new_account_size = starting_balance_override if starting_balance_override is not None else get_prop_rules(variant)["account_size"]
 
         paper_trades[variant] = []
         active_trades[variant] = {}
@@ -4269,6 +4293,7 @@ def admin_reset_variant():
             "previous_balance": round(previous_balance, 2),
             "previous_trade_count": previous_trade_count,
             "new_balance": current_balance[variant],
+            "used_custom_starting_balance": starting_balance_override is not None,
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500

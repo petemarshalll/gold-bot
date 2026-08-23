@@ -6150,6 +6150,29 @@ def replay_combine_endpoint():
         if hour_set is not None and not all(0 <= h <= 23 for h in hour_set):
             return jsonify({"status": "error", "message": f"{param_name} values must be between 0 and 23"}), 400
 
+    # date_from/date_to (22 Aug) -- restricts the combined result to
+    # signals whose own saved timestamp falls within this real
+    # calendar range. Built specifically for split-half out-of-sample
+    # checks: does a filter combo's edge hold up independently in the
+    # FIRST half of the real window as well as the SECOND half, or
+    # does it only show up in whichever period happened to have
+    # favorable noise? A genuine, stable pattern should look similar
+    # in both; one that only appears in one half is a real overfitting
+    # signal, not a coincidence to explain away.
+    date_from_param = request.args.get('date_from', None)
+    date_to_param = request.args.get('date_to', None)
+    date_from = None
+    date_to = None
+    try:
+        if date_from_param:
+            date_from = pd.Timestamp(date_from_param, tz='UTC')
+        if date_to_param:
+            date_to = pd.Timestamp(date_to_param, tz='UTC')
+    except (ValueError, TypeError):
+        return jsonify({"status": "error", "message": "date_from/date_to must be valid dates, e.g. &date_from=2026-06-01&date_to=2026-07-01"}), 400
+    if date_from is not None and date_to is not None and date_from >= date_to:
+        return jsonify({"status": "error", "message": "date_from must be before date_to"}), 400
+
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
 
@@ -6164,7 +6187,7 @@ def replay_combine_endpoint():
     if len(resolved) < 5:
         return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
 
-    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction)
+    result = run_replay_combine_report(batch, filter_keys, mode, exclude_keys, fraction, exclude_hours, only_hours, sl_fraction, date_from, date_to)
     status_code = 200 if result.get("status") == "ok" else 500
     return jsonify(result), status_code
 
@@ -6382,7 +6405,7 @@ def replay_optimize_endpoint():
     })
 
 
-def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None):
+def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fraction=None, exclude_hours=None, only_hours=None, sl_fraction=None, date_from=None, date_to=None):
     try:
         records = batch.get("records", [])
         resolved = [r for r in records if r["outcome"] is not None]
@@ -6415,6 +6438,14 @@ def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fract
 
         combined, breakdown, exclude_breakdown = combine_filters(resolved, filter_keys, mode, exclude_keys)
 
+        date_note = ""
+        if date_from is not None or date_to is not None:
+            if date_from is not None:
+                combined = [r for r in combined if pd.Timestamp(r["timestamp"]) >= date_from]
+            if date_to is not None:
+                combined = [r for r in combined if pd.Timestamp(r["timestamp"]) < date_to]
+            date_note = f"Restricted to {date_from.date() if date_from is not None else 'start'} through {date_to.date() if date_to is not None else 'end'}."
+
         hour_note = ""
         if exclude_hours is not None:
             combined = [r for r in combined if pd.Timestamp(r["timestamp"]).hour not in exclude_hours]
@@ -6423,8 +6454,8 @@ def run_replay_combine_report(batch, filter_keys, mode, exclude_keys=None, fract
             combined = [r for r in combined if pd.Timestamp(r["timestamp"]).hour in only_hours]
             hour_note = f"Restricted to hours (UTC): {', '.join(str(h) for h in sorted(only_hours))}."
 
-        if exclude_hours is not None or only_hours is not None:
-            # breakdown was computed against the pre-hour-filter set above --
+        if exclude_hours is not None or only_hours is not None or date_from is not None or date_to is not None:
+            # breakdown was computed against the pre-filter set above --
             # recompute against the FINAL combined list so the per-filter
             # counts shown can never exceed the actual reported n (they'd
             # otherwise be stale and confusing, e.g. showing more matches
@@ -6469,6 +6500,7 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 Filters combined: {', '.join(filter_keys)}{f' | Excluded if also matching: {", ".join(exclude_keys)}' if exclude_keys else ''}
 Batch: {len(resolved)} resolved signals total
 {target_note}
+{date_note}
 {hour_note}
 
 *Combined result:*
@@ -6493,6 +6525,7 @@ _{explain} Small sample sizes limit how much confidence to place in this — rea
             "exclude_breakdown": {key: info["blocked_count"] for key, info in exclude_breakdown.items()} if exclude_keys else None,
             "target_scaling": target_note or None,
             "hour_restriction": hour_note or None,
+            "date_restriction": date_note or None,
         }
     except Exception as e:
         error_msg = f"⚠️ Combine report error: {str(e)}"

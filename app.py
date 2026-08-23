@@ -3,7 +3,7 @@
 # TradingView → Claude Analysis → Telegram Notification
 # ============================================================
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, has_request_context
 import anthropic
 import requests
 import os
@@ -50,6 +50,34 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 def data_path(filename):
     return os.path.join(DATA_DIR, filename)
+
+
+def _atomic_json_write(path, data):
+    """
+    Writes JSON atomically (22 Aug) -- found in a fresh reliability
+    pass, directly relevant tonight specifically: writes real state
+    to disk still used direct open()+json.dump, which truncates the
+    existing file the instant it opens, then writes incrementally.
+    A Railway restart or process kill at the wrong millisecond
+    mid-write -- a genuinely live risk, not theoretical -- leaves the
+    file empty or truncated. The failure itself is caught cleanly
+    (invalid JSON throws on the next load, already handled), but the
+    result is a full, silent loss of that day's real trade history
+    and balance tracking, exactly on the one file that matters most
+    for A's real account.
+
+    Writes to a temp file in the same directory first, then
+    os.replace() into the real filename -- atomic on the same
+    filesystem (guaranteed here, since the temp file lives right next
+    to the real one). The real file on disk is therefore ALWAYS
+    either the complete previous version or the complete new one,
+    never a partially-written state in between, regardless of exactly
+    when a kill happens.
+    """
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
 
 # ============================================================
 # MEMORY
@@ -290,13 +318,14 @@ VARIANT_PROP_FIRM_OVERRIDES = {
 
 def get_prop_rules(variant):
     """Merges VARIANT_PROP_FIRM_OVERRIDES on top of the shared
-    PROP_FIRM_RULES defaults for one variant. A and C get the shared
-    defaults back unchanged (empty override); B gets its real FTUK
-    numbers. Every prop-firm-relevant calculation should read through
+    PROP_FIRM_RULES defaults for one variant. B and C get the shared
+    defaults back unchanged (empty override); A gets the real FTUK
+    numbers (since the 22 Aug v1.3 account reshuffle -- previously B).
+    Every prop-firm-relevant calculation should read through
     this rather than PROP_FIRM_RULES directly wherever a variant is
     in scope -- reading PROP_FIRM_RULES directly silently means "use
     the shared/demo numbers regardless of which variant this actually
-    is," which is exactly wrong for B now."""
+    is," which is exactly wrong for A now."""
     rules = dict(PROP_FIRM_RULES)
     rules.update(VARIANT_PROP_FIRM_OVERRIDES.get(variant, {}))
     return rules
@@ -336,10 +365,12 @@ def ensure_prop_daily_reset(variant):
     """
     Recomputes this variant's FTUK-style daily drawdown floor once
     per "prop day" at its own configured reset hour (22:00 UTC for
-    B) -- a no-op for variants without a real prop-firm daily rule
-    (drawdown_type == "static"), since A and C have no such floor to
-    track. Floor = max(equity, balance) at the reset moment x
-    (1 - max_daily_loss_pct/100), per FTUK's own stated rule. Falls
+    A, the real FTUK account since the 22 Aug v1.3 account reshuffle
+    -- previously B, before the real account moved) -- a no-op for
+    variants without a real prop-firm daily rule (drawdown_type ==
+    "static"), since B and C have no such floor to track. Floor =
+    max(equity, balance) at the reset moment x (1 -
+    max_daily_loss_pct/100), per FTUK's own stated rule. Falls
     back to Railway's own tracked balance if no equity/balance
     snapshot has arrived yet from the bridge -- less accurate for
     that one calculation, but never crashes, and self-corrects the
@@ -377,7 +408,8 @@ def prop_firm_max_dd_floor(variant):
     Once the trail would reach that point, it locks there permanently
     -- matches FTUK's own stated rule exactly ("once it reaches the
     initial balance, it is locked in and will not trail"). Returns
-    None for any variant without this drawdown type (A, C) -- callers
+    None for any variant without this drawdown type (B, C since the
+    22 Aug v1.3 account reshuffle -- previously A, C) -- callers
     should fall back to the existing static check for those.
     """
     rules = get_prop_rules(variant)
@@ -414,6 +446,22 @@ INSTANCE_STARTED_AT = datetime.now(timezone.utc).isoformat()
 last_bridge_heartbeat = {v: None for v in VARIANTS}
 bridge_watchdog_alerted = {v: False for v in VARIANTS}
 BRIDGE_HEARTBEAT_TIMEOUT_MINUTES = 1
+
+# Stuck-dispatch tracking (22 Aug) -- catches a real, previously-
+# unhandled gap found in a fresh reliability pass: a trade can be
+# marked DISPATCHED the instant the bridge reads it via /mt5/pending,
+# specifically so a slow ack can never cause a duplicate real order.
+# But if the bridge then crashes, loses connectivity, or hits an
+# unhandled error in that exact narrow window -- before it ever
+# calls /mt5/ack -- that trade sits marked DISPATCHED forever, with
+# no retry and no alert. Worse than the closure-tracking gap in one
+# way: Railway would believe a trade is "in flight" when the real
+# order may never have been placed at all, silently losing a real
+# signal. Separate from bridge_watchdog_alerted above since the
+# bridge itself can be alive and heartbeating normally while one
+# specific trade still gets stuck this way.
+stuck_dispatch_alerted = set()
+STUCK_DISPATCH_TIMEOUT_MINUTES = 2
 
 # Live price/candles relayed from the bridge -- genuinely shared
 # across all three variants (gold's real price is the same number
@@ -460,8 +508,7 @@ def save_state():
             "daily_alert_count": daily_alert_count,
             "paused_variants": list(PAUSED_VARIANTS),
         }
-        with open(data_path('bot_state.json'), 'w') as f:
-            json.dump(state, f, indent=2)
+        _atomic_json_write(data_path('bot_state.json'), state)
         print("State saved successfully")
     except Exception as e:
         print(f"State save error: {e}")
@@ -962,8 +1009,7 @@ def log_paper_trade(variant, alert_type, price, direction, entry, stop, target, 
     active_trades[variant][trade_id] = trade
     queue_mt5_trade(variant, trade)
     try:
-        with open(data_path('paper_trades.json'), 'w') as f:
-            json.dump(paper_trades, f, indent=2)
+        _atomic_json_write(data_path('paper_trades.json'), paper_trades)
     except Exception as e:
         print(f"Paper trade log error: {e}")
     return trade_id
@@ -971,8 +1017,7 @@ def log_paper_trade(variant, alert_type, price, direction, entry, stop, target, 
 
 def save_mt5_queue():
     try:
-        with open(data_path('mt5_queue.json'), 'w') as f:
-            json.dump(mt5_pending_trades, f, indent=2)
+        _atomic_json_write(data_path('mt5_queue.json'), mt5_pending_trades)
     except Exception as e:
         print(f"MT5 queue save error: {e}")
 
@@ -1050,8 +1095,7 @@ def log_shadow_trade(variant, alert_type, price, direction, entry, stop, target,
     shadow_trades[variant].append(trade)
     active_shadow_trades[variant][trade_id] = trade
     try:
-        with open(data_path('shadow_trades.json'), 'w') as f:
-            json.dump(shadow_trades, f, indent=2)
+        _atomic_json_write(data_path('shadow_trades.json'), shadow_trades)
     except Exception as e:
         print(f"Shadow trade log error: {e}")
     return trade_id
@@ -1092,8 +1136,7 @@ def monitor_shadow_trades(variant, gold_df):
         del active_shadow_trades[variant][trade_id]
     if trades_to_close:
         try:
-            with open(data_path('shadow_trades.json'), 'w') as f:
-                json.dump(shadow_trades, f, indent=2)
+            _atomic_json_write(data_path('shadow_trades.json'), shadow_trades)
         except Exception as e:
             print(f"Shadow trade update error: {e}")
 
@@ -1368,9 +1411,10 @@ def ensure_daily_reset():
 
     Deliberately separate from ensure_prop_daily_reset() (18 Aug) --
     this is the bot's own UTC-midnight bookkeeping day, unrelated to
-    any specific prop firm's own daily reset time (22:00 UTC for
-    B's FTUK rules). Conflating the two would silently check B's real
-    daily drawdown against the wrong day's window.
+    any specific prop firm's own daily reset time (22:00 UTC for A's
+    FTUK rules, since the 22 Aug v1.3 account reshuffle -- previously
+    B). Conflating the two would silently check A's real daily
+    drawdown against the wrong day's window.
     """
     global daily_pnl, last_pnl_reset_day, daily_alert_count
     today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -1389,9 +1433,10 @@ def get_reference_balance(variant):
     exists (captures any currently-floating P&L on open positions,
     not just closed trades), else falls back to Railway's own tracked
     current_balance (closed trades only, always available, just less
-    current). Used by B's real prop-firm checks specifically, where
-    "am I about to breach a real limit" needs to reflect reality as
-    closely as possible, not lag behind it.
+    current). Used by A's real prop-firm checks specifically (since
+    the 22 Aug v1.3 account reshuffle -- previously B), where "am I
+    about to breach a real limit" needs to reflect reality as closely
+    as possible, not lag behind it.
     """
     snapshot = mt5_account_snapshot.get(variant, {})
     updated_at = snapshot.get("updated_at")
@@ -1405,21 +1450,25 @@ def get_reference_balance(variant):
 def check_risk_cap_before_trade(variant):
     """Returns (allowed: bool, message: str) for a specific variant.
 
-    A and C (drawdown_type == "static"): unchanged from before --
-    disallows opening a new paper trade if doing so, combined with
-    the worst case of all that variant's currently open trades hitting
-    stop loss, would exceed that variant's own account's daily loss
-    limit as a fixed percentage of the starting account size.
+    B and C (drawdown_type == "static", since the 22 Aug v1.3 account
+    reshuffle moved the real FTUK account's rules to A -- previously
+    this was A and C): unchanged from before -- disallows opening a
+    new paper trade if doing so, combined with the worst case of all
+    that variant's currently open trades hitting stop loss, would
+    exceed that variant's own account's daily loss limit as a fixed
+    percentage of the starting account size.
 
-    B (drawdown_type == "trailing_lockable", 18 Aug): genuinely
-    different checks, against B's real FTUK numbers. Daily: worst-case
+    A (drawdown_type == "trailing_lockable", 18 Aug, moved here from
+    B on 22 Aug along with the real account itself): genuinely
+    different checks, against the real FTUK numbers. Daily: worst-case
     projected balance/equity can't fall below prop_daily_floor(),
     which resets at 22:00 UTC specifically, not the bot's own
     UTC-midnight day. Max drawdown: also checked pre-trade here now --
     nothing previously checked the overall/max drawdown before placing
-    a trade for ANY variant, only reactively after a close, but B's
-    6% trailing floor is tight enough that this seemed worth adding
-    for B specifically, without changing A/C's existing behavior.
+    a trade for ANY variant, only reactively after a close, but this
+    account's 6% trailing floor is tight enough that this seemed worth
+    adding specifically, without changing the other two variants'
+    existing behavior.
 
     Checks and self-heals the daily reset on every single call,
     independent of the scheduled midnight job or a trade closing.
@@ -1584,7 +1633,7 @@ def apply_trade_pnl(variant, trade, result, real_pnl_override=None):
     # already respects, rather than changing what's real -- nothing
     # about B's actual trade sizing or confidence gating changes here.
     if not DRAWDOWN_PROTECTION_DISABLED and consecutive_losses[variant] == 3:
-        warnings.append(f"⚠️ [{variant}] DRAWDOWN PROTECTION ACTIVE — {consecutive_losses[variant]} consecutive losses, confidence threshold raised")
+        warnings.append(f"⚠️ [{variant}] {consecutive_losses[variant]} consecutive losses — no automatic behavior change, purely informational")
     if warnings:
         send_telegram("\n".join(warnings))
 
@@ -1717,8 +1766,7 @@ Result: {hit_type} {emoji} {sign}{points:.2f} points ({pnl_sign}${pnl:.2f}) | Ba
         del active_trades[variant][trade_id]
     if trades_to_close:
         try:
-            with open(data_path('paper_trades.json'), 'w') as f:
-                json.dump(paper_trades, f, indent=2)
+            _atomic_json_write(data_path('paper_trades.json'), paper_trades)
         except Exception as e:
             print(f"Paper trade update error: {e}")
 
@@ -1823,8 +1871,7 @@ Stop: {stop} -- price check showed {current_price}. Holding off crediting until 
     for trade_id in trades_to_close:
         del active_trades[variant][trade_id]
     try:
-        with open(data_path('paper_trades.json'), 'w') as f:
-            json.dump(paper_trades, f, indent=2)
+        _atomic_json_write(data_path('paper_trades.json'), paper_trades)
     except Exception as e:
         print(f"Paper trade update error: {e}")
 
@@ -2782,6 +2829,21 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
 # ============================================================
 @app.route('/morning-briefing', methods=['GET'])
 def morning_briefing():
+    # Auth only applies when genuinely reached via a real HTTP request
+    # (22 Aug) -- this function is ALSO called directly by the
+    # scheduler (run_in_context) at 7am daily, which pushes an app
+    # context but not a request context. Calling check_bridge_secret()
+    # unconditionally would have made the SCHEDULED version throw
+    # "working outside of request context" every single time and
+    # silently fail to send -- caught before shipping, not after.
+    # has_request_context() correctly distinguishes a real incoming
+    # HTTP request (the actual security-relevant path this needed
+    # closing) from the scheduler's own trusted, non-externally-
+    # triggerable call.
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
         levels_text = "\n".join([f"- {k.replace('_', ' ').title()}: {v}" for k, v in KEY_LEVELS.items()])
@@ -2815,6 +2877,10 @@ Cover in under 300 words:
 # ============================================================
 @app.route('/weekly-bias', methods=['GET'])
 def weekly_bias_report():
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         dxy_direction, dxy_desc, dxy_implication = get_dxy_bias()
         cot_data = get_cot_data()
@@ -2850,6 +2916,10 @@ Cover in under 350 words:
 # ============================================================
 @app.route('/monday-gap', methods=['GET'])
 def monday_gap_analysis():
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         prompt = f"""
 You are an expert XAUUSD analyst. Monday morning before London open.
@@ -2880,6 +2950,10 @@ Cover in under 250 words:
 # ============================================================
 @app.route('/cot-report', methods=['GET'])
 def cot_report():
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         cot_data = get_cot_data()
         prompt = f"""
@@ -2934,6 +3008,9 @@ _Week of {cot_data['date']}_
 # ============================================================
 @app.route('/prop-status', methods=['GET'])
 def prop_status():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         sections = []
         statuses = {}
@@ -2972,6 +3049,9 @@ Drawdown: {total_status} ({total_used_pct:.1f}% used, ${total_remaining:,.2f} le
 @app.route('/update-pnl', methods=['POST'])
 def update_pnl():
     global daily_pnl, total_pnl, current_balance, trading_days
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         data = request.get_json(silent=True) or {}
         variant = data.get('variant', '')
@@ -2995,6 +3075,7 @@ def update_pnl():
             warnings.append(f"🚨 [{variant}] TOTAL DRAWDOWN LIMIT HIT — ACCOUNT AT RISK")
         if warnings:
             send_telegram("\n".join(warnings))
+        save_state()
         return jsonify({"status": "updated", "variant": variant, "daily_pnl": daily_pnl[variant], "total_pnl": total_pnl[variant]})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -3005,6 +3086,10 @@ def update_pnl():
 @app.route('/auto-levels', methods=['GET'])
 def auto_update_levels():
     global KEY_LEVELS
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         gold = yf.download('GC=F', period='30d', interval='1d', progress=False, timeout=10)
         if gold.empty:
@@ -3047,6 +3132,10 @@ def auto_update_levels():
 @app.route('/update-intraday', methods=['GET'])
 def update_intraday():
     global KEY_LEVELS
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         gold = get_mt5_candles_if_fresh()
         if gold is None:
@@ -3071,6 +3160,9 @@ def update_intraday():
 @app.route('/update-levels', methods=['POST'])
 def update_levels():
     global KEY_LEVELS
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         new_levels = request.get_json(silent=True)
         if new_levels is None:
@@ -3222,8 +3314,7 @@ def mt5_ack():
                 if paper_trade_match is not None:
                     paper_trades[variant].remove(paper_trade_match)
                 try:
-                    with open(data_path('paper_trades.json'), 'w') as f:
-                        json.dump(paper_trades, f, indent=2)
+                    _atomic_json_write(data_path('paper_trades.json'), paper_trades)
                 except Exception as e:
                     print(f"Paper trade save error on MT5 ack failure: {e}")
             send_telegram(f"⚠️ *[{variant}] MT5 order failed* — {entry['alert_type']} {entry['direction']}: {entry['error']}")
@@ -3387,10 +3478,12 @@ def mt5_account_update():
     periodically (18 Aug) -- unlike price/candles (genuinely shared
     market data, only A's bridge relays it), this is per-account
     information, so every variant's own bridge reports its own.
-    Currently only needed for B's real FTUK daily-drawdown floor
-    (get_reference_balance/ensure_prop_daily_reset), which needs to
-    know live equity Railway has no other way to see -- but harmless
-    to relay from A and C's bridges too, for whenever it's useful.
+    Currently only needed for the real FTUK account's daily-drawdown
+    floor (get_reference_balance/ensure_prop_daily_reset) -- A, since
+    the 22 Aug v1.3 account reshuffle (previously B, before the real
+    account moved) -- which needs to know live equity Railway has no
+    other way to see -- but harmless to relay from B and C's bridges
+    too, for whenever it's useful.
     Same validation pattern as mt5_price_update -- a degenerate
     reading (0 or negative) must never get stored.
     """
@@ -3507,6 +3600,14 @@ def check_bridge_watchdog():
     nothing at all for a variant whose bridge simply hasn't been
     started yet (no heartbeat ever received) -- that's not a failure,
     just not running.
+
+    Also checks for any trade stuck in DISPATCHED status for too long
+    (22 Aug) -- see stuck_dispatch_alerted's own module-level comment
+    for the real reasoning. A genuinely different failure mode from a
+    dead bridge: this can fire even while a bridge is heartbeating
+    normally, since it's about one specific trade's own order-
+    placement call failing silently, not the whole process going
+    quiet.
     """
     global bridge_watchdog_alerted
     for variant in VARIANTS:
@@ -3522,6 +3623,35 @@ def check_bridge_watchdog():
                 f"If a position is open, it may not be getting tracked right now."
             )
             bridge_watchdog_alerted[variant] = True
+
+    # Stuck-dispatch check (22 Aug) -- see stuck_dispatch_alerted's own
+    # comment above for the real reasoning. Runs regardless of the
+    # heartbeat check above, since the bridge can be alive and
+    # heartbeating fine while one specific trade still gets stuck.
+    for variant in VARIANTS:
+        for trade_id, entry in mt5_pending_trades[variant].items():
+            if entry.get("status") != "DISPATCHED":
+                continue
+            if trade_id in stuck_dispatch_alerted:
+                continue
+            dispatched_at = entry.get("dispatched_at")
+            if not dispatched_at:
+                continue
+            try:
+                dispatched_time = datetime.fromisoformat(dispatched_at)
+            except (ValueError, TypeError):
+                continue
+            stuck_for = datetime.now(timezone.utc) - dispatched_time
+            if stuck_for > timedelta(minutes=STUCK_DISPATCH_TIMEOUT_MINUTES):
+                minutes = int(stuck_for.total_seconds() // 60)
+                send_telegram(
+                    f"🚨 *[{variant}] STUCK DISPATCH* — trade {trade_id} was handed to the "
+                    f"bridge {minutes} min ago and never confirmed placed or failed. The real "
+                    f"order may never have gone through — please check MT5 directly and "
+                    f"reconcile manually.\n"
+                    f"Alert type: {entry.get('alert_type', '')} {entry.get('direction', '')}"
+                )
+                stuck_dispatch_alerted.add(trade_id)
 
 
 @app.route('/mt5/closure-lookup-failed', methods=['POST'])
@@ -3568,8 +3698,7 @@ def mt5_closure_lookup_failed():
         trade['closure_lookup_failed'] = True
         active_trades[variant].pop(trade_id, None)
         try:
-            with open(data_path('paper_trades.json'), 'w') as f:
-                json.dump(paper_trades, f, indent=2)
+            _atomic_json_write(data_path('paper_trades.json'), paper_trades)
         except Exception as e:
             print(f"Paper trade save error on closure-lookup-failed: {e}")
         save_state()
@@ -3629,8 +3758,7 @@ def mt5_trade_closed():
 
         active_trades[variant].pop(trade_id, None)
         try:
-            with open(data_path('paper_trades.json'), 'w') as f:
-                json.dump(paper_trades, f, indent=2)
+            _atomic_json_write(data_path('paper_trades.json'), paper_trades)
         except Exception as e:
             print(f"Paper trade save error on MT5 close: {e}")
         save_state()
@@ -3741,8 +3869,7 @@ def admin_remove_trade():
         active_trades[variant].pop(trade_id, None)
         mt5_pending_trades[variant].pop(trade_id, None)
 
-        with open(data_path('paper_trades.json'), 'w') as f:
-            json.dump(paper_trades, f, indent=2)
+        _atomic_json_write(data_path('paper_trades.json'), paper_trades)
         save_mt5_queue()
         save_state()
 
@@ -3807,8 +3934,7 @@ def admin_restore_trade():
         total_pnl[variant] += pnl
         daily_pnl[variant] += pnl
 
-        with open(data_path('paper_trades.json'), 'w') as f:
-            json.dump(paper_trades, f, indent=2)
+        _atomic_json_write(data_path('paper_trades.json'), paper_trades)
         save_state()
 
         return jsonify({
@@ -3863,8 +3989,7 @@ def admin_reopen_trade():
         trade.pop('r_multiple', None)
         active_trades[variant][trade_id] = trade
 
-        with open(data_path('paper_trades.json'), 'w') as f:
-            json.dump(paper_trades, f, indent=2)
+        _atomic_json_write(data_path('paper_trades.json'), paper_trades)
         save_state()
 
         return jsonify({
@@ -4002,6 +4127,132 @@ def replay_dedupe_endpoint():
         result["note"] = "Dry run only -- nothing was changed. Add &apply=true to actually remove these duplicates from the saved batch."
 
     return jsonify(result)
+
+
+@app.route('/replay-trajectory', methods=['GET'])
+def replay_trajectory_endpoint():
+    """
+    Shows how a filter combo's performance has actually evolved over
+    real calendar time (22 Aug) -- Pete's own idea, built right after
+    the held-out test proved recent data genuinely can tell a
+    different story than an 8-9 week average. This is DESCRIPTIVE,
+    not a new search -- no new overfitting risk, since nothing here
+    picks a winner out of many options, it just reports how one
+    already-chosen combo did, period by period, in the order it
+    actually happened.
+
+    Same filters=/mode=/exclude=/fraction=/sl_fraction= syntax as
+    /replay-combine. Optional &window=daily or &window=weekly
+    (default weekly -- 60 days of daily buckets is noisy and hard to
+    read; weekly gives ~8-9 clean, real periods).
+
+    Buckets the combined, already-scaled result by real calendar
+    period (using each record's own saved timestamp), sorted
+    chronologically, and returns both each period's own stats AND a
+    running CUMULATIVE total R across periods in order -- so a peak-
+    and-decline (or a steady climb, or genuine flatness) shows up
+    directly rather than needing to be inferred from two coarse
+    halves.
+
+    Free -- reads the same saved batch; fraction/sl_fraction together
+    still cost only one price re-download.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    filters_param = request.args.get('filters', '')
+    mode = request.args.get('mode', '').lower()
+    exclude_param = request.args.get('exclude', '')
+    if not filters_param:
+        return jsonify({"status": "error", "message": "filters query param required, e.g. ?filters=sweep,asian"}), 400
+    if mode not in ('and', 'or'):
+        return jsonify({"status": "error", "message": "mode must be exactly 'and' or 'or'"}), 400
+    valid_keys = {key for key, _, _ in FILTER_DEFINITIONS}
+    filter_keys = [k.strip() for k in filters_param.split(',') if k.strip()]
+    invalid = [k for k in filter_keys if k not in valid_keys]
+    if invalid:
+        return jsonify({"status": "error", "message": f"Unknown filter key(s): {', '.join(invalid)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+    exclude_keys = [k.strip() for k in exclude_param.split(',') if k.strip()] if exclude_param else []
+    invalid_exclude = [k for k in exclude_keys if k not in valid_keys]
+    if invalid_exclude:
+        return jsonify({"status": "error", "message": f"Unknown exclude filter key(s): {', '.join(invalid_exclude)}. Valid keys: {', '.join(sorted(valid_keys))}"}), 400
+
+    fraction_param = request.args.get('fraction', None)
+    sl_fraction_param = request.args.get('sl_fraction', None)
+    fraction = float(fraction_param) if fraction_param is not None else None
+    sl_fraction = float(sl_fraction_param) if sl_fraction_param is not None else None
+
+    window = request.args.get('window', default='weekly').lower()
+    if window not in ('daily', 'weekly'):
+        return jsonify({"status": "error", "message": "window must be exactly 'daily' or 'weekly'"}), 400
+
+    interval = request.args.get('interval', default='1h')
+    period = request.args.get('period', default='2y')
+    try:
+        with open(data_path(replay_batch_filename(interval, period)), 'r') as f:
+            batch = json.load(f)
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": f"No saved batch found for interval={interval}, period={period} — run /replay-generate first."}), 404
+
+    records = batch.get("records", [])
+    resolved = [r for r in records if r["outcome"] is not None]
+    if len(resolved) < 5:
+        return jsonify({"status": "error", "message": f"Only {len(resolved)} resolved signals in the saved batch — not enough to report on."}), 400
+
+    if fraction is not None or sl_fraction is not None:
+        gold = yf.download('GC=F', period=period, interval=interval, progress=False, timeout=20)
+        if gold.empty:
+            return jsonify({"status": "error", "message": f"No price data returned (interval={interval}, period={period})"}), 500
+        gold.columns = [col[0] for col in gold.columns]
+        gold = gold.dropna()
+        resolved = recompute_outcomes_scaled_tp(resolved, gold, fraction if fraction is not None else 1.0, max_lookahead=50 * interval_scale(interval), sl_fraction=sl_fraction)
+        resolved = [r for r in resolved if r["outcome"] is not None]
+
+    combined, _, _ = combine_filters(resolved, filter_keys, mode, exclude_keys)
+    if not combined:
+        return jsonify({"status": "error", "message": "No trades match this filter combination at all."}), 400
+
+    for r in combined:
+        r["_ts"] = pd.Timestamp(r["timestamp"])
+    combined.sort(key=lambda r: r["_ts"])
+
+    buckets = {}
+    for r in combined:
+        if window == 'daily':
+            key = r["_ts"].strftime('%Y-%m-%d')
+        else:
+            week_start = r["_ts"] - pd.Timedelta(days=r["_ts"].weekday())
+            key = week_start.strftime('%Y-%m-%d')
+        buckets.setdefault(key, []).append(r)
+
+    trajectory = []
+    cumulative_r = 0.0
+    for key in sorted(buckets.keys()):
+        bucket_records = buckets[key]
+        n = len(bucket_records)
+        wins = len([r for r in bucket_records if r["outcome"] == "WIN"])
+        total_r = round(sum(r["r_multiple"] for r in bucket_records), 2)
+        cumulative_r = round(cumulative_r + total_r, 2)
+        trajectory.append({
+            "period_start": key,
+            "n": n,
+            "win_rate": round(wins / n * 100, 1) if n else 0,
+            "total_R": total_r,
+            "avg_R": round(total_r / n, 3) if n else 0,
+            "cumulative_total_R": cumulative_r,
+        })
+
+    return jsonify({
+        "status": "ok",
+        "window": window,
+        "filters_applied": filters_param, "mode": mode, "exclude_applied": exclude_param or None,
+        "target_scaling": f"tp={fraction}" if fraction is not None else "tp=unchanged",
+        "sl_scaling": f"sl={sl_fraction}" if sl_fraction is not None else "sl=unchanged",
+        "total_periods": len(trajectory),
+        "trajectory": trajectory,
+        "note": "cumulative_total_R is the running sum in chronological order -- a peak followed by a flattening or declining line means the edge was stronger earlier and has since faded; a steadily climbing line means it's held up throughout.",
+    })
 
 
 @app.route('/replay-overlap-check', methods=['GET'])
@@ -4313,6 +4564,12 @@ def admin_manual_trade():
     scaled figure himself. Tagged alert_type/confidence "MANUAL" with
     manual_override:true in its context so it's clearly distinguishable
     from bot-driven trades in any later performance review.
+
+    Validates that stop/target sit on the correct side of entry for
+    the stated direction (22 Aug) -- same sane-order check the
+    automated webhook path already applies to every real signal,
+    added here after finding this endpoint had no equivalent
+    protection against a simple manual-entry typo.
     """
     ok, msg = check_bridge_secret()
     if not ok:
@@ -4335,6 +4592,23 @@ def admin_manual_trade():
         risk_ok, risk_msg = check_risk_cap_before_trade(variant)
         if not risk_ok:
             return jsonify({"status": "error", "message": f"Blocked by risk cap: {risk_msg}"}), 400
+
+        # Sane-order check (22 Aug) -- found in a fresh reliability
+        # pass: the automated webhook path always confirms stop/target
+        # sit on the correct side of entry for the stated direction
+        # before treating a trade as valid; this manual endpoint had
+        # no equivalent check at all. A simple typo while entering
+        # numbers by hand (transposing stop and target, especially
+        # likely if watching a live setup under time pressure) could
+        # queue a genuinely malformed trade with nothing catching it
+        # before it reached the bridge. Doesn't second-guess Pete's
+        # own judgment on which setups to take -- only confirms the
+        # numbers he enters are self-consistent, same bar the
+        # automated path already holds every signal to.
+        if direction == "LONG" and not (target > entry > stop):
+            return jsonify({"status": "error", "message": f"For a LONG, target ({target}) must be above entry ({entry}), and entry must be above stop ({stop}). Check for a typo."}), 400
+        if direction == "SHORT" and not (target < entry < stop):
+            return jsonify({"status": "error", "message": f"For a SHORT, target ({target}) must be below entry ({entry}), and entry must be below stop ({stop}). Check for a typo."}), 400
 
         risk_pct = data.get('risk_pct', get_prop_rules(variant)["max_loss_per_trade_pct"])
         scaled_target = round(entry + (target - entry) * 0.8, 2)
@@ -4490,10 +4764,8 @@ def admin_reset_variant():
         prop_daily_floor_set_on[variant] = None
         check_drawdown_protection(variant)
 
-        with open(data_path('paper_trades.json'), 'w') as f:
-            json.dump(paper_trades, f, indent=2)
-        with open(data_path('shadow_trades.json'), 'w') as f:
-            json.dump(shadow_trades, f, indent=2)
+        _atomic_json_write(data_path('paper_trades.json'), paper_trades)
+        _atomic_json_write(data_path('shadow_trades.json'), shadow_trades)
         save_mt5_queue()
         save_state()
 
@@ -4519,6 +4791,10 @@ def admin_reset_variant():
 # ============================================================
 @app.route('/check-entries', methods=['GET'])
 def check_entries():
+    if has_request_context():
+        ok, msg = check_bridge_secret()
+        if not ok:
+            return jsonify({"status": "error", "message": msg}), 401
     try:
         if not is_market_open():
             return jsonify({"status": "market closed — entry monitor paused"})
@@ -4751,6 +5027,9 @@ Reject: https://web-production-387c47.up.railway.app/reject-rules?variant={varia
 
 @app.route('/self-review', methods=['GET'])
 def self_review():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     variant = request.args.get('variant', 'A')
     if variant not in VARIANTS:
         return jsonify({"status": "error", "message": f"variant must be one of {VARIANTS}"}), 400
@@ -4780,6 +5059,9 @@ def run_scheduled_self_review():
 # ============================================================
 @app.route('/approve-rules', methods=['GET'])
 def approve_rules():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         variant = request.args.get('variant', 'A')
         if variant not in VARIANTS:
@@ -4801,6 +5083,9 @@ def approve_rules():
 
 @app.route('/reject-rules', methods=['GET'])
 def reject_rules():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         variant = request.args.get('variant', 'A')
         if variant not in VARIANTS:
@@ -4821,6 +5106,9 @@ def reset_learned_rules():
     that hasn't been approved yet -- there was previously no way to
     undo a rule set that had already been approved and applied.
     """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         variant = request.args.get('variant', 'A')
         if variant not in VARIANTS:
@@ -4835,6 +5123,9 @@ def reset_learned_rules():
 
 @app.route('/view-rules', methods=['GET'])
 def view_rules():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         variant = request.args.get('variant', 'A')
         if variant not in VARIANTS:
@@ -4943,17 +5234,54 @@ def simulate_backtest_trade(gold_df, signal_index, direction, entry, stop, targe
 
 @app.route('/backtest', methods=['GET'])
 def backtest_endpoint():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     thread = threading.Thread(target=run_backtest)
     thread.start()
     return jsonify({"status": "backtest started", "note": "runs in the background — results (including any error) will be sent to Telegram in roughly 30-90 seconds"})
 
 
-@app.route('/replay-sample', methods=['GET'])
+@app.route('/replay-sample', methods=['GET', 'POST'])
 def replay_sample_endpoint():
-    per_type = request.args.get('per_type', default=25, type=int)
+    """
+    GET/POST confirm-before-spend (22 Aug) -- matches the same fix
+    already applied to /replay-generate, for the identical reason:
+    this was a bare GET link that started real, billed Claude
+    spending the instant it was hit -- exactly the shape that let a
+    chat app's own link-preview fetcher, or a browser's own
+    prefetching, trigger real spend with zero human action,
+    confirmed to have happened multiple times on /replay-generate
+    specifically. Now a GET only ever renders a small confirmation
+    page -- costs nothing, starts nothing. The actual paid run only
+    starts on POST, from a genuine, deliberate tap.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+
+    per_type = request.values.get('per_type', default=25, type=int)
+    est_calls = per_type * 4
+
+    if request.method == 'GET':
+        secret_provided = request.values.get('secret', '')
+        return f"""
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confirm replay-sample</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; line-height: 1.5;">
+<h2>Confirm before spending</h2>
+<p>This will sample ~{est_calls} signals and make real, billed Claude API calls (per_type={per_type}). Nothing has been charged yet -- opening this page costs nothing.</p>
+<form method="POST" action="/replay-sample">
+<input type="hidden" name="per_type" value="{per_type}">
+<input type="hidden" name="secret" value="{secret_provided}">
+<button type="submit" style="font-size: 18px; padding: 14px 28px; width: 100%; background: #d97706; color: white; border: none; border-radius: 8px;">Yes, start this run now</button>
+</form>
+</body></html>
+""", 200, {'Content-Type': 'text/html'}
+
+    # POST from here on -- the actual real run only ever starts here.
     thread = threading.Thread(target=run_live_judgment_replay, args=(per_type,))
     thread.start()
-    est_calls = per_type * 4
     return jsonify({
         "status": "replay started",
         "sample_size": est_calls,
@@ -5682,6 +6010,9 @@ _This uses point-in-time historical context only — no live KEY_LEVELS, no lear
 
 @app.route('/backtest-validate', methods=['GET'])
 def backtest_validate_endpoint():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     thread = threading.Thread(target=run_backtest_validation)
     thread.start()
     return jsonify({"status": "validation started", "note": "runs in the background — results will be sent to Telegram in roughly 30-90 seconds"})
@@ -5875,6 +6206,9 @@ def replay_filters_endpoint():
     as many times as wanted, including right after adding a brand new
     filter function above.
     """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
     batch_filename = replay_batch_filename(interval, period)
@@ -6056,6 +6390,9 @@ def replay_filters_half_tp_endpoint():
     Only cost is one free yfinance re-download to get real price data
     to re-run the outcome check against -- no Claude calls at all.
     """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     interval = request.args.get('interval', default='1h')
     period = request.args.get('period', default='2y')
     batch_filename = replay_batch_filename(interval, period)
@@ -7114,6 +7451,9 @@ _{datetime.utcnow().strftime('%d %b %Y')}_
 # ============================================================
 @app.route('/dashboard', methods=['GET'])
 def dashboard():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return f"Unauthorized: {msg}", 401
     variant = request.args.get('variant', 'A')
     if variant not in VARIANTS:
         return f"variant must be one of {VARIANTS}", 400
@@ -7237,6 +7577,9 @@ def dashboard():
 # ============================================================
 @app.route('/counterfactual-report', methods=['GET'])
 def counterfactual_report_endpoint():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     thread = threading.Thread(target=run_counterfactual_report)
     thread.start()
     return jsonify({"status": "counterfactual report started"})
@@ -7355,6 +7698,9 @@ Alerts today: {daily_alert_count}
 
 @app.route('/heartbeat', methods=['GET'])
 def heartbeat_endpoint():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         send_heartbeat()
         return jsonify({"status": "heartbeat sent"})
@@ -7380,6 +7726,9 @@ def health():
 # ============================================================
 @app.route('/test', methods=['GET'])
 def test():
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
     try:
         fake_alert = {
             "type": "BEARISH_FVG_SWEEP",

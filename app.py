@@ -64,7 +64,8 @@ def _atomic_json_write(path, data):
     (invalid JSON throws on the next load, already handled), but the
     result is a full, silent loss of that day's real trade history
     and balance tracking, exactly on the one file that matters most
-    for A's real account.
+    for B's real account (moved from A on 24 Aug -- see
+    VARIANT_PROP_FIRM_OVERRIDES' own comment for why).
 
     Writes to a temp file in the same directory first, then
     os.replace() into the real filename -- atomic on the same
@@ -284,14 +285,17 @@ PROP_FIRM_RULES = {
     "daily_reset_hour_utc": 0,
 }
 
-# Per-variant overrides (18 Aug, reassigned 22 Aug for v1.3) -- A is
-# now running the REAL, paid FTUK Flex Challenge ($50k, one-step),
-# not a demo account emulating generic FTMO-style rules -- moved here
-# from B during the v1.3 account reshuffle (the real account swapped
-# physical places with A's old demo). Genuinely different account
-# size, drawdown TYPE, and daily reset time -- not just different
-# numbers in the same formula. B and C stay on the shared
-# PROP_FIRM_RULES above, completely untouched by any of this.
+# Per-variant overrides (18 Aug, reassigned 22 Aug for v1.3, reassigned
+# back 24 Aug) -- B is now running the REAL, paid FTUK Flex Challenge
+# ($50k, one-step) again -- moved back here from A after A's physical
+# terminal showed repeated real reliability problems overnight (a
+# genuine multi-hour hang, then a duplicate stale process even after
+# restarting) that B's own terminal never showed once under the same
+# real trading load. The real FTUK MT5 login itself physically moved
+# to B's proven-stable terminal, not just a label -- same reasoning
+# as every account swap this project has done: don't trust a fresh
+# label alone to fix a hardware-specific problem. A and C stay on the
+# shared PROP_FIRM_RULES above, completely untouched by any of this.
 #
 # FTUK's own stated rules (confirmed directly by Pete, 18 Aug):
 # - Daily drawdown 5%, floor recalculated every day at 22:00 UTC,
@@ -305,7 +309,7 @@ PROP_FIRM_RULES = {
 #   here -- nothing in this codebase blocks trading before a minimum
 #   is reached, it's just tracked for Pete's own reference).
 VARIANT_PROP_FIRM_OVERRIDES = {
-    "A": {
+    "B": {
         "account_size": 50000,
         "max_daily_loss_pct": 5.0,
         "min_trading_days": 1,
@@ -318,9 +322,10 @@ VARIANT_PROP_FIRM_OVERRIDES = {
 
 def get_prop_rules(variant):
     """Merges VARIANT_PROP_FIRM_OVERRIDES on top of the shared
-    PROP_FIRM_RULES defaults for one variant. B and C get the shared
-    defaults back unchanged (empty override); A gets the real FTUK
-    numbers (since the 22 Aug v1.3 account reshuffle -- previously B).
+    PROP_FIRM_RULES defaults for one variant. A and C get the shared
+    defaults back unchanged (empty override); B gets the real FTUK
+    numbers (since 24 Aug -- previously A, before that B, before the
+    22 Aug v1.3 reshuffle moved it there).
     Every prop-firm-relevant calculation should read through
     this rather than PROP_FIRM_RULES directly wherever a variant is
     in scope -- reading PROP_FIRM_RULES directly silently means "use
@@ -365,11 +370,11 @@ def ensure_prop_daily_reset(variant):
     """
     Recomputes this variant's FTUK-style daily drawdown floor once
     per "prop day" at its own configured reset hour (22:00 UTC for
-    A, the real FTUK account since the 22 Aug v1.3 account reshuffle
-    -- previously B, before the real account moved) -- a no-op for
-    variants without a real prop-firm daily rule (drawdown_type ==
-    "static"), since B and C have no such floor to track. Floor =
-    max(equity, balance) at the reset moment x (1 -
+    B, the real FTUK account again since 24 Aug -- previously A,
+    before that B, before the 22 Aug v1.3 reshuffle moved it there)
+    -- a no-op for variants without a real prop-firm daily rule
+    (drawdown_type == "static"), since A and C have no such floor to
+    track. Floor = max(equity, balance) at the reset moment x (1 -
     max_daily_loss_pct/100), per FTUK's own stated rule. Falls
     back to Railway's own tracked balance if no equity/balance
     snapshot has arrived yet from the bridge -- less accurate for
@@ -408,8 +413,8 @@ def prop_firm_max_dd_floor(variant):
     Once the trail would reach that point, it locks there permanently
     -- matches FTUK's own stated rule exactly ("once it reaches the
     initial balance, it is locked in and will not trail"). Returns
-    None for any variant without this drawdown type (B, C since the
-    22 Aug v1.3 account reshuffle -- previously A, C) -- callers
+    None for any variant without this drawdown type (A, C since 24
+    Aug -- previously B, C, before the 22 Aug reshuffle) -- callers
     should fall back to the existing static check for those.
     """
     rules = get_prop_rules(variant)
@@ -1411,9 +1416,9 @@ def ensure_daily_reset():
 
     Deliberately separate from ensure_prop_daily_reset() (18 Aug) --
     this is the bot's own UTC-midnight bookkeeping day, unrelated to
-    any specific prop firm's own daily reset time (22:00 UTC for A's
-    FTUK rules, since the 22 Aug v1.3 account reshuffle -- previously
-    B). Conflating the two would silently check A's real daily
+    any specific prop firm's own daily reset time (22:00 UTC for B's
+    FTUK rules, since 24 Aug -- previously A, before that B).
+    Conflating the two would silently check B's real daily
     drawdown against the wrong day's window.
     """
     global daily_pnl, last_pnl_reset_day, daily_alert_count
@@ -1433,8 +1438,8 @@ def get_reference_balance(variant):
     exists (captures any currently-floating P&L on open positions,
     not just closed trades), else falls back to Railway's own tracked
     current_balance (closed trades only, always available, just less
-    current). Used by A's real prop-firm checks specifically (since
-    the 22 Aug v1.3 account reshuffle -- previously B), where "am I
+    current). Used by B's real prop-firm checks specifically (since
+    24 Aug -- previously A, before that B), where "am I
     about to breach a real limit" needs to reflect reality as closely
     as possible, not lag behind it.
     """
@@ -1450,25 +1455,27 @@ def get_reference_balance(variant):
 def check_risk_cap_before_trade(variant):
     """Returns (allowed: bool, message: str) for a specific variant.
 
-    B and C (drawdown_type == "static", since the 22 Aug v1.3 account
-    reshuffle moved the real FTUK account's rules to A -- previously
-    this was A and C): unchanged from before -- disallows opening a
-    new paper trade if doing so, combined with the worst case of all
-    that variant's currently open trades hitting stop loss, would
-    exceed that variant's own account's daily loss limit as a fixed
-    percentage of the starting account size.
+    A and C (drawdown_type == "static", since 24 Aug moved the real
+    FTUK account's rules back to B -- previously this was B and C,
+    before the 22 Aug reshuffle moved it to A and C): unchanged from
+    before -- disallows opening a new paper trade if doing so,
+    combined with the worst case of all that variant's currently open
+    trades hitting stop loss, would exceed that variant's own
+    account's daily loss limit as a fixed percentage of the starting
+    account size.
 
-    A (drawdown_type == "trailing_lockable", 18 Aug, moved here from
-    B on 22 Aug along with the real account itself): genuinely
-    different checks, against the real FTUK numbers. Daily: worst-case
-    projected balance/equity can't fall below prop_daily_floor(),
-    which resets at 22:00 UTC specifically, not the bot's own
-    UTC-midnight day. Max drawdown: also checked pre-trade here now --
-    nothing previously checked the overall/max drawdown before placing
-    a trade for ANY variant, only reactively after a close, but this
-    account's 6% trailing floor is tight enough that this seemed worth
-    adding specifically, without changing the other two variants'
-    existing behavior.
+    B (drawdown_type == "trailing_lockable", 18 Aug, moved back here
+    from A on 24 Aug along with the real account itself, after A's
+    own physical terminal showed repeated real reliability problems):
+    genuinely different checks, against the real FTUK numbers. Daily:
+    worst-case projected balance/equity can't fall below
+    prop_daily_floor(), which resets at 22:00 UTC specifically, not
+    the bot's own UTC-midnight day. Max drawdown: also checked
+    pre-trade here now -- nothing previously checked the overall/max
+    drawdown before placing a trade for ANY variant, only reactively
+    after a close, but this account's 6% trailing floor is tight
+    enough that this seemed worth adding specifically, without
+    changing the other two variants' existing behavior.
 
     Checks and self-heals the daily reset on every single call,
     independent of the scheduled midnight job or a trade closing.
@@ -2556,20 +2563,22 @@ _Timeframe: {data.get('timeframe', '15m')} | Log this trade in your journal_
                 # single best-evidenced result from the full replay
                 # exploration (14-16 Aug, real 200-signal historical
                 # ============================================================
-                # v1.3 (22 Aug): A now hosts the real, paid FTUK Flex
-                # Challenge account (swapped in from B during the account
-                # reshuffle) -- sweep-only-no-override OR Asian-session,
+                # v1.3 (22 Aug): sweep-only-no-override OR Asian-session,
                 # EXCLUDING anything matching the stacked pattern. Target
                 # scaled to 80%, stop deliberately untouched. Built and
                 # cross-checked against the same real, saved 15m/60d and
                 # 1h/2y batches, via the 22 Aug optimizer search (66,976
                 # combos, every candidate checked against both datasets
                 # independently) -- see variant_a_included's own docstring
-                # for the real numbers behind this specific choice.
+                # for the real numbers behind this specific choice. This
+                # rule itself is unchanged by the 24 Aug account swap --
+                # only which physical account sits behind the label "A"
+                # moved, not this variant's own logic.
                 #
                 # News-risk suppression added here for the first time (22
-                # Aug) -- A never had it before since it never previously
-                # carried real money; now matches the same real-money
+                # Aug), while A carried real money as part of the 22 Aug
+                # v1.3 reshuffle -- kept as-is after the 24 Aug swap moved
+                # the real account back to B, matching the same real-money
                 # safety pattern B and C already use.
                 #
                 # Historical trades logged under A with BOT_VERSION < 1.1.0
@@ -3479,11 +3488,11 @@ def mt5_account_update():
     market data, only A's bridge relays it), this is per-account
     information, so every variant's own bridge reports its own.
     Currently only needed for the real FTUK account's daily-drawdown
-    floor (get_reference_balance/ensure_prop_daily_reset) -- A, since
-    the 22 Aug v1.3 account reshuffle (previously B, before the real
-    account moved) -- which needs to know live equity Railway has no
-    other way to see -- but harmless to relay from B and C's bridges
-    too, for whenever it's useful.
+    floor (get_reference_balance/ensure_prop_daily_reset) -- B, since
+    24 Aug (previously A, before that B, before the 22 Aug v1.3
+    reshuffle moved it to A) -- which needs to know live equity
+    Railway has no other way to see -- but harmless to relay from A
+    and C's bridges too, for whenever it's useful.
     Same validation pattern as mt5_price_update -- a degenerate
     reading (0 or negative) must never get stored.
     """

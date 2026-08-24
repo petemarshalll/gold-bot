@@ -3773,6 +3773,45 @@ def mt5_trade_closed():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/admin/mt5-queue', methods=['GET'])
+def admin_mt5_queue():
+    """
+    Shows the real, current, raw state of one variant's MT5 dispatch
+    queue -- every entry in mt5_pending_trades[variant], exactly as
+    the bridge itself would see it via /mt5/pending, plus its current
+    status (PENDING/DISPATCHED) and how long it's been sitting there.
+
+    Built live (24 Aug) during a real, repeating failure: four
+    real signals in a row went straight from "decision made" to a
+    false simulated stop-out, with no order-placed or order-failed
+    message for A at all, and no way to see WHERE in the pipeline
+    each one actually stopped. Every prior admin tool only shows
+    trades AFTER they've already resolved -- this shows the queue
+    exactly as it stands right now, mid-flight, so the next
+    occurrence can be caught with real evidence instead of another
+    guess from reading code alone.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    variant = request.args.get('variant', '')
+    if variant not in VARIANTS:
+        return jsonify({"status": "error", "message": f"'variant' required, must be one of {VARIANTS}"}), 400
+    queue = mt5_pending_trades.get(variant, {})
+    now = datetime.now(timezone.utc)
+    entries = []
+    for trade_id, entry in queue.items():
+        age_seconds = None
+        ts_field = entry.get('dispatched_at') or entry.get('queued_at')
+        if ts_field:
+            try:
+                age_seconds = round((now - datetime.fromisoformat(ts_field)).total_seconds())
+            except (ValueError, TypeError):
+                pass
+        entries.append({**entry, "age_seconds": age_seconds})
+    return jsonify({"status": "ok", "variant": variant, "queue_size": len(entries), "entries": entries})
+
+
 @app.route('/admin/recent-trades', methods=['GET'])
 def admin_recent_trades():
     """Read-only -- last N paper trades (default 5, override with

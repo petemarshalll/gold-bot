@@ -3773,6 +3773,51 @@ def mt5_trade_closed():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route('/admin/price-source-check', methods=['GET'])
+def admin_price_source_check():
+    """
+    Shows exactly which price source the periodic monitor would use
+    RIGHT NOW, and how fresh it genuinely is (24 Aug, built live
+    during the same repeating false-stop-out investigation as
+    /admin/mt5-queue). monitor_trades_endpoint tries MT5's own live
+    price first, then MT5's own relayed candles, then falls all the
+    way back to yfinance's gold FUTURES data if both are stale --
+    a genuinely different instrument from real spot XAUUSD.m that can
+    diverge from it by a real, meaningful margin. This shows which of
+    those three a real check would actually be drawing from at this
+    exact moment, without needing to wait for a real trade to expose
+    it after the fact.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    now = datetime.now(timezone.utc)
+
+    live_price_age = None
+    if mt5_live_price.get("updated_at"):
+        live_price_age = round((now - mt5_live_price["updated_at"]).total_seconds())
+    live_price_fresh = get_mt5_price_if_fresh() is not None
+
+    candle_age = None
+    if mt5_candle_history.get("updated_at"):
+        candle_age = round((now - mt5_candle_history["updated_at"]).total_seconds())
+    candles_fresh = get_mt5_candles_if_fresh() is not None
+
+    if live_price_fresh:
+        source_in_use = "MT5 live price (real, direct from bridge)"
+    elif candles_fresh:
+        source_in_use = "MT5 relayed candles (real, from bridge)"
+    else:
+        source_in_use = "yfinance GC=F FUTURES FALLBACK -- a different instrument from real spot XAUUSD.m, can diverge meaningfully"
+
+    return jsonify({
+        "status": "ok",
+        "mt5_live_price": {"bid": mt5_live_price.get("bid"), "ask": mt5_live_price.get("ask"), "age_seconds": live_price_age, "considered_fresh": live_price_fresh},
+        "mt5_candle_history": {"most_recent_candle_time": mt5_candle_history["candles"][-1]["time"] if mt5_candle_history.get("candles") else None, "age_seconds": candle_age, "considered_fresh": candles_fresh},
+        "source_a_real_check_would_use_right_now": source_in_use,
+    })
+
+
 @app.route('/admin/mt5-queue', methods=['GET'])
 def admin_mt5_queue():
     """

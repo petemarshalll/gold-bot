@@ -3827,6 +3827,75 @@ def admin_price_source_check():
     })
 
 
+@app.route('/admin/weekly-summary', methods=['GET'])
+def admin_weekly_summary():
+    """
+    Real trading results for all three variants over a given window
+    (default: since the most recent Monday 00:00 UTC), built for a
+    genuine week-in-review question (24 Aug) rather than pulling raw
+    /admin/recent-trades three times and cross-referencing by hand.
+
+    Important, honest limitation: this can only show what Railway
+    still has a record of. A failed real placement (wrong symbol,
+    rejected order, etc.) is deliberately REMOVED from paper_trades
+    entirely on ack -- a correct fix from 18 Aug for a real bug (an
+    unwatched failed placement getting falsely closed by the price
+    monitor), not an oversight -- but it means a variant with
+    frequent placement failures (C's habitual "No symbol info
+    returned for XAUUSD.m") shows fewer real records here than
+    alerts actually fired for it. failed_placements_note below says
+    so explicitly for every variant, not just C, since this
+    limitation is structural, not variant-specific.
+    """
+    ok, msg = check_bridge_secret()
+    if not ok:
+        return jsonify({"status": "error", "message": msg}), 401
+    date_from_param = request.args.get('date_from')
+    if date_from_param:
+        try:
+            cutoff = datetime.fromisoformat(date_from_param).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return jsonify({"status": "error", "message": "date_from must be YYYY-MM-DD"}), 400
+    else:
+        now = datetime.now(timezone.utc)
+        days_since_monday = now.weekday()
+        cutoff = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    summary = {}
+    for v in VARIANTS:
+        window_trades = []
+        for t in paper_trades[v]:
+            opened_at = t.get('opened_at')
+            if not opened_at:
+                continue
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+            except (ValueError, TypeError):
+                continue
+            if opened_dt >= cutoff:
+                window_trades.append(t)
+
+        closed = [t for t in window_trades if t.get('result') in ('WIN', 'LOSS')]
+        wins = [t for t in closed if t['result'] == 'WIN']
+        still_open = [t for t in window_trades if t.get('result') == 'OPEN']
+        never_dispatched = [t for t in window_trades if t.get('result') == 'OPEN' and not t.get('mt5_ticket')]
+        total_pnl = round(sum(t.get('pnl', 0) or 0 for t in closed), 2)
+
+        summary[v] = {
+            "window_trade_count": len(window_trades),
+            "closed": len(closed),
+            "wins": len(wins),
+            "losses": len(closed) - len(wins),
+            "win_rate_pct": round(100 * len(wins) / len(closed), 1) if closed else None,
+            "total_pnl": total_pnl,
+            "still_open": len(still_open),
+            "still_open_never_got_a_real_ticket": len(never_dispatched),
+            "failed_placements_note": "Failed real placements are removed from this record by design (18 Aug fix) -- not counted here at all, not just zero.",
+        }
+
+    return jsonify({"status": "ok", "window_start_utc": cutoff.isoformat(), "variants": summary})
+
+
 @app.route('/admin/mt5-queue', methods=['GET'])
 def admin_mt5_queue():
     """

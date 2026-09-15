@@ -8,9 +8,11 @@ Run on the VPS next to the B bridge, with the same env vars:
     set SYMBOL=XAUUSD.m
     python export_mt5_history.py
 
-Writes data/XAUUSD.m_M1.csv and data/XAUUSD.m_M5.csv (UTC timestamps,
-bid OHLC + tick volume + spread where the broker supplies it). Resumable:
-re-running only fetches candles newer than what's already saved.
+Writes data/XAUUSD.m_M5.csv and data/XAUUSD.m_M1.csv (UTC timestamps,
+bid OHLC + tick volume + spread where the broker supplies it). Walks
+BACKWARDS from now in weekly chunks and stops when the broker's history
+runs out, so rows are newest-first; the harness sorts on load.
+Re-running appends only candles newer than the first row in the file.
 """
 import csv
 import json
@@ -25,7 +27,7 @@ MCP_PORT = os.environ.get("MCP_PORT", "22346")
 MCP_URL = f"http://127.0.0.1:{MCP_PORT}/mcp"
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 SYMBOL = os.environ.get("SYMBOL", "XAUUSD.m")
-PERIODS = os.environ.get("PERIODS", "M1,M5").split(",")
+PERIODS = os.environ.get("PERIODS", "M5,M1").split(",")
 YEARS_BACK = int(os.environ.get("YEARS_BACK", "5"))
 CHUNK_DAYS = int(os.environ.get("CHUNK_DAYS", "7"))
 OUT_DIR = os.environ.get("OUT_DIR", "data")
@@ -75,64 +77,75 @@ def parse_time(s):
     return datetime.strptime(s, "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
-def last_saved_time(path):
+def newest_saved_time(path):
+    """File is newest-first: the first data row is the most recent candle."""
     if not os.path.exists(path):
         return None
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        f.seek(max(0, size - 4096))
-        tail = f.read().decode(errors="ignore").strip().splitlines()
-    for line in reversed(tail):
-        if line and not line.startswith("time"):
-            return datetime.fromisoformat(line.split(",")[0])
-    return None
+    with open(path) as f:
+        next(f, None)
+        line = next(f, "").strip()
+    return datetime.fromisoformat(line.split(",")[0]) if line else None
+
+
+def fetch_chunk(period, t_from, t_to):
+    resp = mcp_call_tool("get_chart_history", {
+        "symbol": SYMBOL, "period": period,
+        "datetime_from": t_from.isoformat(), "datetime_to": t_to.isoformat(),
+    })
+    return resp.get("history", []) or []
 
 
 def export_period(period):
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"{SYMBOL}_{period}.csv")
     now = datetime.now(timezone.utc)
-    resume_from = last_saved_time(path)
-    start = (resume_from + timedelta(minutes=1)) if resume_from else (now - timedelta(days=365 * YEARS_BACK))
+    floor = now - timedelta(days=365 * YEARS_BACK)
+    newest = newest_saved_time(path)
     new_file = not os.path.exists(path)
-    print(f"[{period}] exporting from {start.isoformat()} to now -> {path}")
+    if newest:
+        floor = newest + timedelta(minutes=1)
+        print(f"[{period}] resuming: fetching candles newer than {newest.isoformat()}")
+    else:
+        print(f"[{period}] exporting backwards from now until history ends (max {YEARS_BACK}y) -> {path}")
 
-    written = 0
-    empty_chunks = 0
-    with open(path, "a", newline="") as f:
+    rows = []
+    chunk_end = now
+    empty = 0
+    while chunk_end > floor:
+        chunk_start = max(chunk_end - timedelta(days=CHUNK_DAYS), floor)
+        candles = fetch_chunk(period, chunk_start, chunk_end)
+        candles = [c for c in candles if floor <= parse_time(c["time"]) < chunk_end]
+        if candles:
+            empty = 0
+            candles.sort(key=lambda c: c["time"], reverse=True)
+            rows.extend(candles)
+            print(f"[{period}] {chunk_start.date()} -> {chunk_end.date()}: {len(candles)} candles ({len(rows)} total)")
+        else:
+            empty += 1
+            print(f"[{period}] {chunk_start.date()} -> {chunk_end.date()}: empty ({empty})")
+            if empty >= 4:
+                print(f"[{period}] history appears to end around {chunk_end.date()}. Stopping.")
+                break
+        chunk_end = chunk_start
+        time.sleep(0.2)
+
+    if not rows:
+        print(f"[{period}] nothing new to write")
+        return
+    # newest-first file: new rows go above the existing content
+    old = ""
+    if not new_file:
+        with open(path) as f:
+            next(f, None)
+            old = f.read()
+    with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        if new_file:
-            w.writerow(["time", "open", "high", "low", "close", "tick_volume", "spread"])
-        chunk_start = start
-        while chunk_start < now:
-            chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), now)
-            resp = mcp_call_tool("get_chart_history", {
-                "symbol": SYMBOL, "period": period,
-                "datetime_from": chunk_start.isoformat(),
-                "datetime_to": chunk_end.isoformat(),
-            })
-            candles = resp.get("history", [])
-            if not candles:
-                empty_chunks += 1
-                if empty_chunks >= 8 and written == 0:
-                    print(f"[{period}] {empty_chunks} empty chunks in a row and nothing written yet: "
-                          f"broker history probably starts later than {chunk_start.date()}. Moving on.")
-                    empty_chunks = 0
-            else:
-                empty_chunks = 0
-                for c in candles:
-                    t = parse_time(c["time"])
-                    if t < chunk_start:
-                        continue
-                    w.writerow([t.isoformat(), c["open"], c["high"], c["low"], c["close"],
-                                c.get("tick_volume", c.get("volume", "")), c.get("spread", "")])
-                    written += 1
-                f.flush()
-                print(f"[{period}] {chunk_start.date()} -> {chunk_end.date()}: {len(candles)} candles ({written} total)")
-            chunk_start = chunk_end
-            time.sleep(0.3)
-    print(f"[{period}] done: {written} new candles written to {path}")
+        w.writerow(["time", "open", "high", "low", "close", "tick_volume", "spread"])
+        for c in rows:
+            w.writerow([parse_time(c["time"]).isoformat(), c["open"], c["high"], c["low"], c["close"],
+                        c.get("tick_volume", c.get("volume", "")), c.get("spread", "")])
+        f.write(old)
+    print(f"[{period}] done: {len(rows)} candles written, oldest {parse_time(rows[-1]['time']).date()}, newest {parse_time(rows[0]['time']).date()}")
 
 
 if __name__ == "__main__":

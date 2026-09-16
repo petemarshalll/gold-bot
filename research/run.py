@@ -27,9 +27,12 @@ from engine import (CostModel, by_key, load_candles, metrics, regime_split, robu
                     run_strategy, walk_forward)
 from strategies.asian_reversion import AsianReversion
 from strategies.base import VolRegimeFilter
+from strategies.fvg_sweep import FvgSweep
 from strategies.open_range import OpenRangeBreakout
+from strategies.trend_pullback import TrendPullback
 
-STRATEGIES = {"open_range": OpenRangeBreakout, "asian_reversion": AsianReversion}
+STRATEGIES = {"open_range": OpenRangeBreakout, "asian_reversion": AsianReversion,
+              "trend_pullback": TrendPullback, "fvg_sweep": FvgSweep}
 
 
 def fmt(m: dict) -> str:
@@ -47,7 +50,7 @@ def parse_set(items):
         try:
             out[k] = int(v) if v.lstrip("-").isdigit() else float(v)
         except ValueError:
-            out[k] = v
+            out[k] = v  # string params like sweep_entry=market
     return out
 
 
@@ -94,6 +97,10 @@ def main():
         print("  by direction:")
         for k, m in by_key(trades, lambda t: t.signal.direction).items():
             print(f"    {k:7s}", fmt(m))
+        if any("type" in t.signal.meta for t in trades):
+            print("  by signal type:")
+            for k, m in by_key(trades, lambda t: t.signal.meta.get("type", "?")).items():
+                print(f"    {k:13s}", fmt(m))
         print("  by exit:")
         for k, m in by_key(trades, lambda t: t.exit_reason).items():
             print(f"    {k:7s}", fmt(m))

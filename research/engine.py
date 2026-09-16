@@ -112,6 +112,8 @@ class Signal:
     ttl_bars: int = 12          # cancel unfilled order after this many M5 bars
     exit_at: pd.Timestamp | None = None   # force-flat time (e.g. session end)
     meta: dict = field(default_factory=dict)
+    be_at_r: float = 0.0        # >0: move stop to entry once price reaches this many R
+    trail_r: float = 0.0        # >0: trail the stop this many R behind the best price (after be_at_r is hit)
 
     @property
     def risk(self) -> float:
@@ -163,6 +165,7 @@ def simulate(df: pd.DataFrame, signals: Iterable[Signal], costs: CostModel,
     open_sig: Signal | None = None
     fill_px = fill_t = None
     bars_held = 0
+    cur_stop = best_px = 0.0
     comm = costs.commission_price_units
     stop_slip, entry_slip = costs.stop_slippage, costs.entry_slippage
 
@@ -184,7 +187,23 @@ def simulate(df: pd.DataFrame, signals: Iterable[Signal], costs: CostModel,
         # ---- manage open position
         if open_sig is not None:
             long = open_sig.direction == "LONG"
-            stop, target = open_sig.stop, open_sig.target
+            target = open_sig.target
+            # breakeven / trailing stop, evaluated on the PREVIOUS bar's extreme
+            # so this bar's own high can't move the stop before it can hit it
+            if (open_sig.be_at_r > 0 or open_sig.trail_r > 0) and i > 0:
+                risk = open_sig.risk
+                best = best_px
+                if long:
+                    if open_sig.be_at_r > 0 and best - open_sig.entry >= open_sig.be_at_r * risk:
+                        cur_stop = max(cur_stop, open_sig.entry + comm)
+                    if open_sig.trail_r > 0 and best - open_sig.entry >= max(open_sig.be_at_r, open_sig.trail_r) * risk:
+                        cur_stop = max(cur_stop, best - open_sig.trail_r * risk)
+                else:
+                    if open_sig.be_at_r > 0 and open_sig.entry - best >= open_sig.be_at_r * risk:
+                        cur_stop = min(cur_stop, open_sig.entry - comm)
+                    if open_sig.trail_r > 0 and open_sig.entry - best >= max(open_sig.be_at_r, open_sig.trail_r) * risk:
+                        cur_stop = min(cur_stop, best + open_sig.trail_r * risk)
+            stop = cur_stop
             exit_px = reason = None
             if long:
                 if l <= stop:
@@ -203,10 +222,15 @@ def simulate(df: pd.DataFrame, signals: Iterable[Signal], costs: CostModel,
                 exit_px = c if long else c + spr
                 reason = "time"
             if exit_px is not None:
+                if reason == "stop" and open_sig.be_at_r > 0 and \
+                   ((long and stop >= open_sig.entry) or (not long and stop <= open_sig.entry)):
+                    reason = "trail"
                 gross = (exit_px - fill_px) if long else (fill_px - exit_px)
                 trades.append(Trade(open_sig, fill_t, fill_px, ts, exit_px, reason,
                                     (gross - comm) / open_sig.risk, costs.session(fill_t)))
                 open_sig = None
+            else:
+                best_px = max(best_px, h) if long else min(best_px, l)
             i += 1
             continue
 
@@ -242,6 +266,7 @@ def simulate(df: pd.DataFrame, signals: Iterable[Signal], costs: CostModel,
                 ts = idx[i]
                 open_sig = Signal(**{**sig.__dict__, "entry": filled - (spr if long else 0.0)})
                 fill_px, fill_t, bars_held = filled, ts, 0
+                cur_stop, best_px = sig.stop, (h if long else l)
                 same_bar_stop = (long and l <= sig.stop) or (not long and h + spr >= sig.stop)
                 if same_bar_stop:
                     exit_px = (sig.stop - stop_slip) if long else (sig.stop + stop_slip)
@@ -347,9 +372,19 @@ def walk_forward(strategy, df: pd.DataFrame, costs: CostModel,
     return {"oos_trades": oos, "oos": metrics(oos), "windows": windows}
 
 
-def robustness(strategy, df: pd.DataFrame, costs: CostModel, params: dict, pct: float = 0.2) -> dict:
+def all_params(strategy) -> dict:
+    """Own params plus any wrapped strategy's params (wrappers expose .inner)."""
+    p = dict(strategy.params)
+    inner = getattr(strategy, "inner", None)
+    if inner is not None:
+        p = {**all_params(inner), **p}
+    return p
+
+
+def robustness(strategy, df: pd.DataFrame, costs: CostModel, params: dict | None = None, pct: float = 0.2) -> dict:
     """Perturb each numeric parameter by +/- pct and report avg_r. A real edge survives this."""
-    base = metrics(run_strategy(strategy, df, costs, params))
+    params = all_params(strategy) if params is None else params
+    base = metrics(run_strategy(strategy, df, costs))
     out = {"base": base, "perturbed": {}}
     for k, v in params.items():
         if not isinstance(v, (int, float)) or isinstance(v, bool):
@@ -360,7 +395,7 @@ def robustness(strategy, df: pd.DataFrame, costs: CostModel, params: dict, pct: 
                 nv = max(1, int(round(nv)))
                 if nv == v:
                     nv = v + sign
-            m = metrics(run_strategy(strategy, df, costs, {**params, k: nv}))
+            m = metrics(run_strategy(strategy, df, costs, {k: nv}))
             out["perturbed"][f"{k}={nv}"] = {"avg_r": m["avg_r"], "n": m["n"], "profit_factor": m["profit_factor"]}
     return out
 

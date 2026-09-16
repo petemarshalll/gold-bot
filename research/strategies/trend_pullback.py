@@ -33,7 +33,7 @@ class TrendPullback(Strategy):
     defaults = {
         "daily_ema": 20, "h1_ema": 20, "pullback_bars": 6, "buffer": 0.3,
         "min_stop_atr": 0.5, "rr": 2.0, "max_hold_h": 24, "ttl_bars": 12,
-        "longs_only": 0, "session_start": 6, "session_end": 20,
+        "longs_only": 0, "session_start": 6, "session_end": 20, "be_at_r": 0.0, "trail_r": 0.0,
     }
 
     def param_grid(self) -> dict:
@@ -84,4 +84,6 @@ class TrendPullback(Strategy):
                     risk = stop - entry
                     signals.append(Signal(decision, "SHORT", entry, stop, entry - p["rr"] * risk,
                                           "stop", p["ttl_bars"], flat, {"atr": float(a.iloc[i])}))
+        for s in signals:
+            s.be_at_r, s.trail_r = float(p["be_at_r"]), float(p["trail_r"])
         return signals

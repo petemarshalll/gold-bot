@@ -130,7 +130,7 @@ def main():
 
     # 3. robustness of the fixed params
     print("\nROBUSTNESS (+/-20% on each param, full history)")
-    rb = robustness(strat, df, costs, strat.params)
+    rb = robustness(strat, df, costs)
     print(f"  base            avgR={rb['base']['avg_r']:+.3f}  n={rb['base']['n']}")
     for k, m in rb["perturbed"].items():
         print(f"  {k:16s} avgR={m['avg_r']:+.3f}  n={m['n']}")

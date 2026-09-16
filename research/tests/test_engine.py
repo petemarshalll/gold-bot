@@ -121,3 +121,30 @@ def test_random_data_has_no_edge(tmp_path):
     m = metrics(trades)
     assert m["n"] > 50
     assert m["avg_r"] < 0.15  # random walk plus costs should not look like an edge
+
+
+def test_breakeven_and_trail():
+    # long fills at 100.5, risk 1.5 (stop 99). Price runs to 103 (>1R), then falls back to 99.5.
+    rows = [(100, 101, 99, 100), (100, 101, 100, 100.8), (100.8, 103, 100.7, 102.9),
+            (102.9, 103, 101.5, 101.6), (101.6, 101.7, 98.9, 99.0)]
+    df = bars(rows)
+    plain = Signal(df.index[0], "LONG", 100.5, 99, 110, "stop", 10)
+    assert simulate(df, [plain], ZERO)[0].exit_reason == "stop"          # rides back to -1R
+    be = Signal(df.index[0], "LONG", 100.5, 99, 110, "stop", 10, be_at_r=1.0)
+    t = simulate(df, [be], ZERO)[0]
+    assert t.exit_reason == "trail" and t.r == pytest.approx(0.0, abs=1e-9)  # stopped at entry
+    tr = Signal(df.index[0], "LONG", 100.5, 99, 110, "stop", 10, be_at_r=1.0, trail_r=1.0)
+    t2 = simulate(df, [tr], ZERO)[0]
+    # best 103 after bar 3; trail = 103 - 1.5 = 101.5, hit on bar 4 low 101.5
+    assert t2.exit_reason == "trail" and t2.exit_price == pytest.approx(101.5)
+    assert t2.r == pytest.approx((101.5 - 100.5) / 1.5)
+
+
+def test_robustness_reaches_inner_params():
+    from engine import all_params
+    from strategies.base import TrendGate
+    from strategies.open_range import OpenRangeBreakout
+    g = TrendGate(OpenRangeBreakout(rr=2.0))
+    p = all_params(g)
+    assert "rr" in p and "er_min" in p
+    assert g.with_params({"rr": 3.0}).inner.params["rr"] == 3.0

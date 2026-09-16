@@ -37,6 +37,7 @@ class FvgSweep(Strategy):
         "tf_min": 15, "lookback": 10, "stop_buffer": 0.3, "rr": 1.6,
         "use_fvg": 1, "use_sweep": 1, "asian_only": 0,
         "ttl_bars": 6, "max_hold_h": 8, "min_risk_atr": 0.3, "sweep_entry": "retest", "direction": "BOTH",
+        "be_at_r": 0.0, "trail_r": 0.0,
     }
 
     def param_grid(self) -> dict:
@@ -97,4 +98,6 @@ class FvgSweep(Strategy):
                                               mode, p["ttl_bars"], flat, {**meta, "type": "BULLISH_SWEEP"}))
         if p["direction"] in ("LONG", "SHORT"):
             signals = [s for s in signals if s.direction == p["direction"]]
+        for s in signals:
+            s.be_at_r, s.trail_r = float(p["be_at_r"]), float(p["trail_r"])
         return signals

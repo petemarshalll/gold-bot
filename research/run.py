@@ -26,7 +26,7 @@ import pandas as pd
 from engine import (CostModel, by_key, load_candles, metrics, regime_split, robustness,
                     run_strategy, walk_forward)
 from strategies.asian_reversion import AsianReversion
-from strategies.base import VolRegimeFilter
+from strategies.base import TrendGate, VolRegimeFilter
 from strategies.fvg_sweep import FvgSweep
 from strategies.open_range import OpenRangeBreakout
 from strategies.trend_pullback import TrendPullback
@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--set", nargs="*", help="override params, e.g. rr=2.5 range_min=15")
     ap.add_argument("--vol-filter", action="store_true")
+    ap.add_argument("--trend-gate", action="store_true", help="real-time daily trend filter (past data only)")
     ap.add_argument("--no-wf", action="store_true", help="skip walk-forward (fast look)")
     ap.add_argument("--fit-months", type=int, default=12)
     ap.add_argument("--test-months", type=int, default=3)
@@ -81,6 +82,8 @@ def main():
     strat = STRATEGIES[args.strategy](**parse_set(args.set))
     if args.vol_filter:
         strat = VolRegimeFilter(strat)
+    if args.trend_gate:
+        strat = TrendGate(strat)
     print(f"Strategy: {strat.describe()}\n")
 
     # 1. fixed-parameter full history (the optimistic view)

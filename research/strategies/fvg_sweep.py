@@ -36,7 +36,7 @@ class FvgSweep(Strategy):
     defaults = {
         "tf_min": 15, "lookback": 10, "stop_buffer": 0.3, "rr": 1.6,
         "use_fvg": 1, "use_sweep": 1, "asian_only": 0,
-        "ttl_bars": 6, "max_hold_h": 8, "min_risk_atr": 0.3, "sweep_entry": "retest",
+        "ttl_bars": 6, "max_hold_h": 8, "min_risk_atr": 0.3, "sweep_entry": "retest", "direction": "BOTH",
     }
 
     def param_grid(self) -> dict:
@@ -95,4 +95,6 @@ class FvgSweep(Strategy):
                     if risk >= p["min_risk_atr"] * atr_v:
                         signals.append(Signal(decision, "LONG", entry, stop, entry + p["rr"] * risk,
                                               mode, p["ttl_bars"], flat, {**meta, "type": "BULLISH_SWEEP"}))
+        if p["direction"] in ("LONG", "SHORT"):
+            signals = [s for s in signals if s.direction == p["direction"]]
         return signals
